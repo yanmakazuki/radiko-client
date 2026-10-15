@@ -7,6 +7,27 @@ pub struct ProgramKey {
     pub starts_at: DateTime<FixedOffset>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Classification {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Program {
+    pub key: ProgramKey,
+    /// Schedule XML ID; never assume this is a chapter eventId.
+    pub program_id: String,
+    pub ends_at: DateTime<FixedOffset>,
+    pub title: String,
+    pub performer: String,
+    pub description: String,
+    pub info: String,
+    pub tags: Vec<String>,
+    pub program_genres: Vec<Classification>,
+    pub personality_genres: Vec<Classification>,
+}
+
 /// radiko's broadcast day starts at 05:00 JST, regardless of input timezone.
 pub fn broadcast_day(now: DateTime<FixedOffset>) -> Option<NaiveDate> {
     let jst = FixedOffset::east_opt(9 * 3600)?;
@@ -70,4 +91,10 @@ impl ChapterSet {
                     .then_with(|| b.source_index.cmp(&a.source_index))
             })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Station {
+    pub id: String,
+    pub name: String,
 }

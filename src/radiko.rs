@@ -1,5 +1,6 @@
 //! External data parsing. No inferred event binding or listening permission.
 pub mod auth;
+pub mod catalog;
 mod http;
 pub mod stream;
 use crate::domain::{Chapter, ChapterSet};

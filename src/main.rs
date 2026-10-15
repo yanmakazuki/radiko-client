@@ -1,3 +1,5 @@
+mod programs;
+
 use radiko_client::{
     player::DecodeProbe,
     radiko::{
@@ -21,9 +23,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, data_dir) = arguments(std::env::args().skip(1).collect())?;
     if args.is_empty() || args == ["--help"] {
         println!(
-            "radiko-client: 検証用CLI（音声再生・TUI未実装）\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
+            "radiko-client: 検証用CLI（音声再生・TUI未実装）\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client programs STATION [YYYYMMDD] [--json]\n  radiko-client programs (--areas JP13,JP14 | --all) [YYYYMMDD] [--json]\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
         );
         return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "programs") {
+        return programs::run(&args[1..]);
     }
     if args.len() == 1 && matches!(args[0].as_str(), "login" | "session" | "logout") {
         let store = match data_dir {
@@ -88,6 +93,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             report.sample_bytes
         );
         match report.decode {
+            DecodeProbe::AacDecoded(summary) => {
+                println!(
+                    "AACセグメントの純Rustデコード成功: {}パケット / {}フレーム / {}Hz / {}ch",
+                    summary.packets, summary.frames, summary.sample_rate, summary.channels
+                );
+                println!(
+                    "AACコア: {}Hz / {}ch / SBR検出: {} / モノラルからステレオへの拡張: {}",
+                    summary.core_sample_rate,
+                    summary.core_channels,
+                    summary.sbr_detected,
+                    summary.stereo_expansion
+                );
+                println!(
+                    "デコードしたメディア: {:.3}秒 / 処理時間: {:.3}秒 / 非ゼロサンプル: {}",
+                    summary.media_duration.as_secs_f64(),
+                    summary.decode_duration.as_secs_f64(),
+                    summary.nonzero_samples
+                );
+                println!("PSの明示シグナルと聴感品質は未確認です");
+            }
+            DecodeProbe::AacFailed(error) => println!("サンプル取得済み。AAC検証失敗: {error}"),
             DecodeProbe::Decoded {
                 codec,
                 sample_rate,
@@ -100,7 +126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("サンプル取得済み。採用中のSymphoniaでコンテナを解析できません")
             }
             DecodeProbe::UnsupportedDeclaredCodec => println!(
-                "HLSの宣言はHE-AAC系です。採用中のSymphoniaでは完全なデコードが未対応のため、AACコアだけのデコード成功とは扱いません（実音声のSBR/PSは未解析）"
+                "HE-AAC宣言の非ADTSサンプルは未対応です（SymphoniaでのAACコアだけの成功とは扱いません）"
             ),
             DecodeProbe::UnsupportedCodec => {
                 println!("サンプル取得済み。採用中のSymphoniaでコーデックが未対応です")

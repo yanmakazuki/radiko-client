@@ -1,4 +1,5 @@
 //! One in-memory sample, with no audio output and no persistent recording.
+pub mod aac;
 use std::io::Cursor;
 use symphonia::core::{
     codecs::{CODEC_TYPE_AAC, CODEC_TYPE_PCM_S16LE, DecoderOptions},
@@ -19,22 +20,38 @@ pub enum DecodeProbe {
     UnsupportedFormat,
     UnsupportedCodec,
     UnsupportedDeclaredCodec,
+    AacDecoded(aac::AacSummary),
+    AacFailed(aac::AacError),
     DecodeFailed,
     NoAudio,
     Encrypted,
 }
 
 pub fn probe_declared_sample(bytes: Vec<u8>, declared_codec: Option<&str>) -> DecodeProbe {
+    if audio_offset(&bytes)
+        .and_then(|offset| bytes.get(offset..))
+        .is_some_and(rusty_aac::is_adts)
+    {
+        let mut decoder = aac::AdtsDecoder::new();
+        return match decoder.decode_segment(&bytes, declared_codec) {
+            Ok(summary) => DecodeProbe::AacDecoded(summary),
+            Err(error) => DecodeProbe::AacFailed(error),
+        };
+    }
     if declared_codec.is_some_and(|codecs| {
         codecs
             .split(',')
             .any(|codec| matches!(codec.trim(), "mp4a.40.5" | "mp4a.40.29"))
     }) {
-        // Symphonia 0.5.5 can decode an AAC core while ignoring SBR data.
-        // Do not report that as successful full HE-AAC decoding.
+        // HE-AAC outside ADTS is not wired to the new decoder yet.
+        // Keep the Symphonia fallback from reporting AAC core-only success.
         return DecodeProbe::UnsupportedDeclaredCodec;
     }
-    probe_sample(bytes)
+    probe_symphonia(bytes)
+}
+
+pub fn probe_sample(bytes: Vec<u8>) -> DecodeProbe {
+    probe_declared_sample(bytes, None)
 }
 
 pub(crate) fn audio_offset(bytes: &[u8]) -> Option<usize> {
@@ -66,7 +83,7 @@ pub(crate) fn audio_offset(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-pub fn probe_sample(mut bytes: Vec<u8>) -> DecodeProbe {
+fn probe_symphonia(mut bytes: Vec<u8>) -> DecodeProbe {
     let Some(offset) = audio_offset(&bytes) else {
         return DecodeProbe::UnsupportedFormat;
     };

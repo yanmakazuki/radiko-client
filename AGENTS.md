@@ -2,14 +2,15 @@
 
 ## Scope and Architecture
 
-This macOS Rust client currently provides authentication, HLS probes, and chapter inspection; audio output, continuous playback, search, and TUI integration remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
+This macOS Rust client currently provides station/day and regional/nationwide day listings, authentication, HLS probes, and chapter inspection; audio output, continuous playback, search, and TUI integration remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
 
 ## Project Structure
 
+- `src/programs.rs`: program listing CLI; `src/catalog.rs`: region selection and bounded acquisition; `src/radiko/catalog.rs`: uncached metadata HTTP/XML.
 - `src/main.rs`: CLI arguments and reporting; `src/lib.rs`: library exports.
 - `src/domain.rs`: broadcast dates, status, and chapters.
 - `src/radiko/`: authentication, bounded HTTP, and stream probes; `src/radiko.rs`: chapter parsing.
-- `src/player.rs`: in-memory decoding probes; `src/session.rs` and `src/storage.rs`: session types and persistence.
+- `src/player.rs` and `src/player/aac.rs`: in-memory decoding probes and stateful AAC/SBR decoding; `src/session.rs` and `src/storage.rs`: session types and persistence.
 - `tests/`: CLI, domain, and storage integration tests; `tests/fixtures/`: synthetic JSON, XML, and HLS assets.
 
 ## Build and Development Commands
@@ -51,10 +52,12 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 
 ## 現在の状態
 
+- 単一局指定に加え、`programs --areas JP13,JP14 [YYYYMMDD] [--json]`と`programs --all [YYYYMMDD] [--json]`を追加。地域別局一覧から対象局を重複排除し、単一日を最大4並列で毎回取得する。部分失敗を表示し、JSONのcompleteと終了コードで欠落を通知する。2026年10月15日に47地域の応答から109局・4,323枠の取得、fmt・clippy・全58テスト成功を確認。期間指定・分類／キーワード検索・TUIは未実装。
+
 - 初期実装段階。放送日・放送状態、チャプターJSON解析に加え、会員ログイン・セッション確認・原子的保存／削除の検証用CLIを追加済み。会員ログインはユーザー確認済み。ライブ／タイムフリーのHLS・先頭サンプル取得CLIも追加し、実アカウントで地元OBS・エリア外TBSライブ、TBS前日／10日前の取得を確認済み。音声出力・連続再生・検索・TUIは未実装。
 - 依存取得・Cargo.lock生成済み。2026年10月15日にMacOSX26.5 SDKを明示してビルド・既存テスト6件・CLI確認9件が成功。既定のMacOSX27.0 SDKではリンクに失敗する。fmt・clippyも導入後に実行し、整形適用後のfmtチェック・警告をエラー扱いしたclippy・テスト6件が成功。詳細は[実装状況](docs/implementation.md)を参照。
 - 2026年10月14日の東京エリアの番組表XMLで、番組ジャンル・出演者分類・タグの存在を確認済み。
-- 配信取得CLI追加後はfmt・clippy・テスト37件が成功。取得したHLSはHE-AAC系（mp4a.40.5）を宣言しており、Symphonia 0.5.5での完全デコードは未対応。実音声のSBR/PS解析、純Rustでの実配信再生・30分連続再生は未検証。取得成功を再生対応済みとしない。
+- ADTS向けに純Rustの`rusty_aac 1.1.0`を追加し、地元OBS・エリア外TBSライブ、TBS前日／10日前の先頭各約5秒で、コア24kHzから48kHz・ステレオへのSBR再構成と全パケットのPCM生成を確認済み。fmt・clippy・テスト43件が成功。PSの明示シグナル・聴感品質・音声出力・連続再生は未検証。非ADTSのHE-AACは未対応で、取得成功やサンプルのPCM生成を30分連続再生対応済みとしない。
 - 2026年10月15日に公開実装で公式AIチャプターの取得処理を確認。取得先・フィールド・参考リンクは設計書の「タイムフリーのチャプター」に記載。本プロジェクトでの実通信、`eventId`の対応付け、認証条件、ジャンプ再生は未検証。
 - 検証結果を記録する際は、確認日・対象・手順・結果を示す。取得できた番組情報だけを根拠に再生対応済みとは判断しない。
 

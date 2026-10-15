@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod domain;
 pub mod player;
 pub mod radiko;

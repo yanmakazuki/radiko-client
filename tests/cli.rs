@@ -124,3 +124,37 @@ fn invalid_data_directory_arguments_fail_and_inspector_still_works() {
             .contains("不正項目: 1 / 除外した楽曲: 1")
     );
 }
+
+#[test]
+fn programs_rejects_invalid_arguments_without_creating_session_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("absent");
+    for args in [
+        vec!["programs"],
+        vec!["programs", "../TBS"],
+        vec!["programs", "TBS", "20260230"],
+        vec!["programs", "TBS", "--json", "--json"],
+    ] {
+        let mut full = vec!["--data-dir", data.to_str().unwrap()];
+        full.extend(args);
+        assert!(!run(&full).status.success());
+    }
+    assert!(!data.exists());
+}
+
+#[test]
+fn region_commands_validate_before_network_and_document_both_selectors() {
+    for args in [
+        vec!["programs", "--areas"],
+        vec!["programs", "--areas", "JP0"],
+        vec!["programs", "--areas", "JP01"],
+        vec!["programs", "--all", "--areas", "JP13"],
+        vec!["programs", "--all", "20260230"],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let output = run(&["programs", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--areas") && help.contains("--all"));
+}
