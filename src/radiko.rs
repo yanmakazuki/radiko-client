@@ -1,5 +1,7 @@
 //! External data parsing. No inferred event binding or listening permission.
 pub mod auth;
+mod http;
+pub mod stream;
 use crate::domain::{Chapter, ChapterSet};
 use serde_json::Value;
 use std::{fmt, time::Duration};

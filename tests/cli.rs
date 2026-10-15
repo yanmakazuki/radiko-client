@@ -12,6 +12,30 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn stream_probes_validate_arguments_and_require_a_session_before_network_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("data");
+    let path = directory.to_str().unwrap();
+    for (args, expected) in [
+        (vec!["probe-live", "TBS"], "未ログイン"),
+        (vec!["probe-live", "../TBS"], "局ID"),
+        (vec!["probe-timefree", "TBS", "20260230010000"], "日時"),
+        (vec!["probe-timefree", "TBS", "20990101000000"], "放送前"),
+        (
+            vec!["probe-timefree", "TBS", "20261001010000"],
+            "未ログイン",
+        ),
+    ] {
+        let mut full = vec!["--data-dir", path];
+        full.extend(args);
+        let output = run(&full);
+        assert!(!output.status.success());
+        assert!(String::from_utf8(output.stderr).unwrap().contains(expected));
+    }
+    assert!(!directory.exists());
+}
+
+#[test]
 fn session_without_file_and_logout_work_offline_without_creating_data_directory() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("data");

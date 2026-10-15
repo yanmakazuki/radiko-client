@@ -1,2 +1,8 @@
 /target/
 /local-data/
+session.json
+session.json.*
+.env
+.env.*
+!.env.example
+.DS_Store

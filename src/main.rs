@@ -1,5 +1,11 @@
 use radiko_client::{
-    radiko::{MAX_CHAPTER_BYTES, auth::MemberClient, parse_chapters},
+    player::DecodeProbe,
+    radiko::{
+        MAX_CHAPTER_BYTES,
+        auth::MemberClient,
+        parse_chapters,
+        stream::{self, ProbeMode},
+    },
     session::Membership,
     storage::SessionStore,
 };
@@ -15,7 +21,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, data_dir) = arguments(std::env::args().skip(1).collect())?;
     if args.is_empty() || args == ["--help"] {
         println!(
-            "radiko-client: 検証用CLI（音声再生・TUI未実装）\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
+            "radiko-client: 検証用CLI（音声再生・TUI未実装）\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
         );
         return Ok(());
     }
@@ -25,6 +31,90 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             None => SessionStore::default_location()?,
         };
         return member_command(&args[0], &store);
+    }
+    if (args.len() == 2 && args[0] == "probe-live")
+        || (args.len() == 3 && args[0] == "probe-timefree")
+    {
+        stream::validate_station(&args[1])?;
+        let mode = if args[0] == "probe-live" {
+            ProbeMode::Live
+        } else {
+            ProbeMode::TimeFree
+        };
+        let cursor = if mode == ProbeMode::Live {
+            chrono::Utc::now().fixed_offset()
+        } else {
+            stream::parse_time(&args[2])?
+        };
+        if mode == ProbeMode::TimeFree && cursor > chrono::Utc::now() {
+            return Err(stream::ProbeError::Upcoming.into());
+        }
+        let store = match data_dir {
+            Some(path) => SessionStore::new(path),
+            None => SessionStore::default_location()?,
+        };
+        let session = store
+            .load()?
+            .ok_or("未ログインです。loginでログインしてください")?;
+        let membership = MemberClient::new()?.check(&session)?;
+        eprintln!("会員セッション有効。放送枠・配信認証・HLSを検証しています…");
+        let report = stream::probe(&args[1], mode, cursor, &session, &membership)?;
+        let jst = chrono::FixedOffset::east_opt(9 * 3600).ok_or("日本時間を構成できません")?;
+        println!(
+            "{} / {:?} / {}–{}（日本時間）",
+            report.station,
+            report.mode,
+            report
+                .starts_at
+                .with_timezone(&jst)
+                .format("%Y-%m-%d %H:%M:%S"),
+            report
+                .ends_at
+                .with_timezone(&jst)
+                .format("%Y-%m-%d %H:%M:%S")
+        );
+        println!(
+            "認証エリア: {} / エリア外: {} / 失敗した配信先: {}",
+            report.area, report.outside_area, report.failed_endpoints
+        );
+        println!(
+            "HLS取得成功: {}セグメント / {:.3}秒 / ENDLIST: {}",
+            report.segments, report.playlist_seconds, report.end_list
+        );
+        println!(
+            "HLS宣言コーデック: {} / サンプル形式: {} / {}バイト",
+            report.declared_codec.as_deref().unwrap_or("未宣言"),
+            report.container,
+            report.sample_bytes
+        );
+        match report.decode {
+            DecodeProbe::Decoded {
+                codec,
+                sample_rate,
+                channels,
+                frames,
+            } => println!(
+                "先頭パケットの純Rustデコード成功: {codec} / {sample_rate}Hz / {channels}ch / {frames}フレーム"
+            ),
+            DecodeProbe::UnsupportedFormat => {
+                println!("サンプル取得済み。採用中のSymphoniaでコンテナを解析できません")
+            }
+            DecodeProbe::UnsupportedDeclaredCodec => println!(
+                "HLSの宣言はHE-AAC系です。採用中のSymphoniaでは完全なデコードが未対応のため、AACコアだけのデコード成功とは扱いません（実音声のSBR/PSは未解析）"
+            ),
+            DecodeProbe::UnsupportedCodec => {
+                println!("サンプル取得済み。採用中のSymphoniaでコーデックが未対応です")
+            }
+            DecodeProbe::DecodeFailed => println!("サンプル取得済み。音声デコードに失敗しました"),
+            DecodeProbe::NoAudio => {
+                println!("サンプル取得済み。有効な音声フレームを確認できません")
+            }
+            DecodeProbe::Encrypted => {
+                println!("暗号化サンプル取得済み。復号・デコードは未実装です")
+            }
+        }
+        println!("音声出力・連続再生・番組末尾の停止は未検証です");
+        return Ok(());
     }
     if args.len() != 4 || args[0] != "inspect-chapters" {
         return Err("引数が不正です。--helpを参照してください".into());

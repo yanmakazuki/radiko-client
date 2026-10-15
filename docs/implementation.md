@@ -1,5 +1,49 @@
 # 実装状況
 
+## 2026年10月15日：ライブ／タイムフリーの配信取得
+
+ユーザーから会員ログイン成功の確認を受け、保存済みセッションを使う次の入口を追加した。
+
+```sh
+cargo run -- probe-live TBS
+cargo run -- probe-timefree TBS 20261014120000
+cargo run -- probe-timefree TBS 20261005120000
+```
+
+`--data-dir`を指定可能。日時は実日付・日本時間の14桁（00〜23時）で、指定時刻を含む放送枠を解決する。過去の日付は実行時の聴取期限に合わせて選ぶ。
+
+実装内容：
+
+- 番組APIで局ID・開始終了日時を照合し、放送前・放送中のタイムフリー・候補期限切れを配信認証より前に拒否。候補期限は放送終了の放送日と午前5時境界から計算し、実サーバー応答を最終判断とする。
+- `auth1`のトークン・キー範囲を検証し、公開プレイヤーキーから部分キーを生成。`auth2`に会員セッションを渡して国内エリアを確認。位置情報の偽装は行わない。
+- 認証エリアの局一覧から地元／エリア外を判定。契約と`tsInNg`／`tsplusInNg`／`tsOutNg`／`tsplusOutNg`・`failedRecord`を確認し、地域・聴取期間に合う配信先だけを選択する。観測した禁止フラグ0を許可条件、2を禁止条件として扱い、未知の値・欠落を未確認とする。
+- 配信設定XMLをquick-xml、HLSをm3u8-rsで解析。マスター／音声用プレイリスト、相対URI、初期化セグメント、明示オフセット付きバイト範囲に対応。暗黙オフセットは未対応として拒否。
+- 各HTTP要求に接続10秒／全体20秒、テキスト1MiB・配信認証64KiB・初期化1MiB・音声セグメント8MiBの上限を設定。通信障害・408・5xxのみ最大3回再試行。429は自動再試行しない。HLSのリダイレクトは最大5回で、HTTPSの確認済みサービスドメイン群だけを許可する。
+- 会員CookieとセッショントークンをCDNへ送らない。配信URL・トークン・応答本文・音声は出力／保存しない。エラーは安全な処理段階名と種別で表示する。
+- 先頭1セグメントをメモリだけに取得。ID3の長さを検証し、音声ペイロードの形式を判定する。Symphoniaでのサンプルデコード結果と取得成功は別に表示。HE-AAC系宣言ではAACコアだけの成功を完全なデコード成功としない。CLI終了コード0は取得成功のみを意味する。
+
+取得方法の根拠：
+
+- [公式playerCommon.js](https://radiko.jp/apps/js/playerCommon.js)と[公式radiko-js-player](https://radiko.jp/apps/lib/radiko-js-player.min.js)で`pc_html5`の認証、公開キー、会員セッションのヘッダー、地域別配信先の選択、クエリー項目を確認。
+- 番組解決先と候補期限は[公開実装](https://github.com/garret1317/yt-dlp-rajiko/blob/master/yt_dlp_plugins/extractor/radiko.py)と[時刻処理](https://github.com/garret1317/yt-dlp-rajiko/blob/master/yt_dlp_plugins/extractor/radiko_time.py)を参照し、本プロジェクトで実通信した。公開実装の確認だけを検証成功とはしていない。
+- 実通信で局一覧の`api.radiko.jp/v3/station/list/...`は404だったため、取得できた`radiko.jp/v3/station/list/...`を使用。番組条件の4種類のフラグと`failedRecord`も実応答で存在を確認した。
+
+実通信の手順と結果（同日、日本時間16時台、認証エリアJP44）：
+
+| 対象 | コマンド引数 | 結果 |
+|---|---|---|
+| 地元ライブ | `probe-live OBS` | 会員確認・配信認証・HLS・先頭サンプル取得成功。OBSの16:40〜17:00枠。エリア外false、配信先の失敗0 |
+| エリア外ライブ | `probe-live TBS` | 同様に取得成功。TBSの16:50〜17:00枠。エリア外true、配信先の失敗0 |
+| 通常タイムフリー | `probe-timefree TBS 20261014120000` | 10月14日12:00〜13:00枠のHLS・先頭サンプル取得成功 |
+| 8〜30日前のタイムフリー | `probe-timefree TBS 20261005120000` | 10月5日12:00〜13:00枠のHLS・先頭サンプル取得成功 |
+
+いずれもHLSの宣言コーデックは`mp4a.40.5`で、3セグメント・約15秒・ENDLISTなしの動的プレイリストだった。全放送枠を取得したことにはならず、先頭が番組音声か広告か、指定位置との一致も未確認。OBSのサンプルでMPEG-2 AAC ADTSを確認し、TBSではID3を除くとAAC ADTSを判別できた。サンプルの音声出力は行っていない。
+
+**再生の未解決事項**：[Symphonia 0.5.5の対応表](https://github.com/pdeljanov/Symphonia/tree/v0.5.5#codecs-decoders)ではHE-AAC／HE-AACv2は未対応。採用版のADTSリーダーも同期語を`0xfff1`に限定しており、観測したMPEG-2 ADTSをそのまま解析できない。AACコアだけのデコードでSBR/PSを無視して成功扱いにしない判定を追加した。HLS宣言だけで実音声のSBR/PS構成や代替形式の有無を確定しない。次は実音声のSBR/PS解析と純Rustによる完全なデコードの成立条件を検証する。音声出力・連続再生・番組末尾の停止・TUIは未実装／未検証。
+
+自動検証：`cargo fmt --all -- --check`、MacOSX26.5 SDK指定での`cargo clippy --offline --all-targets --all-features -- -D warnings`・`cargo test --offline --all-targets --all-features`が成功。テストは全37件（ライブラリ22、CLI5、既存ドメイン6、保存4）。合成XML／HLSと通信モックで正常系、通常／30日、地域・契約不足、禁止／未確認、放送前・終了境界、URI・キー範囲、不正HLS、ID3、HE-AACの誤成功防止を検証。生成したPCM WAVの純Rustデコードも成功した。通常のテストは実アカウントやradikoへの通信に依存しない。
+
+
 ## 2026年10月15日：会員認証とセッションの検証用入口
 
 追加内容：

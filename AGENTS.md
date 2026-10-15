@@ -1,4 +1,47 @@
-# 開発エージェント向けガイド
+# Repository Guidelines
+
+## Scope and Architecture
+
+This macOS Rust client currently provides authentication, HLS probes, and chapter inspection; audio output, continuous playback, search, and TUI integration remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
+
+## Project Structure
+
+- `src/main.rs`: CLI arguments and reporting; `src/lib.rs`: library exports.
+- `src/domain.rs`: broadcast dates, status, and chapters.
+- `src/radiko/`: authentication, bounded HTTP, and stream probes; `src/radiko.rs`: chapter parsing.
+- `src/player.rs`: in-memory decoding probes; `src/session.rs` and `src/storage.rs`: session types and persistence.
+- `tests/`: CLI, domain, and storage integration tests; `tests/fixtures/`: synthetic JSON, XML, and HLS assets.
+
+## Build and Development Commands
+
+```sh
+cargo build
+cargo run -- --help
+cargo run -- inspect-chapters tests/fixtures/chapters.json 90 0
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
+These build, inspect CLI behavior, check formatting, reject lint warnings, and run tests. For the documented macOS SDK linker failure, prefix Cargo commands with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. Maintain `Cargo.lock`.
+
+## Coding Style and Domain Rules
+
+Use Rust 2024, four-space indentation, and rustfmt. Use `snake_case` functions/modules and `UpperCamelCase` types. Return errors for routine failures instead of `unwrap()` or `expect()`. Keep communication, domain logic, storage, and playback responsibilities separate. Identify slots by station ID plus start time; broadcast days begin at 05:00 JST. Keep broadcast status distinct from listening permission.
+
+## Testing Guidelines
+
+Use Rust's built-in tests with descriptive behavior-based names. Ordinary tests must use fixtures, mocks, and generated audio without accounts or radiko access. Cover boundaries, malformed responses, permissions, and failure paths; no numerical coverage threshold is configured. Run the three checks above before review. Separate explicit network probes from automated tests; acquisition success does not establish playback support.
+
+## Commits and Pull Requests
+
+History uses short Japanese descriptions and an English initial commit, without an established prefix convention. Write concise commits describing the change. PRs should explain behavior, relevant issues, validation commands/results, and remaining limitations.
+
+## Security and Configuration
+
+Never persist passwords or log credentials, cookies, tokens, or signed URLs. Use `--data-dir` for session storage: atomic writes, directories `0700`, files `0600`. Preserve corrupt files until explicit successful login. Do not cache program data or persist audio.
+
+---
 
 ## プロジェクトの目的
 
@@ -8,10 +51,10 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 
 ## 現在の状態
 
-- 初期実装段階。放送日・放送状態、チャプターJSON解析に加え、会員ログイン・セッション確認・原子的保存／削除の検証用CLIを追加済み。配信取得・音声再生・検索・TUIは未実装。会員認証はモック検証済みで、実アカウントでは未検証。
+- 初期実装段階。放送日・放送状態、チャプターJSON解析に加え、会員ログイン・セッション確認・原子的保存／削除の検証用CLIを追加済み。会員ログインはユーザー確認済み。ライブ／タイムフリーのHLS・先頭サンプル取得CLIも追加し、実アカウントで地元OBS・エリア外TBSライブ、TBS前日／10日前の取得を確認済み。音声出力・連続再生・検索・TUIは未実装。
 - 依存取得・Cargo.lock生成済み。2026年10月15日にMacOSX26.5 SDKを明示してビルド・既存テスト6件・CLI確認9件が成功。既定のMacOSX27.0 SDKではリンクに失敗する。fmt・clippyも導入後に実行し、整形適用後のfmtチェック・警告をエラー扱いしたclippy・テスト6件が成功。詳細は[実装状況](docs/implementation.md)を参照。
 - 2026年10月14日の東京エリアの番組表XMLで、番組ジャンル・出演者分類・タグの存在を確認済み。
-- 会員認証、エリアフリー再生、タイムフリー30、純Rustでの実配信デコードは未検証。
+- 配信取得CLI追加後はfmt・clippy・テスト37件が成功。取得したHLSはHE-AAC系（mp4a.40.5）を宣言しており、Symphonia 0.5.5での完全デコードは未対応。実音声のSBR/PS解析、純Rustでの実配信再生・30分連続再生は未検証。取得成功を再生対応済みとしない。
 - 2026年10月15日に公開実装で公式AIチャプターの取得処理を確認。取得先・フィールド・参考リンクは設計書の「タイムフリーのチャプター」に記載。本プロジェクトでの実通信、`eventId`の対応付け、認証条件、ジャンプ再生は未検証。
 - 検証結果を記録する際は、確認日・対象・手順・結果を示す。取得できた番組情報だけを根拠に再生対応済みとは判断しない。
 
