@@ -7,3 +7,10 @@ rust-version = "1.85"
 [dependencies]
 chrono = "0.4.45"
 serde_json = "1.0.154"
+serde = { version = "1.0", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+directories = "6.0"
+rpassword = "7.4"
+tempfile = "3.23"
+zeroize = "1.9"
+libc = "0.2"

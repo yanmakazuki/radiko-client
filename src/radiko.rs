@@ -1,4 +1,5 @@
 //! External data parsing. No inferred event binding or listening permission.
+pub mod auth;
 use crate::domain::{Chapter, ChapterSet};
 use serde_json::Value;
 use std::{fmt, time::Duration};
@@ -27,7 +28,11 @@ impl fmt::Display for ChapterError {
 impl std::error::Error for ChapterError {}
 
 fn display_text(value: Option<&Value>) -> Option<String> {
-    let text: String = value?.as_str()?.chars().filter(|c| !c.is_control()).collect();
+    let text: String = value?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
@@ -46,8 +51,15 @@ pub fn parse_chapters(
         return Err(ChapterError::InvalidTimeline);
     }
     let root: Value = serde_json::from_slice(bytes).map_err(|_| ChapterError::InvalidJson)?;
-    let items = root.get("chapters").and_then(Value::as_array).ok_or(ChapterError::MissingArray)?;
-    let mut result = ChapterSet { chapters: Vec::new(), invalid_count: 0, music_count: 0 };
+    let items = root
+        .get("chapters")
+        .and_then(Value::as_array)
+        .ok_or(ChapterError::MissingArray)?;
+    let mut result = ChapterSet {
+        chapters: Vec::new(),
+        invalid_count: 0,
+        music_count: 0,
+    };
     for (source_index, item) in items.iter().enumerate() {
         if item.get("isMusic").and_then(Value::as_bool) == Some(true) {
             result.music_count += 1;
@@ -58,25 +70,39 @@ pub fn parse_chapters(
             result.invalid_count += 1;
             continue;
         }
-        let interval = item.get("fromSec").and_then(Value::as_f64)
+        let interval = item
+            .get("fromSec")
+            .and_then(Value::as_f64)
             .zip(item.get("toSec").and_then(Value::as_f64))
-            .and_then(|(a,b)| {
+            .and_then(|(a, b)| {
                 if a < 0.0 || b <= a {
                     return None;
                 }
-                let (a,b) = (a + offset_seconds, b + offset_seconds);
-                if !a.is_finite() || !b.is_finite() || a < 0.0 || b <= a || b > slot_duration.as_secs_f64() {
+                let (a, b) = (a + offset_seconds, b + offset_seconds);
+                if !a.is_finite()
+                    || !b.is_finite()
+                    || a < 0.0
+                    || b <= a
+                    || b > slot_duration.as_secs_f64()
+                {
                     return None;
                 }
                 let start = Duration::try_from_secs_f64(a).ok()?;
                 let end = Duration::try_from_secs_f64(b).ok()?;
-                (start < end && end <= slot_duration).then_some((start,end))
+                (start < end && end <= slot_duration).then_some((start, end))
             });
-        let Some((start,end)) = interval else { result.invalid_count += 1; continue; };
+        let Some((start, end)) = interval else {
+            result.invalid_count += 1;
+            continue;
+        };
         result.chapters.push(Chapter {
-            title: display_text(item.get("titleLong")).or_else(|| display_text(item.get("title"))).unwrap_or_else(|| "無題".into()),
+            title: display_text(item.get("titleLong"))
+                .or_else(|| display_text(item.get("title")))
+                .unwrap_or_else(|| "無題".into()),
             summary: display_text(item.get("summaryLong")).unwrap_or_default(),
-            start, end, source_index,
+            start,
+            end,
+            source_index,
         });
     }
     result.chapters.sort_by_key(|c| c.start);
