@@ -40,8 +40,9 @@ fn display_text(value: Option<&Value>) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-/// `offset_seconds` is event origin minus selected slot origin, verified by caller.
+/// `offset_seconds` is event origin minus selected slot origin for arithmetic conversion.
 /// Parsing a response does not establish that binding or authorize playback.
+/// The caller must verify the audio origin before using positions for playback.
 pub fn parse_chapters(
     bytes: &[u8],
     slot_duration: Duration,

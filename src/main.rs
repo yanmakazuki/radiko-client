@@ -1,7 +1,10 @@
+mod chapters;
+mod play;
 mod programs;
+mod searches;
 
 use radiko_client::{
-    player::DecodeProbe,
+    player::{DecodeProbe, output},
     radiko::{
         MAX_CHAPTER_BYTES,
         auth::MemberClient,
@@ -23,12 +26,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, data_dir) = arguments(std::env::args().skip(1).collect())?;
     if args.is_empty() || args == ["--help"] {
         println!(
-            "radiko-client: 検証用CLI（音声再生・TUI未実装）\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client programs STATION [YYYYMMDD] [--json]\n  radiko-client programs (--areas JP13,JP14 | --all) [YYYYMMDD] [--json]\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
+            "radiko-client: 検証用CLI（TUI未実装）\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client [--data-dir DIR] play-live STATION [--interactive] [--seconds N]\n  radiko-client [--data-dir DIR] play-timefree STATION YYYYMMDDHHmmss [--offset SECONDS] [--interactive] [--seconds N]\n  radiko-client probe-output [SECONDS]\n  radiko-client [--data-dir DIR] play-sample STATION [YYYYMMDDHHmmss]\n  radiko-client programs STATION [START [END]] [--json]\n  radiko-client programs (--areas JP13,JP14 | --all) [START [END]] [--json]\n  radiko-client programs --help（絞り込みオプション）\n  radiko-client searches --help（条件の保存・一覧・削除）\n  radiko-client programs --saved NAME / --restore\n  radiko-client chapters STATION YYYYMMDDHHmmss\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
+        );
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "searches") {
+        return searches::run(&args[1..], data_dir);
+    }
+    if args.first().is_some_and(|arg| arg == "chapters") {
+        return chapters::run(&args[1..]);
+    }
+    if args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "play-live" | "play-timefree"))
+    {
+        return play::run(&args, data_dir);
+    }
+    if args.first().is_some_and(|arg| arg == "probe-output") {
+        if args.len() > 2 {
+            return Err("probe-output [SECONDS]（1〜10秒）".into());
+        }
+        let seconds = args
+            .get(1)
+            .map(|s| s.parse::<u32>())
+            .transpose()?
+            .unwrap_or(2);
+        let summary = output::probe_tone(seconds)?;
+        println!(
+            "生成音の出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
+            summary.frames, summary.sample_rate, summary.channels, summary.underrun_frames
         );
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "programs") {
-        return programs::run(&args[1..]);
+        return programs::run(&args[1..], data_dir);
     }
     if args.len() == 1 && matches!(args[0].as_str(), "login" | "session" | "logout") {
         let store = match data_dir {
@@ -39,9 +70,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if (args.len() == 2 && args[0] == "probe-live")
         || (args.len() == 3 && args[0] == "probe-timefree")
+        || ((2..=3).contains(&args.len()) && args[0] == "play-sample")
     {
         stream::validate_station(&args[1])?;
-        let mode = if args[0] == "probe-live" {
+        let mode = if args[0] == "probe-live" || (args[0] == "play-sample" && args.len() == 2) {
             ProbeMode::Live
         } else {
             ProbeMode::TimeFree
@@ -63,7 +95,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("未ログインです。loginでログインしてください")?;
         let membership = MemberClient::new()?.check(&session)?;
         eprintln!("会員セッション有効。放送枠・配信認証・HLSを検証しています…");
-        let report = stream::probe(&args[1], mode, cursor, &session, &membership)?;
+        let report = if args[0] == "play-sample" {
+            stream::probe_for_output(&args[1], mode, cursor, &session, &membership)?
+        } else {
+            stream::probe(&args[1], mode, cursor, &session, &membership)?
+        };
         let jst = chrono::FixedOffset::east_opt(9 * 3600).ok_or("日本時間を構成できません")?;
         println!(
             "{} / {:?} / {}–{}（日本時間）",
@@ -139,7 +175,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("暗号化サンプル取得済み。復号・デコードは未実装です")
             }
         }
-        println!("音声出力・連続再生・番組末尾の停止は未検証です");
+        if args[0] == "play-sample" {
+            let pcm = report
+                .audio
+                .as_ref()
+                .ok_or("取得したサンプルは音声出力に対応していません")?;
+            let remaining = if mode == ProbeMode::Live {
+                Some(
+                    (report.ends_at - chrono::Utc::now().fixed_offset())
+                        .to_std()
+                        .map_err(|_| "番組終了")?,
+                )
+            } else {
+                None
+            };
+            // The sample starts at the selected slot's beginning. Never output past its end.
+            if mode == ProbeMode::TimeFree
+                && pcm.summary.media_duration > (report.ends_at - report.starts_at).to_std()?
+            {
+                return Err("サンプルが放送枠の末尾を越えています".into());
+            }
+            let summary = output::play_pcm(pcm, remaining)?;
+            println!(
+                "先頭1セグメントの出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
+                summary.frames, summary.sample_rate, summary.channels, summary.underrun_frames
+            );
+            println!(
+                "サンプル末尾で停止しました。連続再生にはplay-live／play-timefreeを使用してください"
+            );
+        } else {
+            println!("音声出力は行っていません。30分連続再生・実際の番組末尾の停止は未検証です");
+        }
         return Ok(());
     }
     if args.len() != 4 || args[0] != "inspect-chapters" {

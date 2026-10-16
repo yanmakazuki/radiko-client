@@ -1,3 +1,4 @@
+pub mod searches;
 use crate::session::MemberSession;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]

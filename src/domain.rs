@@ -1,3 +1,4 @@
+pub mod search;
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike};
 use std::time::Duration as Position;
 
@@ -97,4 +98,43 @@ impl ChapterSet {
 pub struct Station {
     pub id: String,
     pub name: String,
+}
+
+/// An explicit inclusive broadcast-day selection, bounded to 30 days.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BroadcastRange {
+    start: NaiveDate,
+    end: NaiveDate,
+    days: Vec<NaiveDate>,
+}
+impl BroadcastRange {
+    pub fn single(day: NaiveDate) -> Self {
+        Self {
+            start: day,
+            end: day,
+            days: vec![day],
+        }
+    }
+    pub fn new(start: NaiveDate, end: NaiveDate) -> Result<Self, &'static str> {
+        let span = end.signed_duration_since(start).num_days();
+        if !(0..30).contains(&span) {
+            return Err("期間は開始日から終了日までの1〜30放送日で指定してください");
+        }
+        let mut days = vec![start];
+        let mut day = start;
+        while day < end {
+            day = day.succ_opt().ok_or("放送日の範囲外です")?;
+            days.push(day);
+        }
+        Ok(Self { start, end, days })
+    }
+    pub fn start(&self) -> NaiveDate {
+        self.start
+    }
+    pub fn end(&self) -> NaiveDate {
+        self.end
+    }
+    pub fn days(&self) -> &[NaiveDate] {
+        &self.days
+    }
 }

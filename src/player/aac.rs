@@ -1,4 +1,4 @@
-//! Stateful, bounded ADTS decoding. Only diagnostic counters survive a segment.
+//! Stateful, bounded ADTS decoding; PCM retention requires an explicit call.
 use rusty_aac::{config::StreamConfig, decode::Decoder, parse_adts};
 use std::{
     fmt,
@@ -7,6 +7,7 @@ use std::{
 
 pub const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PACKETS: usize = 4096;
+const MAX_PCM_SAMPLES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AacError {
@@ -61,6 +62,19 @@ pub struct AacSummary {
     pub media_duration: Duration,
     pub decode_duration: Duration,
     pub nonzero_samples: usize,
+}
+
+/// Validated PCM for one short segment. Debug deliberately omits audio samples.
+pub struct DecodedPcm {
+    pub summary: AacSummary,
+    pub samples: Vec<f32>,
+}
+impl fmt::Debug for DecodedPcm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodedPcm")
+            .field("summary", &self.summary)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,17 +150,34 @@ impl AdtsDecoder {
         bytes: &[u8],
         declared_codec: Option<&str>,
     ) -> Result<AacSummary, AacError> {
-        let result = self.decode(bytes, declared_codec);
+        let result = self.decode(bytes, declared_codec, None);
         if result.is_err() {
             self.decoder = None;
             self.format = None;
         }
         result
     }
+    /// Retains at most 4 MiB; no PCM escapes if any packet or final check fails.
+    pub fn decode_segment_pcm(
+        &mut self,
+        bytes: &[u8],
+        declared_codec: Option<&str>,
+    ) -> Result<DecodedPcm, AacError> {
+        let mut samples = Vec::with_capacity(MAX_PCM_SAMPLES);
+        match self.decode(bytes, declared_codec, Some(&mut samples)) {
+            Ok(summary) => Ok(DecodedPcm { summary, samples }),
+            Err(error) => {
+                self.decoder = None;
+                self.format = None;
+                Err(error)
+            }
+        }
+    }
     fn decode(
         &mut self,
         bytes: &[u8],
         declared_codec: Option<&str>,
+        mut pcm: Option<&mut Vec<f32>>,
     ) -> Result<AacSummary, AacError> {
         let started = Instant::now();
         let frames = frames(bytes)?;
@@ -206,7 +237,13 @@ impl AdtsDecoder {
             summary.frames += output_frames;
             summary.nonzero_samples += audio.samples.iter().filter(|s| s.abs() > 0.000_001).count();
             summary.sbr_detected |= decoder.saw_sbr();
-            // Drop this packet's PCM here. Do not accumulate an entire programme.
+            if let Some(samples) = pcm.as_mut() {
+                if samples.len() + audio.samples.len() > MAX_PCM_SAMPLES {
+                    return Err(AacError::TooLarge);
+                }
+                samples.extend_from_slice(&audio.samples);
+            }
+            // Normal decode probes discard PCM; explicit output retains one bounded segment.
         }
         summary.decode_duration = started.elapsed();
         summary.stereo_expansion = summary.core_channels == 1 && summary.channels == 2;
@@ -270,6 +307,34 @@ mod tests {
         }
         assert!(result.len() >= 3);
         result
+    }
+    #[test]
+    fn retained_pcm_is_complete_validated_and_bounded_before_output() {
+        let bytes = generated_adts(24000, false).concat();
+        let mut decoder = AdtsDecoder::new();
+        let pcm = decoder.decode_segment_pcm(&bytes, None).unwrap();
+        assert_eq!(
+            pcm.samples.len(),
+            pcm.summary.frames * usize::from(pcm.summary.channels)
+        );
+        assert!(pcm.samples.capacity() <= MAX_PCM_SAMPLES);
+        assert!(pcm.samples.iter().all(|s| s.is_finite()));
+        assert!(pcm.samples.iter().any(|s| s.abs() > 0.000001));
+        assert!(!format!("{pcm:?}").contains("samples: ["));
+        assert_eq!(
+            decoder
+                .decode_segment_pcm(&bytes, Some("mp4a.40.5"))
+                .unwrap_err(),
+            AacError::DeclaredSbrMissing
+        );
+        assert!(decoder.decode_segment_pcm(&bytes, None).is_ok());
+        let packet = generated_adts(24000, false).remove(0);
+        let too_much = packet.repeat(MAX_PCM_SAMPLES / 1024 + 1);
+        assert_eq!(
+            decoder.decode_segment_pcm(&too_much, None).unwrap_err(),
+            AacError::TooLarge
+        );
+        assert!(decoder.decode_segment_pcm(&bytes, None).is_ok());
     }
     #[test]
     fn generated_mpeg2_adts_with_id3_decodes_every_packet_at_the_correct_rate() {

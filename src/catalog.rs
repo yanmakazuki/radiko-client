@@ -1,6 +1,7 @@
 //! Region selection and bounded acquisition. Only the current request is retained.
+pub mod search;
 use crate::{
-    domain::Station,
+    domain::{BroadcastRange, Station},
     radiko::catalog::{CatalogClient, CatalogError, ProgramList, validate_area},
 };
 use chrono::NaiveDate;
@@ -33,6 +34,7 @@ pub struct SelectedStation {
 }
 #[derive(Debug)]
 pub struct Failure {
+    pub day: Option<NaiveDate>,
     pub target: String,
     pub error: CatalogError,
 }
@@ -52,6 +54,7 @@ impl Report {
     }
 }
 pub struct Progress<'a> {
+    pub day: Option<NaiveDate>,
     pub phase: &'static str,
     pub target: &'a str,
     pub completed: usize,
@@ -66,6 +69,15 @@ pub fn acquire(
     source: &impl Source,
     areas: &[String],
     day: NaiveDate,
+    progress: impl FnMut(Progress<'_>),
+) -> Result<Report, CatalogError> {
+    acquire_range(source, areas, &BroadcastRange::single(day), progress)
+}
+
+pub fn acquire_range(
+    source: &impl Source,
+    areas: &[String],
+    range: &BroadcastRange,
     mut progress: impl FnMut(Progress<'_>),
 ) -> Result<Report, CatalogError> {
     for area in areas {
@@ -108,11 +120,13 @@ pub fn acquire(
                     }
                 }
                 Err(error) => report.area_failures.push(Failure {
+                    day: None,
                     target: area.clone(),
                     error,
                 }),
             }
             progress(Progress {
+                day: None,
                 phase: "局一覧",
                 target: area,
                 completed,
@@ -126,16 +140,78 @@ pub fn acquire(
     for station in &mut report.stations {
         station.areas.sort();
     }
-    let stations: Vec<_> = report
+    acquire_schedules(source, range, &mut report, &mut progress);
+    Ok(report)
+}
+
+/// Explicit station selections skip regional discovery, sharing the same global worker bound.
+pub fn acquire_stations(
+    source: &impl Source,
+    stations: &[String],
+    range: &BroadcastRange,
+    mut progress: impl FnMut(Progress<'_>),
+) -> Result<Report, CatalogError> {
+    if stations.is_empty() {
+        return Err(CatalogError::InvalidStation);
+    }
+    for station in stations {
+        crate::radiko::stream::validate_station(station)
+            .map_err(|_| CatalogError::InvalidStation)?;
+    }
+    let stations = stations
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| SelectedStation {
+            station: Station {
+                name: id.clone(),
+                id,
+            },
+            areas: vec![],
+        })
+        .collect();
+    let mut report = Report {
+        areas: vec![],
+        stations,
+        lists: vec![],
+        area_failures: vec![],
+        schedule_failures: vec![],
+    };
+    acquire_schedules(source, range, &mut report, &mut progress);
+    for station in &mut report.stations {
+        if let Some(list) = report
+            .lists
+            .iter()
+            .find(|list| list.station_id == station.station.id)
+        {
+            station.station.name = list.station_name.clone();
+        }
+    }
+    Ok(report)
+}
+
+fn acquire_schedules(
+    source: &impl Source,
+    range: &BroadcastRange,
+    report: &mut Report,
+    progress: &mut impl FnMut(Progress<'_>),
+) {
+    let jobs: Vec<_> = report
         .stations
         .iter()
-        .map(|s| s.station.id.clone())
+        .flat_map(|station| {
+            range
+                .days()
+                .iter()
+                .map(move |day| (station.station.id.clone(), *day))
+        })
         .collect();
     let mut keys = HashSet::new();
     parallel(
-        &stations,
-        |station| source.programs(station, day),
-        |station, result, completed| {
+        &jobs,
+        |(station, day)| source.programs(station, *day),
+        |(station, day), result, completed| {
             let list = match result {
                 Ok(mut list) => {
                     list.programs.retain(|program| {
@@ -151,16 +227,18 @@ pub fn acquire(
                 Err(error) => {
                     report.schedule_failures.push(Failure {
                         target: station.clone(),
+                        day: Some(*day),
                         error,
                     });
                     None
                 }
             };
             progress(Progress {
+                day: Some(*day),
                 phase: "番組表",
                 target: station,
                 completed,
-                total: stations.len(),
+                total: jobs.len(),
                 failed: report.schedule_failures.len(),
                 list: list.as_ref(),
             });
@@ -169,18 +247,19 @@ pub fn acquire(
             }
         },
     );
-    report.lists.sort_by(|a, b| a.station_id.cmp(&b.station_id));
+    report
+        .lists
+        .sort_by(|a, b| (&a.station_id, a.broadcast_day).cmp(&(&b.station_id, b.broadcast_day)));
     report.area_failures.sort_by(|a, b| a.target.cmp(&b.target));
     report
         .schedule_failures
-        .sort_by(|a, b| a.target.cmp(&b.target));
-    Ok(report)
+        .sort_by(|a, b| (&a.target, a.day).cmp(&(&b.target, b.day)));
 }
 
-fn parallel<T: Send>(
-    jobs: &[String],
-    work: impl Fn(&str) -> T + Sync,
-    mut consume: impl FnMut(&String, T, usize),
+fn parallel<J: Sync, T: Send>(
+    jobs: &[J],
+    work: impl Fn(&J) -> T + Sync,
+    mut consume: impl FnMut(&J, T, usize),
 ) {
     let next = AtomicUsize::new(0);
     thread::scope(|scope| {

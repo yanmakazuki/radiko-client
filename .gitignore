@@ -6,3 +6,7 @@ session.json.*
 .env.*
 !.env.example
 .DS_Store
+
+searches.json
+searches.json.*
+searches.lock

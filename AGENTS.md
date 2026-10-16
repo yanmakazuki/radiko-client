@@ -2,15 +2,23 @@
 
 ## Scope and Architecture
 
-This macOS Rust client currently provides station/day and regional/nationwide day listings, authentication, HLS probes, and chapter inspection; audio output, continuous playback, search, and TUI integration remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
+This macOS Rust client currently provides filtered station and regional/nationwide date-range listings, authentication, HLS probes, bounded continuous audio output, and chapter acquisition/inspection; saved search CLI support is available; long-duration playback validation and TUI integration remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
 
 ## Project Structure
 
+- `src/domain/search.rs`: validated criteria and startup date reset; `src/storage/searches.rs`: atomic versioned criteria storage; `src/searches.rs`: offline named-search management CLI.
+
+- `src/catalog/search.rs`: pure AND/OR filtering and observed classification aggregation.
+
+- `src/chapters.rs`: read-only chapter CLI; `src/radiko/stream/chapters.rs`: metadata identity checks and bounded chapter acquisition.
+
+- `src/player/state.rs`: owned playback snapshots and active playback states.
+- `src/play.rs`: continuous playback, switching, and seek CLI; `src/player/seek.rs`: latest-request playback preparation; `src/player/playback.rs`: bounded worker and output control; `src/radiko/stream/playback.rs`: stateful HLS acquisition.
 - `src/programs.rs`: program listing CLI; `src/catalog.rs`: region selection and bounded acquisition; `src/radiko/catalog.rs`: uncached metadata HTTP/XML.
 - `src/main.rs`: CLI arguments and reporting; `src/lib.rs`: library exports.
-- `src/domain.rs`: broadcast dates, status, and chapters.
+- `src/domain.rs`: bounded broadcast-day ranges, slot identity, status, and chapters.
 - `src/radiko/`: authentication, bounded HTTP, and stream probes; `src/radiko.rs`: chapter parsing.
-- `src/player.rs` and `src/player/aac.rs`: in-memory decoding probes and stateful AAC/SBR decoding; `src/session.rs` and `src/storage.rs`: session types and persistence.
+- `src/player.rs`, `src/player/aac.rs`, and `src/player/output.rs`: decoding probes, stateful AAC/SBR decoding, and bounded CPAL output; `src/session.rs` and `src/storage.rs`: session types and persistence.
 - `tests/`: CLI, domain, and storage integration tests; `tests/fixtures/`: synthetic JSON, XML, and HLS assets.
 
 ## Build and Development Commands
@@ -40,7 +48,7 @@ History uses short Japanese descriptions and an English initial commit, without 
 
 ## Security and Configuration
 
-Never persist passwords or log credentials, cookies, tokens, or signed URLs. Use `--data-dir` for session storage: atomic writes, directories `0700`, files `0600`. Preserve corrupt files until explicit successful login. Do not cache program data or persist audio.
+Never persist passwords or log credentials, cookies, tokens, or signed URLs. Use `--data-dir` for session and search-condition storage: atomic writes, directories `0700`, files `0600`. Preserve corrupt files until explicit successful login. Do not cache program data or persist audio.
 
 ---
 
@@ -52,13 +60,33 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 
 ## 現在の状態
 
+- 2026年10月16日に`searches save/list/show/delete/restore`と`programs --saved NAME`／`--restore`を追加。名前付き条件は保存期間、前回条件の復元は当日1日を適用する。version付きsearches.jsonへ原子的保存し、破損保護・権限・非待機の更新排他を実装。2日46枠→6件の保存呼び出しと当日24枠→0件の復元を確認。fmt・clippy・全135テスト成功。TUI起動時の自動復元と編集／検索世代の統合は未接続。
+
+- 2026年10月16日に`programs ... START END`の期間取得・検索を追加（両端含む最大30放送日）。局発見は期間全体で一度、局×日付の全体で最大4並列、失敗は局・日別に保持する。TBSの2日46枠→6件、JP44の2日476枠→17件を確認。fmt・clippy・全125テスト成功。条件保存・アプリ／TUI統合は未実装。
+
+- 2026年10月16日に`programs`へ`--keyword`／`--genre`／`--personality`、軸別未分類指定、`--classifications`を追加。同軸OR・異軸AND、分類は絞り込み前の今回の取得結果から集計する。TBS23枠→3枠、JP44の6局243枠→0件でも取得件数と観測分類を保持することを確認。fmt・clippy・全118テスト成功。期間・条件保存・アプリ／TUIでの検索は未実装。
+
+- 2026年10月16日に`chapters STATION YYYYMMDDHHmmss`を追加。公開メタデータのeventId・開始時刻とチャプター応答の局・programIdを照合し、参考位置のみを表示する。TBS前日／10日前の分割枠で認証なしに13件／14件（楽曲除外）の取得を確認。fmt・clippy・全109テスト成功。実音声との時刻対応・ジャンプ再生は未検証／未接続。
+
+- 2026年10月16日に番組名・状態・音量・準備先の通知と`status`を追加。`player::state::PlaybackSnapshot`は現在の対象と準備先を分離し、ライブの番組内位置は未確認として扱う。TBS前日枠でJST・番組名・停止／再開準備・音量表示を確認。fmt・clippy・全102テスト成功。アプリ／TUI統合と長時間検証は未完了。
+
+- 2026年10月16日に対話再生の`live STATION`／`timefree STATION YYYYMMDDHHmmss [--offset SECONDS]`を追加。準備成功後のみ局・番組を切り替え、後続シークと再開も新枠を対象にする。TBS前日→10日前→OBSライブの切替・切替後シークと、OBSで120秒の出力を確認（不足0）。fmt・clippy・全96テスト成功。聴感同期、30分／TUI同時操作は未完了。
+
+- 2026年10月16日に対話再生へ`pause`／`resume`／`volume 0〜100`を追加。タイムフリーは停止位置、ライブは同じ枠の最新位置で再開準備する。一時停止で古い準備を無効化し、音量を世代間で維持する。TBS前日枠で停止位置保持・再開・ミュート中の位置進行・q終了を確認。全91テスト成功。実配信ライブ再開・長時間停止・聴感は未検証。
+
+- 2026年10月16日に`play-timefree --offset SECONDS`と`--interactive`を追加。`seek 秒数`／`+15`／`-15`／`q`に対応し、PDTで時刻を確認できた配信だけをシークする。旧再生を継続したままPCMと出力機器を準備し、最新要求だけに切り替える。TBS前日／10日前の開始位置、要求上書き、15秒戻る操作、q停止を確認。fmt・clippy・全87テスト成功。局切替、TUI／チャプター連携、聴感同期、30分検証は未完了。
+
+- 2026年10月16日に`play-live STATION [--seconds N]`と`play-timefree STATION YYYYMMDDHHmmss [--seconds N]`を追加。HLSの通し番号で更新・重複・欠落を管理し、同一デコーダー／出力streamで連続再生する。PCMチャネル容量1、出力2秒。OBSライブ・TBS前日／10日前を各30秒、TBSライブのCtrl+C中断を確認。fmt・clippy・全78テスト成功。30分連続再生、聴感、実機番組終了境界、検索／TUI同時操作は未検証。
+
+- 2026年10月16日に`probe-output [SECONDS]`と`play-sample STATION [YYYYMMDDHHmmss]`を追加。純Rustデコード済みの短いサンプルをCPALへ渡し、2秒のrtrbバッファと最大4MiBのPCM上限を設けた。生成音・地元OBS／エリア外TBSライブ・TBS前日／10日前タイムフリーの出力経路を実機で確認。fmt・clippy・全66テスト成功。通常のプローブは音声を出さない。連続再生・シーク・局切替・実際の放送終了境界・聴感品質は未検証。詳細は実装状況を参照。
+
 - 単一局指定に加え、`programs --areas JP13,JP14 [YYYYMMDD] [--json]`と`programs --all [YYYYMMDD] [--json]`を追加。地域別局一覧から対象局を重複排除し、単一日を最大4並列で毎回取得する。部分失敗を表示し、JSONのcompleteと終了コードで欠落を通知する。2026年10月15日に47地域の応答から109局・4,323枠の取得、fmt・clippy・全58テスト成功を確認。期間指定・分類／キーワード検索・TUIは未実装。
 
-- 初期実装段階。放送日・放送状態、チャプターJSON解析に加え、会員ログイン・セッション確認・原子的保存／削除の検証用CLIを追加済み。会員ログインはユーザー確認済み。ライブ／タイムフリーのHLS・先頭サンプル取得CLIも追加し、実アカウントで地元OBS・エリア外TBSライブ、TBS前日／10日前の取得を確認済み。音声出力・連続再生・検索・TUIは未実装。
+- 初期実装段階。放送日・放送状態、チャプターJSON解析に加え、会員ログイン・セッション確認・原子的保存／削除の検証用CLIを追加済み。会員ログインはユーザー確認済み。ライブ／タイムフリーのHLS・先頭サンプル取得CLIも追加し、実アカウントで地元OBS・エリア外TBSライブ、TBS前日／10日前の取得を確認済み。音声出力と連続再生CLIは後日の項目を参照。検索・TUIは未実装。
 - 依存取得・Cargo.lock生成済み。2026年10月15日にMacOSX26.5 SDKを明示してビルド・既存テスト6件・CLI確認9件が成功。既定のMacOSX27.0 SDKではリンクに失敗する。fmt・clippyも導入後に実行し、整形適用後のfmtチェック・警告をエラー扱いしたclippy・テスト6件が成功。詳細は[実装状況](docs/implementation.md)を参照。
 - 2026年10月14日の東京エリアの番組表XMLで、番組ジャンル・出演者分類・タグの存在を確認済み。
 - ADTS向けに純Rustの`rusty_aac 1.1.0`を追加し、地元OBS・エリア外TBSライブ、TBS前日／10日前の先頭各約5秒で、コア24kHzから48kHz・ステレオへのSBR再構成と全パケットのPCM生成を確認済み。fmt・clippy・テスト43件が成功。PSの明示シグナル・聴感品質・音声出力・連続再生は未検証。非ADTSのHE-AACは未対応で、取得成功やサンプルのPCM生成を30分連続再生対応済みとしない。
-- 2026年10月15日に公開実装で公式AIチャプターの取得処理を確認。取得先・フィールド・参考リンクは設計書の「タイムフリーのチャプター」に記載。本プロジェクトでの実通信、`eventId`の対応付け、認証条件、ジャンプ再生は未検証。
+- 2026年10月15日に公開実装で公式AIチャプターの取得処理を確認。取得先・フィールド・参考リンクは設計書の「タイムフリーのチャプター」に記載。当日時点では本プロジェクトでの実通信、`eventId`の対応付け、認証条件、ジャンプ再生は未検証。取得の更新は2026年10月16日の項目を参照。
 - 検証結果を記録する際は、確認日・対象・手順・結果を示す。取得できた番組情報だけを根拠に再生対応済みとは判断しない。
 
 ## 開発の順序

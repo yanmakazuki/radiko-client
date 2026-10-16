@@ -1,5 +1,9 @@
-//! One in-memory sample, with no audio output and no persistent recording.
+//! In-memory decode probes and explicit bounded audio output; no persistent recording.
 pub mod aac;
+pub mod output;
+pub mod playback;
+pub mod seek;
+pub mod state;
 use std::io::Cursor;
 use symphonia::core::{
     codecs::{CODEC_TYPE_AAC, CODEC_TYPE_PCM_S16LE, DecoderOptions},

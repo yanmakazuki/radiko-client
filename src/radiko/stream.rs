@@ -1,8 +1,14 @@
 //! Explicit network probe; sessions, signed URLs and media bytes are never logged or saved.
+pub mod chapters;
+pub mod playback;
 use super::http::{Fetch, Http, trusted};
 use crate::{
     domain::broadcast_day,
-    player::{DecodeProbe, probe_declared_sample},
+    player::{
+        DecodeProbe,
+        aac::{AdtsDecoder, DecodedPcm},
+        probe_declared_sample,
+    },
     session::{MemberSession, Membership},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -27,6 +33,7 @@ const PLAYER_KEY: &[u8] = b"bcd151073c03b352e1ef2fd66c32209da9ca0afa";
 pub enum ProbeError {
     At(&'static str, Box<ProbeError>),
     InvalidInput,
+    InvalidPosition,
     Network,
     Http(u16),
     Authentication,
@@ -54,6 +61,9 @@ impl fmt::Display for ProbeError {
             Self::At(stage, error) => write!(f, "{stage}: {error}"),
             Self::Http(status) => write!(f, "配信サーバーがHTTP {status}を返しました"),
             other => f.write_str(match other {
+                Self::InvalidPosition => {
+                    "シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+                }
                 Self::InvalidInput => "局IDまたは日時が不正です（日時は日本時間のYYYYMMDDHHmmss）",
                 Self::Network => "配信の検証中に通信に失敗しました",
                 Self::Authentication => {
@@ -115,9 +125,19 @@ pub struct ProbeReport {
     pub container: &'static str,
     pub sample_bytes: usize,
     pub decode: DecodeProbe,
+    /// One validated segment, never serialized or logged.
+    pub audio: Option<DecodedPcm>,
 }
 
+#[derive(Clone)]
+struct ChapterEvent {
+    id: String,
+    origin: DateTime<FixedOffset>,
+}
+#[derive(Clone)]
 struct Program {
+    chapter_event: Option<ChapterEvent>,
+    title: Option<String>,
     start: DateTime<FixedOffset>,
     end: DateTime<FixedOffset>,
     timefree: [Option<bool>; 4],
@@ -158,13 +178,55 @@ pub fn probe(
     session: &MemberSession,
     membership: &Membership,
 ) -> Result<ProbeReport, ProbeError> {
+    execute_probe(station, mode, cursor, session, membership, false)
+}
+
+pub fn probe_for_output(
+    station: &str,
+    mode: ProbeMode,
+    cursor: DateTime<FixedOffset>,
+    session: &MemberSession,
+    membership: &Membership,
+) -> Result<ProbeReport, ProbeError> {
+    execute_probe(station, mode, cursor, session, membership, true)
+}
+
+struct ProbeOptions {
+    now: DateTime<FixedOffset>,
+    retain_audio: bool,
+}
+impl From<DateTime<FixedOffset>> for ProbeOptions {
+    fn from(now: DateTime<FixedOffset>) -> Self {
+        Self {
+            now,
+            retain_audio: false,
+        }
+    }
+}
+
+fn execute_probe(
+    station: &str,
+    mode: ProbeMode,
+    cursor: DateTime<FixedOffset>,
+    session: &MemberSession,
+    membership: &Membership,
+    retain_audio: bool,
+) -> Result<ProbeReport, ProbeError> {
     validate_station(station)?;
     let now = Utc::now().fixed_offset();
     if mode == ProbeMode::TimeFree && cursor > now {
         return Err(ProbeError::Upcoming);
     }
     let http = Http::new()?;
-    probe_with(&http, station, mode, cursor, now, session, membership)
+    probe_with(
+        &http,
+        station,
+        mode,
+        cursor,
+        ProbeOptions { now, retain_audio },
+        session,
+        membership,
+    )
 }
 
 fn probe_with(
@@ -172,12 +234,86 @@ fn probe_with(
     station: &str,
     mode: ProbeMode,
     cursor: DateTime<FixedOffset>,
-    now: DateTime<FixedOffset>,
+    options: impl Into<ProbeOptions>,
     session: &MemberSession,
     membership: &Membership,
 ) -> Result<ProbeReport, ProbeError> {
-    let program = program(http, station, cursor).map_err(|e| e.at("放送枠取得"))?;
+    let ProbeOptions { now, retain_audio } = options.into();
+    let PreparedRequest {
+        program,
+        auth,
+        outside_area,
+        endpoints,
+    } = prepare_with(http, station, mode, cursor, now, session, membership)?;
+    let mut last_error = ProbeError::NoEndpoint;
+    for (failed, endpoint) in endpoints.into_iter().enumerate() {
+        match inspect_hls(http, endpoint, &auth.headers, retain_audio) {
+            Ok(sample) => {
+                return Ok(ProbeReport {
+                    station: station.into(),
+                    starts_at: program.start,
+                    ends_at: program.end,
+                    mode,
+                    area: auth.area,
+                    outside_area,
+                    failed_endpoints: failed,
+                    segments: sample.segments,
+                    playlist_seconds: sample.seconds,
+                    end_list: sample.end_list,
+                    declared_codec: sample.codec,
+                    container: sample.container,
+                    sample_bytes: sample.bytes,
+                    decode: sample.decode,
+                    audio: sample.audio,
+                });
+            }
+            Err(error @ (ProbeError::Authentication | ProbeError::RateLimited)) => {
+                return Err(error);
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error.at("HLS・サンプル取得"))
+}
+
+struct PreparedRequest {
+    program: Program,
+    auth: PlaybackAuth,
+    outside_area: bool,
+    endpoints: Vec<Url>,
+}
+struct RequestedPosition {
+    at: DateTime<FixedOffset>,
+    position: std::time::Duration,
+}
+impl From<DateTime<FixedOffset>> for RequestedPosition {
+    fn from(at: DateTime<FixedOffset>) -> Self {
+        Self {
+            at,
+            position: std::time::Duration::ZERO,
+        }
+    }
+}
+fn prepare_with(
+    http: &impl Fetch,
+    station: &str,
+    mode: ProbeMode,
+    cursor: impl Into<RequestedPosition>,
+    now: DateTime<FixedOffset>,
+    session: &MemberSession,
+    membership: &Membership,
+) -> Result<PreparedRequest, ProbeError> {
+    let cursor = cursor.into();
+    let program = program(http, station, cursor.at).map_err(|e| e.at("放送枠取得"))?;
     eligible(&program, mode, now, membership)?;
+    if (mode == ProbeMode::Live && !cursor.position.is_zero())
+        || cursor.position
+            >= (program.end - program.start)
+                .to_std()
+                .map_err(|_| ProbeError::InvalidInput)?
+    {
+        return Err(ProbeError::InvalidPosition);
+    }
     let auth = authenticate(http, session).map_err(|e| e.at("配信認証"))?;
     let outside_area =
         !local_station(http, &auth.area, station).map_err(|e| e.at("地域の局一覧取得"))?;
@@ -198,36 +334,42 @@ fn probe_with(
             false,
         )
         .map_err(|e| e.at("配信先設定の取得"))?;
-    let endpoints = endpoints(&config.bytes, mode, outside_area)?;
-    let mut last_error = ProbeError::NoEndpoint;
-    for (failed, endpoint) in endpoints.into_iter().enumerate() {
-        let endpoint = playlist_url(endpoint, station, mode, &program, outside_area)?;
-        match inspect_hls(http, endpoint, &auth.headers) {
-            Ok(sample) => {
-                return Ok(ProbeReport {
-                    station: station.into(),
-                    starts_at: program.start,
-                    ends_at: program.end,
-                    mode,
-                    area: auth.area,
-                    outside_area,
-                    failed_endpoints: failed,
-                    segments: sample.segments,
-                    playlist_seconds: sample.seconds,
-                    end_list: sample.end_list,
-                    declared_codec: sample.codec,
-                    container: sample.container,
-                    sample_bytes: sample.bytes,
-                    decode: sample.decode,
-                });
+    let endpoints = endpoints(&config.bytes, mode, outside_area)?
+        .into_iter()
+        .map(|endpoint| {
+            let mut url = playlist_url(endpoint, station, mode, &program, outside_area)?;
+            if !cursor.position.is_zero() {
+                let pairs: Vec<(String, String)> = url
+                    .query_pairs()
+                    .filter(|(key, _)| key != "l")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                url.set_query(None);
+                url.query_pairs_mut()
+                    .extend_pairs(pairs)
+                    .append_pair("l", "60");
+                let seconds = cursor.position.as_secs().saturating_sub(10);
+                let seek = program
+                    .start
+                    .checked_add_signed(Duration::seconds(
+                        i64::try_from(seconds).map_err(|_| ProbeError::InvalidInput)?,
+                    ))
+                    .ok_or(ProbeError::InvalidInput)?;
+                let zone = FixedOffset::east_opt(9 * 3600).ok_or(ProbeError::InvalidInput)?;
+                url.query_pairs_mut().append_pair(
+                    "seek",
+                    &seek.with_timezone(&zone).format("%Y%m%d%H%M%S").to_string(),
+                );
             }
-            Err(error @ (ProbeError::Authentication | ProbeError::RateLimited)) => {
-                return Err(error);
-            }
-            Err(error) => last_error = error,
-        }
-    }
-    Err(last_error.at("HLS・サンプル取得"))
+            Ok(url)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PreparedRequest {
+        program,
+        auth,
+        outside_area,
+        endpoints,
+    })
 }
 
 fn url(text: &str) -> Result<Url, ProbeError> {
@@ -383,7 +525,42 @@ fn parse_program(
         Some(2) => Some(false),
         _ => None,
     };
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|value| {
+            value
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(512)
+                .collect::<String>()
+        })
+        .filter(|value| !value.trim().is_empty());
+    // eventId belongs to this API response, never to the schedule XML ID namespace.
+    let chapter_event = value
+        .get("eventId")
+        .and_then(Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+        .zip(
+            value
+                .get("episodeIntroductionStartAt")
+                .and_then(Value::as_str)
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok()),
+        )
+        .filter(|_| value.get("stationId").and_then(Value::as_str) == Some(station))
+        .map(|(id, origin)| ChapterEvent {
+            id: id.into(),
+            origin,
+        });
     Ok(Program {
+        chapter_event,
+        title,
         start,
         end,
         timefree: [
@@ -576,11 +753,13 @@ struct HlsSample {
     container: &'static str,
     bytes: usize,
     decode: DecodeProbe,
+    audio: Option<DecodedPcm>,
 }
 fn inspect_hls(
     http: &impl Fetch,
     mut target: Url,
     headers: &HeaderMap,
+    retain_audio: bool,
 ) -> Result<HlsSample, ProbeError> {
     let mut codec = None;
     let mut master_encrypted = false;
@@ -654,10 +833,19 @@ fn inspect_hls(
                 };
                 sample.extend_from_slice(&segment);
                 let bytes = sample.len();
-                let decode = if encrypted {
-                    DecodeProbe::Encrypted
+                let (decode, audio) = if encrypted {
+                    (DecodeProbe::Encrypted, None)
+                } else if retain_audio
+                    && crate::player::audio_offset(&sample)
+                        .and_then(|offset| sample.get(offset..))
+                        .is_some_and(rusty_aac::is_adts)
+                {
+                    match AdtsDecoder::new().decode_segment_pcm(&sample, codec.as_deref()) {
+                        Ok(pcm) => (DecodeProbe::AacDecoded(pcm.summary), Some(pcm)),
+                        Err(error) => (DecodeProbe::AacFailed(error), None),
+                    }
                 } else {
-                    probe_declared_sample(sample, codec.as_deref())
+                    (probe_declared_sample(sample, codec.as_deref()), None)
                 };
                 return Ok(HlsSample {
                     segments: media.segments.len(),
@@ -667,6 +855,7 @@ fn inspect_hls(
                     container,
                     bytes,
                     decode,
+                    audio,
                 });
             }
         }
@@ -863,6 +1052,89 @@ mod tests {
     }
 
     #[test]
+    fn seek_preserves_original_slot_uses_preroll_and_rejects_out_of_slot_before_auth() {
+        let start = "2026-10-14T11:00:00+09:00";
+        let end = "2026-10-14T12:00:00+09:00";
+        let mock = flow();
+        mock.steps.borrow_mut()[0].bytes = program_json(start, end, 0);
+        let prepared = prepare_with(
+            &mock,
+            "TBS",
+            ProbeMode::TimeFree,
+            RequestedPosition {
+                at: dt(start),
+                position: std::time::Duration::from_secs(60),
+            },
+            dt("2026-10-15T12:00:00+09:00"),
+            &member(),
+            &membership(),
+        )
+        .unwrap();
+        assert_eq!(mock.seen.borrow().len(), 5);
+        for url in prepared.endpoints {
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert_eq!(pairs.get("ft").unwrap(), "20261014110000");
+            assert_eq!(pairs.get("start_at").unwrap(), "20261014110000");
+            assert_eq!(pairs.get("end_at").unwrap(), "20261014120000");
+            assert_eq!(pairs.get("seek").unwrap(), "20261014110050");
+            assert_eq!(pairs.get("l").unwrap(), "60");
+            assert_eq!(url.query_pairs().filter(|(key, _)| key == "l").count(), 1);
+        }
+        let mock = flow();
+        mock.steps.borrow_mut()[0].bytes = program_json(start, end, 0);
+        assert!(matches!(
+            prepare_with(
+                &mock,
+                "TBS",
+                ProbeMode::TimeFree,
+                RequestedPosition {
+                    at: dt(start),
+                    position: std::time::Duration::from_secs(3600)
+                },
+                dt("2026-10-15T12:00:00+09:00"),
+                &member(),
+                &membership()
+            ),
+            Err(ProbeError::InvalidPosition)
+        ));
+        assert_eq!(mock.seen.borrow().len(), 1);
+    }
+    #[test]
+    fn sample_pcm_is_retained_only_for_explicit_output_and_is_never_in_debug_logs() {
+        use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, write_adts_header};
+        let mut encoder = AacEncoder::new(AacEncoderConfig::default());
+        let samples: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.05).sin() * 0.1).collect();
+        encoder.push_pcm(&samples, 1, 24_000).unwrap();
+        encoder.finish();
+        let mut bytes = Vec::new();
+        while let Ok(packet) = encoder.next_packet() {
+            bytes.extend(write_adts_header(&AdtsHeader {
+                object_type: 2,
+                sample_rate: 24_000,
+                channels: 1,
+                frame_length: packet.data.len() + 7,
+                header_len: 7,
+            }));
+            bytes.extend(packet.data);
+        }
+        for retain in [false, true] {
+            let mock = Mock {steps: RefCell::new(vec![step("/audio.m3u8", b"#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\nchunk.aac\n#EXT-X-ENDLIST\n"),step("/chunk.aac", &bytes)].into()),seen: RefCell::new(Vec::new())};
+            let sample = inspect_hls(
+                &mock,
+                Url::parse("https://radiko.jp/audio.m3u8").unwrap(),
+                &HeaderMap::new(),
+                retain,
+            )
+            .unwrap();
+            assert!(matches!(sample.decode, DecodeProbe::AacDecoded(_)));
+            assert_eq!(sample.audio.is_some(), retain);
+            if let Some(pcm) = sample.audio {
+                assert_eq!(pcm.samples.len(), pcm.summary.frames);
+            }
+            assert!(mock.steps.borrow().is_empty());
+        }
+    }
+    #[test]
     fn live_probe_resolves_auth_and_hls_without_leaking_member_credentials_to_cdn() {
         let mock = flow();
         let now = dt("2026-10-15T12:00:00+09:00");
@@ -959,6 +1231,25 @@ mod tests {
     }
 
     #[test]
+    fn metadata_title_is_optional_bounded_and_safe_for_terminal_display() {
+        let mut value = serde_json::json!({"programs":[{"stationId":"TBS", "startAt":"2026-10-15T03:00:00Z", "endAt":"2026-10-15T04:00:00Z", "title":"合成\n番組\u{1b}"}]});
+        let parse = |value: &Value| {
+            parse_program(
+                &serde_json::to_vec(value).unwrap(),
+                "TBS",
+                dt("2026-10-15T12:00:00+09:00"),
+            )
+            .unwrap()
+        };
+        assert_eq!(parse(&value).title.as_deref(), Some("合成番組"));
+        value["programs"][0]["title"] = Value::String("あ".repeat(600));
+        assert_eq!(parse(&value).title.unwrap().chars().count(), 512);
+        for title in [Value::Null, Value::Bool(true), Value::String(" \n".into())] {
+            value["programs"][0]["title"] = title;
+            assert!(parse(&value).title.is_none());
+        }
+    }
+    #[test]
     fn observed_blackout_flags_select_local_paid_and_outside_conditions() {
         let bytes = br#"{"programs":[{"stationId":"TBS","startAt":"2026-10-01T11:00:00+09:00","endAt":"2026-10-01T12:00:00+09:00","blackout":{"tsInNg":0,"tsplusInNg":2,"tsOutNg":2,"tsplusOutNg":0,"failedRecord":0}}]}"#;
         let program = parse_program(bytes, "TBS", dt("2026-10-01T11:00:00+09:00")).unwrap();
@@ -1035,6 +1326,8 @@ mod tests {
     #[test]
     fn timefree_contract_and_expiry_boundaries_and_blackouts_are_separate() {
         let program = Program {
+            chapter_event: None,
+            title: None,
             start: dt("2026-10-01T11:00:00+09:00"),
             end: dt("2026-10-01T12:00:00+09:00"),
             timefree: [Some(true); 4],
@@ -1089,7 +1382,7 @@ mod tests {
         ] {
             let program = Program {
                 timefree: [flag; 4],
-                ..program
+                ..program.clone()
             };
             assert_eq!(availability(&program, now, false).unwrap_err(), error);
         }
@@ -1136,6 +1429,8 @@ mod tests {
     #[test]
     fn timefree_query_uses_actual_jst_slot_not_requested_cursor_or_utc() {
         let program = Program {
+            chapter_event: None,
+            title: None,
             start: dt("2026-10-14T16:00:00Z"),
             end: dt("2026-10-14T17:00:00Z"),
             timefree: [Some(true); 4],
