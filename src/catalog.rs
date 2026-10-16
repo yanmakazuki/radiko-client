@@ -8,7 +8,7 @@ use chrono::NaiveDate;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -78,8 +78,20 @@ pub fn acquire_range(
     source: &impl Source,
     areas: &[String],
     range: &BroadcastRange,
+    progress: impl FnMut(Progress<'_>),
+) -> Result<Report, CatalogError> {
+    acquire_range_controlled(source, areas, range, &AtomicBool::new(false), progress)
+}
+pub fn acquire_range_controlled(
+    source: &impl Source,
+    areas: &[String],
+    range: &BroadcastRange,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(Progress<'_>),
 ) -> Result<Report, CatalogError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CatalogError::Cancelled);
+    }
     for area in areas {
         validate_area(area)?;
     }
@@ -100,8 +112,9 @@ pub fn acquire_range(
         schedule_failures: Vec::new(),
     };
     let mut selected = BTreeMap::<String, SelectedStation>::new();
-    parallel(
+    parallel_cancelled(
         &areas,
+        cancelled,
         |area| source.stations(area),
         |area, result, completed| {
             match result {
@@ -140,7 +153,13 @@ pub fn acquire_range(
     for station in &mut report.stations {
         station.areas.sort();
     }
-    acquire_schedules(source, range, &mut report, &mut progress);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CatalogError::Cancelled);
+    }
+    acquire_schedules(source, range, &mut report, cancelled, &mut progress);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CatalogError::Cancelled);
+    }
     Ok(report)
 }
 
@@ -149,8 +168,20 @@ pub fn acquire_stations(
     source: &impl Source,
     stations: &[String],
     range: &BroadcastRange,
+    progress: impl FnMut(Progress<'_>),
+) -> Result<Report, CatalogError> {
+    acquire_stations_controlled(source, stations, range, &AtomicBool::new(false), progress)
+}
+pub fn acquire_stations_controlled(
+    source: &impl Source,
+    stations: &[String],
+    range: &BroadcastRange,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(Progress<'_>),
 ) -> Result<Report, CatalogError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CatalogError::Cancelled);
+    }
     if stations.is_empty() {
         return Err(CatalogError::InvalidStation);
     }
@@ -178,7 +209,13 @@ pub fn acquire_stations(
         area_failures: vec![],
         schedule_failures: vec![],
     };
-    acquire_schedules(source, range, &mut report, &mut progress);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CatalogError::Cancelled);
+    }
+    acquire_schedules(source, range, &mut report, cancelled, &mut progress);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CatalogError::Cancelled);
+    }
     for station in &mut report.stations {
         if let Some(list) = report
             .lists
@@ -195,6 +232,7 @@ fn acquire_schedules(
     source: &impl Source,
     range: &BroadcastRange,
     report: &mut Report,
+    cancelled: &AtomicBool,
     progress: &mut impl FnMut(Progress<'_>),
 ) {
     let jobs: Vec<_> = report
@@ -208,8 +246,9 @@ fn acquire_schedules(
         })
         .collect();
     let mut keys = HashSet::new();
-    parallel(
+    parallel_cancelled(
         &jobs,
+        cancelled,
         |(station, day)| source.programs(station, *day),
         |(station, day), result, completed| {
             let list = match result {
@@ -256,8 +295,17 @@ fn acquire_schedules(
         .sort_by(|a, b| (&a.target, a.day).cmp(&(&b.target, b.day)));
 }
 
+#[cfg(test)]
 fn parallel<J: Sync, T: Send>(
     jobs: &[J],
+    work: impl Fn(&J) -> T + Sync,
+    consume: impl FnMut(&J, T, usize),
+) {
+    parallel_cancelled(jobs, &AtomicBool::new(false), work, consume)
+}
+fn parallel_cancelled<J: Sync, T: Send>(
+    jobs: &[J],
+    cancelled: &AtomicBool,
     work: impl Fn(&J) -> T + Sync,
     mut consume: impl FnMut(&J, T, usize),
 ) {
@@ -268,6 +316,9 @@ fn parallel<J: Sync, T: Send>(
             let (tx, work, next) = (tx.clone(), &work, &next);
             scope.spawn(move || {
                 loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(job) = jobs.get(index) else {
                         break;
@@ -280,7 +331,9 @@ fn parallel<J: Sync, T: Send>(
         }
         drop(tx);
         for (done, (index, value)) in rx.into_iter().enumerate() {
-            consume(&jobs[index], value, done + 1);
+            if !cancelled.load(Ordering::Acquire) {
+                consume(&jobs[index], value, done + 1);
+            }
         }
     });
 }

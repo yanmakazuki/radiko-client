@@ -1,3 +1,4 @@
+pub mod app;
 pub mod catalog;
 pub mod domain;
 pub mod player;

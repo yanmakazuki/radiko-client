@@ -2,9 +2,11 @@
 
 ## Scope and Architecture
 
-This macOS Rust client currently provides filtered station and regional/nationwide date-range listings, authentication, HLS probes, bounded continuous audio output, and chapter acquisition/inspection; saved search CLI support is available; long-duration playback validation and TUI integration remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
+This macOS Rust client currently provides filtered station and regional/nationwide date-range listings, authentication, HLS probes, bounded continuous audio output, and chapter acquisition/inspection; saved search CLI and a read-only search TUI are available; playback/chapter TUI integration and long-duration playback validation remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
 
 ## Project Structure
+
+- `src/app.rs` and `src/app/search.rs`: main-loop-owned search state, editing, request generations, and bounded cancellable acquisition; `src/tui.rs`: read-only Ratatui frontend and terminal restoration.
 
 - `src/domain/search.rs`: validated criteria and startup date reset; `src/storage/searches.rs`: atomic versioned criteria storage; `src/searches.rs`: offline named-search management CLI.
 
@@ -59,6 +61,8 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 実装前に[設計書](docs/design.md)と[アーキテクチャ設計](docs/architecture.md)を読む。仕様の判断は設計書とユーザーの最新の指示に従い、仕様変更時は設計書とアーキテクチャ設計も整合させる。
 
 ## 現在の状態
+
+- 2026年10月16日に閲覧専用`tui`を追加。番組一覧／詳細、キーワード編集・確定・取消、再取得、条件の当日復元・終了時保存に対応。appの検索世代・最新待機要求・容量4の通知とcatalogの協調キャンセルで古い結果を破棄し、全体4並列を維持する。仮想端末で公開番組表表示・編集・q／Ctrl+C／SIGINT終了と端末復元を確認。fmt・clippy・全143テスト成功。画面からの再生・チャプターと30分同時操作は未接続／未検証。
 
 - 2026年10月16日に`searches save/list/show/delete/restore`と`programs --saved NAME`／`--restore`を追加。名前付き条件は保存期間、前回条件の復元は当日1日を適用する。version付きsearches.jsonへ原子的保存し、破損保護・権限・非待機の更新排他を実装。2日46枠→6件の保存呼び出しと当日24枠→0件の復元を確認。fmt・clippy・全135テスト成功。TUI起動時の自動復元と編集／検索世代の統合は未接続。
 

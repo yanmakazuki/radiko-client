@@ -14,6 +14,30 @@ pub struct Filter {
     pub(crate) keyword_lowercase: Option<String>,
 }
 impl Filter {
+    pub fn with_keyword(&self, keyword: Option<String>) -> Result<Self, &'static str> {
+        Self::new(
+            self.program_genres.clone(),
+            self.personality_genres.clone(),
+            self.unclassified_program,
+            self.unclassified_personality,
+            keyword,
+        )
+    }
+    pub fn program_genres(&self) -> &[String] {
+        &self.program_genres
+    }
+    pub fn personality_genres(&self) -> &[String] {
+        &self.personality_genres
+    }
+    pub fn unclassified_program(&self) -> bool {
+        self.unclassified_program
+    }
+    pub fn unclassified_personality(&self) -> bool {
+        self.unclassified_personality
+    }
+    pub fn keyword(&self) -> Option<&str> {
+        self.keyword.as_deref()
+    }
     pub fn new(
         program_genres: Vec<String>,
         personality_genres: Vec<String>,

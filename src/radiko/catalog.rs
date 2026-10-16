@@ -15,6 +15,7 @@ const MAX_PROGRAMS: usize = 2048;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CatalogError {
+    Cancelled,
     InvalidStation,
     InvalidDate,
     InvalidArea,
@@ -30,6 +31,7 @@ pub enum CatalogError {
 impl fmt::Display for CatalogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("検索を取り消しました"),
             Self::InvalidArea => f.write_str("地域IDが不正です（JP1〜JP47）"),
             Self::WrongArea => f.write_str("取得した局一覧が指定した地域と一致しません"),
             Self::InvalidStation => f.write_str("局IDが不正です（例: TBS、OBS、FMT）"),

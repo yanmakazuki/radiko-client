@@ -354,3 +354,21 @@ fn saved_search_invalid_arguments_and_corrupt_restore_do_not_overwrite_storage()
     );
     assert_eq!(fs::read(&file).unwrap(), b"broken");
 }
+
+#[test]
+fn tui_help_and_nonterminal_rejection_do_not_start_network_or_write_preferences() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("data");
+    let path = directory.to_str().unwrap();
+    let help = run(&["--data-dir", path, "tui", "--help"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8(help.stdout).unwrap().contains("閲覧専用"));
+    let output = run(&["--data-dir", path, "tui"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("対話端末")
+    );
+    assert!(!directory.exists());
+}
