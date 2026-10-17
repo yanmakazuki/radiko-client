@@ -1,4 +1,4 @@
-//! Versioned criteria only: no schedules, classifications, credentials, or playback positions.
+//! バージョン付き検索条件の保存。番組表・分類一覧・認証情報・再生位置は含めない。
 use super::*;
 use crate::domain::{
     BroadcastRange,

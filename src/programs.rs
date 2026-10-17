@@ -1,3 +1,4 @@
+//! 番組一覧CLIの条件解析と表示。取得件数と絞り込み後の件数、取得失敗を区別する。
 use chrono::{DateTime, FixedOffset, Utc};
 use radiko_client::catalog::search::{Filter, ObservedClassifications};
 use radiko_client::{

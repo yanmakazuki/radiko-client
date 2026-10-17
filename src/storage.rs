@@ -1,3 +1,4 @@
+//! セッションの読み込みと原子的保存。破損ファイルの保護と保存先の権限検査を行う。
 pub mod searches;
 use crate::session::MemberSession;
 use serde::{Deserialize, Serialize};
@@ -86,7 +87,7 @@ impl SessionStore {
         #[cfg(unix)]
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = options.open(self.path())?;
-        // Validate the opened descriptor too, not only the path before opening.
+        // 開く前のパスだけでなく、実際に開いたファイルも検査する。
         let metadata = file.metadata()?;
         check_regular_file(&metadata)?;
         #[cfg(unix)]
@@ -113,7 +114,7 @@ impl SessionStore {
         Ok(Some(stored.session))
     }
 
-    /// Only call after explicit, successful login. Replaces corrupt old files too.
+    /// 明示的なログイン成功後にだけ呼ぶ。既存ファイルが破損していても置き換える。
     pub fn save(&self, session: MemberSession) -> Result<(), StorageError> {
         if !session.validate() {
             return Err(StorageError::Invalid);
@@ -144,7 +145,7 @@ impl SessionStore {
         })
     }
 
-    /// No network is needed to forget a local session, even when it is corrupt.
+    /// 破損時も通信せずにローカルセッションを削除できる。
     pub fn delete(&self) -> Result<(), StorageError> {
         if !self.check_directory()? {
             return Ok(());
@@ -191,8 +192,9 @@ fn atomic_write(
     write: impl FnOnce(&mut fs::File) -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    // tempfile creates Unix files with 0600, including before the first write.
+    // tempfileはUnix上で最初の書き込み前から0600の一時ファイルを作る。
     write(temporary.as_file_mut())?;
+    // 内容を同期してから置き換え、最後にディレクトリの変更も同期する。
     temporary.as_file().sync_all()?;
     temporary
         .persist(path)

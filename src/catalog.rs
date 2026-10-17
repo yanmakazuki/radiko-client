@@ -1,4 +1,4 @@
-//! Region selection and bounded acquisition. Only the current request is retained.
+//! 地域から対象局を決定し、並列数を制限して取得する。保持するのは今回の要求の結果だけ。
 pub mod search;
 use crate::{
     domain::{BroadcastRange, Station},
@@ -63,8 +63,8 @@ pub struct Progress<'a> {
     pub list: Option<&'a ProgramList>,
 }
 
-/// Region discovery finishes before schedules start, so shared stations are fetched once.
-/// The callback runs on the caller's thread; at most four network calls are active.
+/// 地域別の局発見を終えてから番組表を取得し、地域間で共通する局の重複取得を防ぐ。
+/// 通知は呼び出し元スレッドで行い、通信は全体で最大4並列とする。
 pub fn acquire(
     source: &impl Source,
     areas: &[String],
@@ -163,7 +163,7 @@ pub fn acquire_range_controlled(
     Ok(report)
 }
 
-/// Explicit station selections skip regional discovery, sharing the same global worker bound.
+/// 局の明示指定では地域別の発見を省略する。並列数の上限は地域指定と共通。
 pub fn acquire_stations(
     source: &impl Source,
     stations: &[String],

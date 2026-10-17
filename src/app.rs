@@ -1,4 +1,4 @@
-//! Main-loop-owned state; metadata search never sends a playback command.
+//! メインループが所有するアプリ状態。検索の状態更新から再生コマンドは送らない。
 pub mod search;
 use crate::{
     catalog,
@@ -16,11 +16,13 @@ pub enum SearchStatus {
     Failed,
 }
 pub struct AppState {
+    /// 検索に適用済みの条件。編集中の値とは独立して保持する。
     pub committed: SearchCriteria,
     pub draft: Option<SearchCriteria>,
     pub status: SearchStatus,
     pub progress: Option<search::Progress>,
     pub programs: Vec<Program>,
+    /// 元の番組配列へのインデックス。描画のたびに再絞り込みしない。
     pub visible: Vec<usize>,
     pub area_failures: Vec<catalog::Failure>,
     pub schedule_failures: Vec<catalog::Failure>,
@@ -64,6 +66,7 @@ impl AppState {
     pub fn cancel_edit(&mut self) {
         self.draft = None;
     }
+    /// 条件を確定して世代を進める。実際の取得開始は呼び出し元が行う。
     pub fn commit(&mut self) -> Result<SearchId, &'static str> {
         let next = self.id.0.checked_add(1).ok_or("検索要求数の上限です")?;
         if let Some(draft) = self.draft.take() {
@@ -71,6 +74,7 @@ impl AppState {
         }
         self.id = SearchId(next);
         self.status = SearchStatus::Loading;
+        // 前回の一覧で未取得範囲を補完せず、今回の取得結果だけを表示する。
         self.programs.clear();
         self.visible.clear();
         self.area_failures.clear();
@@ -81,6 +85,7 @@ impl AppState {
         Ok(self.id)
     }
     pub fn apply(&mut self, event: Event) {
+        // キャンセル後に遅れて届いた旧検索の結果を、新しい一覧へ混ぜない。
         if event.id() != self.id {
             return;
         }

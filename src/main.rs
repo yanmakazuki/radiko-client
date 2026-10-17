@@ -1,3 +1,4 @@
+//! CLIの入口。サブコマンドへ処理を振り分け、結果や安全なエラー情報を表示する。
 mod chapters;
 mod play;
 mod programs;

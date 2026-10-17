@@ -1,3 +1,4 @@
+//! 公式チャプターの取得・一覧表示CLI。参考位置の表示に限定し、ジャンプ再生は行わない。
 use chrono::FixedOffset;
 use radiko_client::radiko::stream::{
     self,

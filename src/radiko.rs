@@ -1,4 +1,4 @@
-//! External data parsing. No inferred event binding or listening permission.
+//! 外部データの解析。チャプターの対応付けや聴取権限を解析結果だけから推定しない。
 pub mod auth;
 pub mod catalog;
 mod http;

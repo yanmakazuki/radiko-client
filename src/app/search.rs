@@ -1,4 +1,4 @@
-//! One acquisition at a time, a latest pending request, and four bounded progress messages.
+//! 取得は一度に一つ実行し、待機要求は最新の一つだけ保持する。進捗通知は容量4に制限する。
 use crate::{
     catalog::{self, Report, Source},
     domain::{
@@ -145,10 +145,12 @@ impl Service {
         if let Some(active) = &self.active {
             active.cancel.store(true, Ordering::Release);
         }
+        // 入力が続いても要求を積み上げず、次に実行する条件を上書きする。
         self.pending = Some((id, criteria));
         self.launch();
     }
     fn launch(&mut self) {
+        // 実行中HTTPの終了を待ってから次世代を開始し、全体の並列上限を守る。
         if self.active.is_some() {
             return;
         }
@@ -172,7 +174,7 @@ impl Service {
                     .await
                     .map_err(|_| Error::Worker)
                     .and_then(|r| r.map_err(Error::Catalog));
-                // A worker may have sent its final progress after the first drain.
+                // 最初の受信後に届いた最終進捗も、完了イベントより先に反映する。
                 for _ in 0..4 {
                     let Ok(event) = self.rx.try_recv() else { break };
                     events.push(event);

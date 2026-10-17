@@ -1,4 +1,4 @@
-//! Owned playback notifications contain public metadata and counters only.
+//! 再生状態通知は公開メタデータとカウンターのみを所有し、認証情報や音声を含めない。
 use super::{output::OutputSummary, seek::PlaybackRequest};
 use crate::radiko::stream::{ProbeMode, playback::StreamInfo};
 use std::time::Duration;

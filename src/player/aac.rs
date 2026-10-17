@@ -1,4 +1,4 @@
-//! Stateful, bounded ADTS decoding; PCM retention requires an explicit call.
+//! 状態を保持する容量制限付きADTSデコーダー。PCMは明示的に要求された場合だけ保持する。
 use rusty_aac::{config::StreamConfig, decode::Decoder, parse_adts};
 use std::{
     fmt,

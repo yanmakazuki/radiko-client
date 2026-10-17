@@ -1,4 +1,4 @@
-//! Explicit network probe; sessions, signed URLs and media bytes are never logged or saved.
+//! 明示実行する配信検証。セッション、署名付きURL、音声データはログ出力・保存しない。
 pub mod chapters;
 pub mod playback;
 use super::http::{Fetch, Http, trusted};

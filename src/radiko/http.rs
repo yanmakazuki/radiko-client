@@ -1,4 +1,4 @@
-//! Bounded probe HTTP. Raw reqwest errors, URLs and bodies never escape this module.
+//! サイズ・時間・再試行回数を制限するHTTP処理。生のエラー・URL・本文を外部へ返さない。
 use super::stream::ProbeError;
 use reqwest::{
     Url,

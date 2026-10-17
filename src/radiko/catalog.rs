@@ -1,4 +1,4 @@
-//! Read-only, uncached station/day schedules. No session or playback requests.
+//! キャッシュを使わない局一覧・日別番組表の取得。セッションや再生要求は扱わない。
 use super::{
     http::{Fetch, Http},
     stream::{ProbeError, parse_time, validate_station},

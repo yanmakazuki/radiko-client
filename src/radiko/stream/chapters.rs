@@ -1,4 +1,4 @@
-//! Explicit, read-only chapter inspection. Candidate seconds do not authorize seeking.
+//! 公式チャプターの取得・参照。候補の秒数が得られても、シーク可能とは判定しない。
 use super::*;
 use crate::{
     domain::ChapterSet,

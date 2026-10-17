@@ -1,3 +1,4 @@
+//! 連続再生CLIの操作と通知。認証確認、割り込み、対話コマンドを再生処理へ接続する。
 use chrono::{DateTime, FixedOffset, Utc};
 use radiko_client::player::seek::{Command, Controller, PlaybackRequest};
 use radiko_client::{

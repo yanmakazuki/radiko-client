@@ -1,4 +1,4 @@
-//! Pure filtering of this acquisition only. This module performs no I/O or caching.
+//! 今回取得した番組の絞り込みと観測分類の集計。通信やキャッシュは扱わない。
 use crate::domain::{Classification, Program};
 use std::collections::BTreeSet;
 

@@ -1,3 +1,4 @@
+//! 放送枠・放送日・状態・チャプターの共通型と判定。放送状態と聴取可否は別に扱う。
 pub mod search;
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike};
 use std::time::Duration as Position;
@@ -17,7 +18,7 @@ pub struct Classification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
     pub key: ProgramKey,
-    /// Schedule XML ID; never assume this is a chapter eventId.
+    /// 番組表XMLのID。チャプター用のeventIdと同じものだと仮定しない。
     pub program_id: String,
     pub ends_at: DateTime<FixedOffset>,
     pub title: String,
@@ -29,7 +30,7 @@ pub struct Program {
     pub personality_genres: Vec<Classification>,
 }
 
-/// radiko's broadcast day starts at 05:00 JST, regardless of input timezone.
+/// 入力のタイムゾーンによらず、日本時間の午前5時を放送日の境界にする。
 pub fn broadcast_day(now: DateTime<FixedOffset>) -> Option<NaiveDate> {
     let jst = FixedOffset::east_opt(9 * 3600)?;
     let local = now.with_timezone(&jst);
@@ -81,7 +82,7 @@ pub struct ChapterSet {
 }
 
 impl ChapterSet {
-    /// The most recent start wins; equal starts retain source order.
+    /// 重複時は開始位置が最も後の項目を選び、同じ開始位置なら元の順序を優先する。
     pub fn current(&self, position: Position) -> Option<&Chapter> {
         self.chapters
             .iter()
@@ -100,7 +101,7 @@ pub struct Station {
     pub name: String,
 }
 
-/// An explicit inclusive broadcast-day selection, bounded to 30 days.
+/// 両端を含む放送日の選択範囲。最大30日までに制限する。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BroadcastRange {
     start: NaiveDate,

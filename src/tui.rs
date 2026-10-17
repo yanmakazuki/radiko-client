@@ -1,4 +1,4 @@
-//! Read-only TUI. Rendering has no network or playback side effects.
+//! 閲覧専用TUI。描画処理は状態を参照するだけで、通信や再生を実行しない。
 use chrono::{DateTime, FixedOffset, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use radiko_client::{

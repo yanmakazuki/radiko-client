@@ -1,3 +1,4 @@
+//! 保存した検索条件を管理するオフラインCLI。番組取得や認証通信は行わない。
 use chrono::Utc;
 use radiko_client::{
     domain::search::SearchCriteria,

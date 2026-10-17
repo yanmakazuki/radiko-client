@@ -1,4 +1,4 @@
-//! Latest-request-wins playback preparation. The current output is untouched on failure.
+//! 最新要求を優先する再生準備。準備失敗時も現在の音声出力を維持する。
 use super::{
     output::StopToken,
     playback::{PlaybackError, Ready, prepare_ready},
@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-/// A target is resolved anew; it never reuses a signed URL or decoded audio.
+/// 対象を毎回解決し直し、署名付きURLやデコード済み音声を再利用しない。
 #[derive(Clone, Debug)]
 pub struct PlaybackRequest {
     pub station: String,
@@ -147,7 +147,7 @@ impl Controller {
         }
     }
     pub(super) fn poll(&mut self, info: &StreamInfo, current: Duration) -> Option<Ready> {
-        // Drain commands before results so an already-delivered older response cannot win.
+        // 結果より先に操作を処理し、配送済みの古い準備結果も採用しない。
         for command in self.commands.try_iter() {
             self.changed = true;
             let resuming = matches!(command, Command::Resume);

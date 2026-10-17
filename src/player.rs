@@ -1,4 +1,4 @@
-//! In-memory decode probes and explicit bounded audio output; no persistent recording.
+//! メモリ内でのデコード検証と容量制限付き音声出力。録音ファイルは保存しない。
 pub mod aac;
 pub mod output;
 pub mod playback;

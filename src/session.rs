@@ -1,4 +1,4 @@
-//! Reusable member session only. Never store a password or account response.
+//! 再利用可能な会員セッションだけを保持する。パスワードやアカウント応答全体は保存しない。
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

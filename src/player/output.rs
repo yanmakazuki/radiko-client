@@ -1,4 +1,4 @@
-//! CPAL output consumes complete stereo frames without locks, allocation or waits.
+//! CPALのコールバックは左右一組のフレームを消費し、ロック・メモリ確保・待機を行わない。
 use super::aac::DecodedPcm;
 use cpal::{
     SampleFormat, SampleRate,

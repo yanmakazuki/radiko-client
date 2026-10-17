@@ -1,4 +1,4 @@
-//! Explicit member-authentication probe. HTTP bodies and tokens never enter errors.
+//! 明示的な会員認証の検証。HTTP本文やトークンをエラーへ含めない。
 use crate::session::{MemberSession, Membership};
 use reqwest::{
     blocking::Client,

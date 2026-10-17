@@ -1,3 +1,4 @@
+//! 検索条件の検証と起動時の復元。番組ジャンルと出演者分類は独立した条件として保持する。
 use super::{BroadcastRange, broadcast_day};
 use chrono::{DateTime, FixedOffset};
 use std::collections::BTreeSet;

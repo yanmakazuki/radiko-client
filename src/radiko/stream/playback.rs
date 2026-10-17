@@ -1,4 +1,4 @@
-//! Stateful HLS acquisition. URLs, headers and media are intentionally not Debug.
+//! 状態を保持するHLS取得。URL・ヘッダー・音声データはDebug出力の対象にしない。
 use super::*;
 use std::time::{Duration as Wait, Instant};
 

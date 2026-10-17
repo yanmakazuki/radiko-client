@@ -1,4 +1,4 @@
-//! Main-thread output plus one bounded network/decode worker.
+//! 主スレッドで出力を制御し、通信・デコードは容量制限付きの単一ワーカーで実行する。
 use super::{
     aac::{AacError, AdtsDecoder, DecodedPcm},
     output::{ContinuousOutput, OutputError, OutputSummary, StopToken},
