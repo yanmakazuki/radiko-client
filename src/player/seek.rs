@@ -42,6 +42,10 @@ impl PlaybackRequest {
 pub enum Command {
     Select(PlaybackRequest),
     Seek(Duration),
+    SeekSlot {
+        key: crate::domain::ProgramKey,
+        position: Duration,
+    },
     Relative(i64),
     Stop,
     Pause,
@@ -61,6 +65,9 @@ struct Completed {
 }
 pub struct Controller {
     commands: Receiver<Command>,
+    preparation_worker: Option<thread::JoinHandle<()>>,
+    reporter: Box<dyn FnMut(String) + Send>,
+    pub(super) notification_interval: Duration,
     latest: Arc<Mutex<Option<Job>>>,
     results: Receiver<Completed>,
     generation: Arc<AtomicU64>,
@@ -79,11 +86,53 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
+        let mut controller =
+            Self::with_reporter(commands, stop, factory, |message| eprintln!("{message}"));
+        controller.notification_interval = Duration::from_secs(5);
+        controller
+    }
+    /// CLI reporting cadence with cancellation-aware preparation.
+    pub fn new_cancellable(
+        commands: Receiver<Command>,
+        stop: StopToken,
+        factory: impl Fn(PlaybackRequest, StopToken) -> Result<Box<dyn SegmentSource>, PlaybackError>
+        + Send
+        + 'static,
+    ) -> Self {
+        let mut controller = Self::with_cancellable_reporter(commands, stop, factory, |message| {
+            eprintln!("{message}")
+        });
+        controller.notification_interval = Duration::from_secs(5);
+        controller
+    }
+    pub fn with_reporter(
+        commands: Receiver<Command>,
+        stop: StopToken,
+        factory: impl Fn(PlaybackRequest) -> Result<Box<dyn SegmentSource>, PlaybackError>
+        + Send
+        + 'static,
+        reporter: impl FnMut(String) + Send + 'static,
+    ) -> Self {
+        Self::with_cancellable_reporter(
+            commands,
+            stop,
+            move |request, _| factory(request),
+            reporter,
+        )
+    }
+    pub fn with_cancellable_reporter(
+        commands: Receiver<Command>,
+        stop: StopToken,
+        factory: impl Fn(PlaybackRequest, StopToken) -> Result<Box<dyn SegmentSource>, PlaybackError>
+        + Send
+        + 'static,
+        reporter: impl FnMut(String) + Send + 'static,
+    ) -> Self {
         let latest = Arc::new(Mutex::new(None::<Job>));
         let generation = Arc::new(AtomicU64::new(0));
         let (tx, results) = mpsc::sync_channel(1);
         let (mailbox, ids, shutdown) = (latest.clone(), generation.clone(), stop.clone());
-        thread::spawn(move || {
+        let preparation_worker = thread::spawn(move || {
             while !shutdown.is_cancelled() {
                 let job = match mailbox.lock() {
                     Ok(mut slot) => slot.take(),
@@ -96,7 +145,7 @@ impl Controller {
                 if job.stop.is_cancelled() {
                     continue;
                 }
-                let result = factory(job.request.clone()).and_then(|source| {
+                let result = factory(job.request.clone(), job.stop.clone()).and_then(|source| {
                     let info = source.info();
                     let same_slot = job.expected.as_ref().is_none_or(|expected| {
                         expected.station == info.station
@@ -135,6 +184,9 @@ impl Controller {
         });
         Self {
             commands,
+            preparation_worker: Some(preparation_worker),
+            reporter: Box::new(reporter),
+            notification_interval: Duration::from_millis(250),
             latest,
             results,
             generation,
@@ -146,9 +198,20 @@ impl Controller {
             volume: 25,
         }
     }
+    /// Call only from the owning background control thread, after output has been stopped.
+    /// Prevents a replacement session from accumulating workers blocked in old HTTP requests.
+    pub fn finish_preparation(&mut self) {
+        self.stop.cancel();
+        if let Some(worker) = self.preparation_worker.take() {
+            let _ = worker.join();
+        }
+    }
+    pub(super) fn report(&mut self, message: String) {
+        (self.reporter)(message);
+    }
     pub(super) fn poll(&mut self, info: &StreamInfo, current: Duration) -> Option<Ready> {
         // 結果より先に操作を処理し、配送済みの古い準備結果も採用しない。
-        for command in self.commands.try_iter() {
+        for command in self.commands.try_iter().take(32).collect::<Vec<_>>() {
             self.changed = true;
             let resuming = matches!(command, Command::Resume);
             let selection = if let Command::Select(ref target) = command {
@@ -170,7 +233,7 @@ impl Controller {
                     if let Some(old) = self.pending.take() {
                         old.cancel();
                     }
-                    eprintln!("一時停止");
+                    self.report("一時停止".into());
                     continue;
                 }
                 Command::Resume => {
@@ -187,6 +250,16 @@ impl Controller {
                     self.stop.cancel();
                     continue;
                 }
+                Command::SeekSlot { key, position } => {
+                    if info.station != key.station_id
+                        || info.starts_at != key.starts_at
+                        || info.mode != ProbeMode::TimeFree
+                    {
+                        self.report("位置指定を取消: 再生対象が変わりました（再生を継続）".into());
+                        continue;
+                    }
+                    Some(position)
+                }
                 Command::Seek(position) => Some(position),
                 Command::Relative(seconds) => {
                     if seconds < 0 {
@@ -202,7 +275,7 @@ impl Controller {
                     || (target.mode == ProbeMode::Live && target.position != Duration::ZERO)
                     || target.cursor > Utc::now()
                 {
-                    eprintln!("切替不可: 局・日時・開始位置を確認してください");
+                    self.report("切替不可: 局・日時・開始位置を確認してください".into());
                     continue;
                 }
                 target.clone()
@@ -215,17 +288,15 @@ impl Controller {
                         (resuming || info.mode == ProbeMode::TimeFree) && p < length
                     });
                 let Some((_, position)) = valid else {
-                    eprintln!("シーク不可: タイムフリーの放送枠内を指定してください（再生を継続）");
+                    self.report(
+                        "シーク不可: タイムフリーの放送枠内を指定してください（再生を継続）".into(),
+                    );
                     continue;
                 };
                 PlaybackRequest {
                     station: info.station.clone(),
                     mode: info.mode,
-                    cursor: if info.mode == ProbeMode::Live {
-                        Utc::now().fixed_offset()
-                    } else {
-                        info.starts_at
-                    },
+                    cursor: info.starts_at,
                     position,
                 }
             };
@@ -254,24 +325,24 @@ impl Controller {
                         pending.cancel();
                     }
                     self.pending_target = None;
-                    eprintln!("再生準備に失敗しました（現在の状態を維持）");
+                    (self.reporter)("再生準備に失敗しました（現在の状態を維持）".into());
                     continue;
                 }
             }
             if self.paused {
-                eprintln!(
+                self.report(format!(
                     "再生準備中: {} / {:?} / {:.3}秒（一時停止を維持）",
                     request.station,
                     request.mode,
                     request.position.as_secs_f64()
-                );
+                ));
             } else {
-                eprintln!(
+                self.report(format!(
                     "再生準備中: {} / {:?} / {:.3}秒（現在の再生を継続）",
                     request.station,
                     request.mode,
                     request.position.as_secs_f64()
-                );
+                ));
             }
         }
         while let Ok(completed) = self.results.try_recv() {
@@ -285,7 +356,7 @@ impl Controller {
                     self.pending = None;
                     return Some(ready);
                 }
-                Err(error) => eprintln!("再生準備失敗（現在の状態を維持）: {error}"),
+                Err(error) => self.report(format!("再生準備失敗（現在の状態を維持）: {error}")),
             }
             self.pending = None;
         }
@@ -500,7 +571,7 @@ mod tests {
             let stop = StopToken::default();
             let mut control = Controller::new(rx, stop.clone(), move |request| {
                 let position = request.position;
-                seen_tx.send(position).unwrap();
+                seen_tx.send((position, request.cursor)).unwrap();
                 gate.recv_timeout(Duration::from_secs(2)).unwrap();
                 Err(PlaybackError::EarlyEnd)
             });
@@ -515,11 +586,14 @@ mod tests {
             control.poll(&slot, Duration::from_secs(65));
             assert_eq!(
                 seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-                if mode == ProbeMode::Live {
-                    Duration::ZERO
-                } else {
-                    Duration::from_secs(65)
-                }
+                (
+                    if mode == ProbeMode::Live {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(65)
+                    },
+                    slot.starts_at
+                )
             );
             let token = control.pending.as_ref().unwrap().clone();
             tx.send(Command::Pause).unwrap();
@@ -528,6 +602,71 @@ mod tests {
             assert!(control.paused);
             assert!(!stop.is_cancelled());
             release.send(()).unwrap();
+        }
+    }
+    #[test]
+    fn newer_seek_cancels_factory_token_and_starts_only_the_latest_preparation() {
+        let (tx, rx) = mpsc::channel();
+        let (seen, events) = mpsc::channel();
+        let stop = StopToken::default();
+        let mut control = Controller::new_cancellable(rx, stop.clone(), move |request, cancel| {
+            seen.send(request.position).unwrap();
+            if request.position == Duration::from_secs(1) {
+                let began = Instant::now();
+                while !cancel.is_cancelled() {
+                    assert!(began.elapsed() < Duration::from_secs(2));
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Err(PlaybackError::Source(ProbeError::Cancelled))
+        });
+        assert_eq!(control.notification_interval, Duration::from_secs(5));
+        tx.send(Command::Seek(Duration::from_secs(1))).unwrap();
+        control.poll(&info(), Duration::ZERO);
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Duration::from_secs(1)
+        );
+        tx.send(Command::Seek(Duration::from_secs(2))).unwrap();
+        control.poll(&info(), Duration::ZERO);
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Duration::from_secs(2)
+        );
+        assert!(!stop.is_cancelled());
+        control.finish_preparation();
+    }
+    #[test]
+    fn stale_slot_seek_never_calls_factory_or_cancels_current_playback() {
+        let stop = StopToken::default();
+        let (tx, rx) = mpsc::channel();
+        let mut control =
+            Controller::new(rx, stop.clone(), |_| panic!("stale seek must not prepare"));
+        let slot = info();
+        for (station, start, mode) in [
+            ("OBS", slot.starts_at, ProbeMode::TimeFree),
+            (
+                "TBS",
+                slot.starts_at + chrono::Duration::hours(1),
+                ProbeMode::TimeFree,
+            ),
+            ("TBS", slot.starts_at, ProbeMode::Live),
+        ] {
+            let mut current = slot.clone();
+            current.station = station.into();
+            current.starts_at = start;
+            current.mode = mode;
+            tx.send(Command::SeekSlot {
+                key: crate::domain::ProgramKey {
+                    station_id: slot.station.clone(),
+                    starts_at: slot.starts_at,
+                },
+                position: Duration::from_secs(15),
+            })
+            .unwrap();
+            assert!(control.poll(&current, Duration::ZERO).is_none());
+            assert!(control.pending.is_none());
+            assert!(!stop.is_cancelled());
         }
     }
     #[test]

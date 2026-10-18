@@ -24,9 +24,13 @@ pub enum Next {
 }
 pub trait SegmentSource: Send + 'static {
     fn info(&self) -> &StreamInfo;
+    fn set_cancellation(&mut self, _cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {}
     fn poll_segment(&mut self) -> Result<Next, ProbeError>;
 }
 impl<T: SegmentSource + ?Sized> SegmentSource for Box<T> {
+    fn set_cancellation(&mut self, cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        (**self).set_cancellation(cancelled);
+    }
     fn info(&self) -> &StreamInfo {
         (**self).info()
     }
@@ -39,6 +43,9 @@ pub struct PreparedStream {
     hls: HlsStream<Http>,
 }
 impl SegmentSource for PreparedStream {
+    fn set_cancellation(&mut self, cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.hls.http.set_cancellation(cancelled);
+    }
     fn info(&self) -> &StreamInfo {
         &self.info
     }
@@ -65,6 +72,29 @@ pub fn prepare_at(
     membership: &Membership,
     position: Wait,
 ) -> Result<PreparedStream, ProbeError> {
+    prepare_at_controlled(
+        station,
+        mode,
+        cursor,
+        session,
+        membership,
+        position,
+        std::sync::Arc::new(|| false),
+    )
+}
+/// Cooperative cancellation between HTTP operations; in-flight blocking I/O retains its timeout.
+pub fn prepare_at_controlled(
+    station: &str,
+    mode: ProbeMode,
+    cursor: DateTime<FixedOffset>,
+    session: &MemberSession,
+    membership: &Membership,
+    position: Wait,
+    cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<PreparedStream, ProbeError> {
+    if cancelled() {
+        return Err(ProbeError::Cancelled);
+    }
     validate_station(station)?;
     if mode == ProbeMode::Live && !position.is_zero() {
         return Err(ProbeError::InvalidPosition);
@@ -73,7 +103,8 @@ pub fn prepare_at(
     if mode == ProbeMode::TimeFree && cursor > now {
         return Err(ProbeError::Upcoming);
     }
-    let http = Http::new()?;
+    let mut http = Http::new()?;
+    http.set_cancellation(cancelled);
     let request = prepare_with(
         &http,
         station,

@@ -18,6 +18,8 @@ use std::{
 #[derive(Debug)]
 pub enum PlaybackError {
     Source(ProbeError),
+    Storage(crate::storage::StorageError),
+    LoginRequired,
     Auth(crate::radiko::auth::AuthError),
     Decode(AacError),
     Output(OutputError),
@@ -28,6 +30,8 @@ pub enum PlaybackError {
 impl fmt::Display for PlaybackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Storage(e) => e.fmt(f),
+            Self::LoginRequired => f.write_str("未ログインです。loginでログインしてください"),
             Self::Auth(e) => e.fmt(f),
             Self::Source(e) => write!(f, "配信取得: {e}"),
             Self::Decode(e) => write!(f, "デコード: {e}"),
@@ -98,6 +102,8 @@ fn send(tx: &mpsc::SyncSender<Event>, mut event: Event, stop: &StopToken) -> boo
 pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker, Receiver<Event>) {
     let (tx, rx) = mpsc::sync_channel(1);
     let control = stop.clone();
+    let cancelled = control.clone();
+    source.set_cancellation(std::sync::Arc::new(move || cancelled.is_cancelled()));
     let handle = thread::spawn(move || {
         let mut decoder = AdtsDecoder::new();
         let info = source.info().clone();
@@ -343,8 +349,25 @@ pub fn play_controlled(
     progress: impl FnMut(Progress),
 ) -> Result<PlaybackReport, PlaybackError> {
     play_loop(
-        source,
+        Initial::Source(source),
         seconds,
+        stop,
+        progress,
+        ContinuousOutput::new,
+        Some(controls),
+    )
+}
+/// Wait without decoding/output until a validated Select is prepared by the controller.
+/// `idle` is only a control context; no snapshot claims it is playing.
+pub fn play_session(
+    idle: StreamInfo,
+    stop: StopToken,
+    controls: &mut super::seek::Controller,
+    progress: impl FnMut(Progress),
+) -> Result<PlaybackReport, PlaybackError> {
+    play_loop::<ContinuousOutput>(
+        Initial::<Box<dyn SegmentSource>>::Idle(idle),
+        None,
         stop,
         progress,
         ContinuousOutput::new,
@@ -358,10 +381,21 @@ fn play_with<S: AudioSink>(
     progress: impl FnMut(Progress),
     create: impl FnMut(&DecodedPcm, u64, Option<Duration>, StopToken) -> Result<S, OutputError>,
 ) -> Result<PlaybackReport, PlaybackError> {
-    play_loop(source, seconds, stop, progress, create, None)
+    play_loop(
+        Initial::Source(source),
+        seconds,
+        stop,
+        progress,
+        create,
+        None,
+    )
+}
+enum Initial<T> {
+    Source(T),
+    Idle(StreamInfo),
 }
 fn play_loop<S: AudioSink>(
-    source: impl SegmentSource,
+    initial: Initial<impl SegmentSource>,
     seconds: Option<u32>,
     stop: StopToken,
     mut progress: impl FnMut(Progress),
@@ -375,10 +409,15 @@ fn play_loop<S: AudioSink>(
         }
     }
     let _cancel = CancelOnExit(stop.clone());
-    let jst = chrono::FixedOffset::east_opt(9 * 3600).ok_or(PlaybackError::Worker)?;
-    let mut info = source.info().clone();
     let mut local = stop.child();
-    let (mut _running_worker, mut rx) = worker(source, local.clone());
+    let (mut info, mut running_worker, mut rx) = match initial {
+        Initial::Source(source) => {
+            let info = source.info().clone();
+            let (worker, rx) = worker(source, local.clone());
+            (info, Some(worker), rx)
+        }
+        Initial::Idle(info) => (info, None, mpsc::channel().1),
+    };
     let mut current = None;
     let mut cursor = 0;
     let mut output: Option<S> = None;
@@ -425,13 +464,15 @@ fn play_loop<S: AudioSink>(
                     .map(|sink| (sink, limit, why))
                     .map_err(PlaybackError::Output)
                 }) {
-                    Err(error) => eprintln!("再生切替失敗（現在の状態を維持）: {error}"),
+                    Err(error) => {
+                        control.report(format!("再生切替失敗（現在の状態を維持）: {error}"))
+                    }
                     Ok((sink, limit, why)) => {
                         control.paused = false;
                         local.cancel();
                         output = Some(sink);
                         local = ready.worker.stop.clone();
-                        _running_worker = ready.worker;
+                        running_worker = Some(ready.worker);
                         rx = ready.rx;
                         info = ready.info;
                         current = Some(ready.pcm);
@@ -442,16 +483,7 @@ fn play_loop<S: AudioSink>(
                         eof = false;
                         last_pcm_at = Instant::now();
                         report_at = Instant::now();
-                        eprintln!(
-                            "再生切替完了: {} / {:?} / {}–{}（日本時間） / {:.3}秒",
-                            info.station,
-                            info.mode,
-                            info.starts_at
-                                .with_timezone(&jst)
-                                .format("%Y-%m-%d %H:%M:%S"),
-                            info.ends_at.with_timezone(&jst).format("%Y-%m-%d %H:%M:%S"),
-                            info.position.as_secs_f64()
-                        );
+                        control.report(format!("再生切替完了: {} / {:?}", info.station, info.mode));
                     }
                 }
             }
@@ -470,14 +502,15 @@ fn play_loop<S: AudioSink>(
         if paused {
             last_pcm_at = Instant::now();
         }
-        if info.mode == ProbeMode::Live && Utc::now() >= info.ends_at {
+        if running_worker.is_some() && info.mode == ProbeMode::Live && Utc::now() >= info.ends_at {
             return Ok(PlaybackReport {
                 output: output.as_ref().map(|o| o.summary()),
                 segments,
                 reason: EndReason::ProgramEnd,
             });
         }
-        if !paused
+        if running_worker.is_some()
+            && !paused
             && current.is_none()
             && !eof
             && !output.as_ref().is_some_and(|o| o.accepted() >= maximum)
@@ -523,7 +556,8 @@ fn play_loop<S: AudioSink>(
                 Err(TryRecvError::Disconnected) => return Err(PlaybackError::Worker),
             }
         }
-        if current.is_none()
+        if running_worker.is_some()
+            && current.is_none()
             && !eof
             && !output.as_ref().is_some_and(|o| o.accepted() >= maximum)
             && last_pcm_at.elapsed() > Duration::from_secs(30)
@@ -564,7 +598,7 @@ fn play_loop<S: AudioSink>(
                 Err(error) => return Err(error.into()),
             }
         }
-        if Instant::now() >= report_at {
+        if running_worker.is_some() && Instant::now() >= report_at {
             progress(Progress::active(
                 &info,
                 output.as_ref().map(|out| out.summary()),
@@ -575,7 +609,10 @@ fn play_loop<S: AudioSink>(
                     .as_ref()
                     .and_then(|control| control.pending_target.clone()),
             ));
-            report_at = Instant::now() + Duration::from_secs(5);
+            report_at = Instant::now()
+                + controls.as_ref().map_or(Duration::from_secs(5), |control| {
+                    control.notification_interval
+                });
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -586,6 +623,61 @@ mod tests {
     use super::*;
     use crate::radiko::stream::playback::Segment;
     use std::collections::VecDeque;
+    #[test]
+    fn boxed_source_receives_generation_cancellation_before_polling() {
+        use std::sync::Arc;
+        struct Waiting {
+            info: StreamInfo,
+            cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+            entered: mpsc::Sender<()>,
+            done: mpsc::Sender<()>,
+        }
+        impl SegmentSource for Waiting {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn set_cancellation(&mut self, cancelled: Arc<dyn Fn() -> bool + Send + Sync>) {
+                self.cancelled = Some(cancelled);
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                let check = self
+                    .cancelled
+                    .as_ref()
+                    .expect("hook installed before polling");
+                self.entered.send(()).unwrap();
+                let began = Instant::now();
+                while !check() {
+                    assert!(began.elapsed() < Duration::from_secs(2));
+                    thread::sleep(Duration::from_millis(1));
+                }
+                self.done.send(()).unwrap();
+                Err(ProbeError::Cancelled)
+            }
+        }
+        let (entered, seen) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let start = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00+09:00").unwrap();
+        let source: Box<dyn SegmentSource> = Box::new(Waiting {
+            info: StreamInfo {
+                title: None,
+                station: "TBS".into(),
+                mode: ProbeMode::TimeFree,
+                starts_at: start,
+                ends_at: start + chrono::Duration::hours(1),
+                position: Duration::ZERO,
+            },
+            cancelled: None,
+            entered,
+            done,
+        });
+        let parent = StopToken::default();
+        let (mut worker, events) = worker(source, parent.child());
+        seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        parent.cancel();
+        finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.handle.take().unwrap().join().unwrap();
+        assert!(events.try_recv().is_err());
+    }
     struct Source {
         info: StreamInfo,
         events: VecDeque<Result<Next, ProbeError>>,
@@ -679,6 +771,92 @@ mod tests {
             discontinuity,
             starts_at: None,
         }))
+    }
+    #[test]
+    fn idle_session_reports_preparation_failure_without_output_or_active_snapshot() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        let (tx, rx) = mpsc::channel();
+        let (notice, received) = mpsc::channel();
+        let mut idle = info(1000);
+        idle.starts_at -= chrono::Duration::hours(1);
+        idle.ends_at -= chrono::Duration::hours(1);
+        let stop = StopToken::default();
+        let mut controller = Controller::with_reporter(
+            rx,
+            stop.clone(),
+            |_| Err(PlaybackError::LoginRequired),
+            move |message| {
+                if message.contains("未ログイン") {
+                    notice.send(message).unwrap();
+                }
+            },
+        );
+        tx.send(Command::Select(PlaybackRequest {
+            station: idle.station.clone(),
+            mode: idle.mode,
+            cursor: idle.starts_at,
+            position: Duration::ZERO,
+        }))
+        .unwrap();
+        let quit = tx.clone();
+        let handle = thread::spawn(move || {
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            quit.send(Command::Stop).unwrap();
+        });
+        let report = play_loop::<Sink>(
+            Initial::<Source>::Idle(idle),
+            None,
+            stop,
+            |_| panic!("idle is not active playback"),
+            |_, _, _, _| panic!("failed preparation must never open output"),
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        assert!(report.output.is_none());
+        handle.join().unwrap();
+    }
+    #[test]
+    fn idle_session_starts_only_the_prepared_slot_and_stops_at_its_end() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        let (tx, rx) = mpsc::channel();
+        let mut selected = info(100);
+        selected.starts_at -= chrono::Duration::hours(1);
+        selected.ends_at -= chrono::Duration::hours(1);
+        let expected = selected.clone();
+        tx.send(Command::Select(PlaybackRequest {
+            station: selected.station.clone(),
+            mode: selected.mode,
+            cursor: selected.starts_at,
+            position: Duration::ZERO,
+        }))
+        .unwrap();
+        let stop = StopToken::default();
+        let bytes = packet(24_000).repeat(8);
+        let mut controller = Controller::with_reporter(
+            rx,
+            stop.clone(),
+            move |_| {
+                Ok(Box::new(Source {
+                    info: selected.clone(),
+                    events: VecDeque::from([event(bytes.clone(), false), Ok(Next::End)]),
+                }))
+            },
+            |_| {},
+        );
+        let report = play_loop(
+            Initial::<Source>::Idle(expected.clone()),
+            None,
+            stop,
+            |snapshot| {
+                assert_eq!(snapshot.info.starts_at, expected.starts_at);
+            },
+            sink,
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::ProgramEnd);
+        assert_eq!(report.output.unwrap().frames, 2400);
     }
     #[test]
     fn successful_station_switch_cancels_old_output_and_preserves_volume() {
@@ -778,7 +956,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut previous = None;
         let result = play_loop(
-            source,
+            Initial::Source(source),
             None,
             stop,
             |snapshot| {
@@ -898,7 +1076,7 @@ mod tests {
         let mut requested = false;
         let mut attempts = 0;
         let report = play_loop(
-            source,
+            Initial::Source(source),
             None,
             stop,
             |snapshot| {

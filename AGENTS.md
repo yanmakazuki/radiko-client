@@ -2,11 +2,16 @@
 
 ## Scope and Architecture
 
-This macOS Rust client currently provides filtered station and regional/nationwide date-range listings, authentication, HLS probes, bounded continuous audio output, and chapter acquisition/inspection; saved search CLI and a read-only search TUI are available; playback/chapter TUI integration and long-duration playback validation remain unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Prioritize playback feasibility before search and TUI work. Preserve the pure Rust decoding requirement; do not substitute external players or OS decoders automatically.
+This macOS Rust client provides filtered station and regional/nationwide date-range listings, authentication, HLS probes, bounded audio output, saved search CLI, and a search/live/time-free TUI. Chapter jumps require a matching event origin and slot; broader real-device validation remains unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Preserve pure Rust decoding; do not substitute external players or OS decoders automatically.
 
 ## Project Structure
 
-- `src/app.rs` and `src/app/search.rs`: main-loop-owned search state, editing, request generations, and bounded cancellable acquisition; `src/tui.rs`: read-only Ratatui frontend and terminal restoration.
+- `src/app.rs` and `src/app/search.rs`: main-loop-owned search state, editing, request generations, and bounded cancellable acquisition; `src/tui.rs`: Ratatui search/playback frontend and terminal restoration.
+- `src/app/playback.rs`: bounded TUI playback commands, session resolution, snapshots, and output shutdown.
+- `src/app/chapters.rs`: chapter request generations, bounded acquisition, and origin/slot-bound jump validation; listening permission is rechecked by playback.
+- `src/app/auth.rs`: asynchronous session checks, explicit login/logout jobs, and contract-only snapshots; credential drafts are zeroized and never logged.
+- `src/tui/filters.rs`: local date/scope/classification/keyword editing, validation, and observed-classification display; no I/O.
+- `src/app/named.rs` and `src/tui/named.rs`: serialized local saved-search operations and browser; recalls populate drafts without fetching.
 
 - `src/domain/search.rs`: validated criteria and startup date reset; `src/storage/searches.rs`: atomic versioned criteria storage; `src/searches.rs`: offline named-search management CLI.
 
@@ -61,6 +66,59 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 実装前に[設計書](docs/design.md)と[アーキテクチャ設計](docs/architecture.md)を読む。仕様の判断は設計書とユーザーの最新の指示に従い、仕様変更時は設計書とアーキテクチャ設計も整合させる。
 
 ## 現在の状態
+
+- 2026年10月18日にユーザーの聴感で、TBSの10月15日・10月6日12時枠の交通情報とチャプター開始秒数の対応を確認。原点一致のEventBindingを持つ章だけEnterから通常の権限確認・シーク／別枠切替へ接続した。原点が異なる枠の補正は未対応。区切り時点の検証・中断状況は実装状況を参照。
+
+- 2026年10月18日に共通HTTPと会員認証を非同期reqwestへ移行し、blocking featureを削除してCargo.lockを更新。共有current-thread Runtimeで要求futureを取消し、DNSは最大4件の許可をOS作業終了まで保持する。検索・チャプター・会員確認・再生準備とHLSへ各領域の取消を接続。認証POSTの自動再試行は追加しない。実配信の短時間シーク・再開・末尾停止・ログアウト検証が成功し、30分検証とはビルド／範囲を分けて記録する。
+
+
+- 2026年10月18日にTBSの20261015120000をミュートで1800.6秒連続出力し、38回の検索編集取消・フォーム開閉・再取得・ライブ画面往復・チャプター閲覧の操作サイクルを確認。定期観測の不足はすべて0、停止・q終了・端末復元が成功した。ライブ一覧追加時点のビルドでの一ケースであり、後続の認証／名称選択、聴感、長時間ライブや機器切断までの検証とはしない。詳細な範囲は実装状況を参照。
+
+
+- 2026年10月18日に地域欄のF2で47都道府県名の複数選択を追加。全国／複数地域を下書きへ反映し、検索確定まで通信・再生操作を行わない。単一局を地域指定へ置換することを明示し、取消では元の入力を維持する。地域名は静的表示であり局一覧は検索時に新規取得する。
+
+
+- 2026年10月18日に条件フォームのF2で分類名称の複数選択を追加。候補は編集開始時点の観測データだけを用い、同ID別名・保存済み未観測ID・未分類を保持する。Enterは下書きへの反映のみで、検索確定までは通信しない。カンマを含む保存IDを保持し、直接入力も継続利用できる。
+
+
+- 2026年10月18日にTUIのIログイン／Oログアウトを追加。入力中と取消ではI/Oせず、パスワード非表示・Zeroizing保持、認証成功後のみ原子的保存。ログアウトはy確認後に再生を停止して指定ストアのセッションだけを削除する。更新は単一ジョブで重複を受理せず、古い認証確認を破棄する。終了時の結果未確認は端末復元後に案内。実アカウントの新ログイン送信は未検証。
+
+
+- 2026年10月18日にvで専用ライブ一覧を追加。当日を新規取得し放送中だけ表示、Enterでライブ再生。vで元のタイムフリー条件・期間へ戻って再取得する。開始／終了境界では通信なしで表示を更新し、画面切替だけで音声を変更しない。明示した過去日付はタイムフリーへ移して保持する。長時間再生と同時操作の検証は1800.6秒の実施記録を参照。
+
+
+- 2026年10月18日に再生CLIの初回配信解決と対話中のシーク／切替準備も取消対応へ接続。Ctrl+Cは会員確認／解決が戻った後に中断扱いとし、要求別取消と5秒定期通知を両立する。blocking I/Oの即時中断と実配信での再検証は未実施。
+
+
+- 2026年10月18日にTUI再生準備のfactoryへ要求別StopTokenを接続。セッション読込・会員確認の前後と、配信解決HTTPの区切りで取消を確認する。旧準備の取消／最新要求開始を偽factoryで検証。会員確認の実行中通信とblocking I/Oそのものの中断は未対応。
+
+
+- 2026年10月18日に再生中HLSのHTTPへ世代キャンセルを接続。停止・切替後の追加要求／再試行／リダイレクトと本文読取の区切りで取消し、部分本文を破棄する。blocking通信そのものと再生準備／会員確認の途中中断は未対応。通常テストは偽source／readerで検証し実通信しない。
+
+
+- 2026年10月17日にTUIの出力診断を追加。現在の出力世代の秒数・不足フレーム／秒数・PCM形式・セグメント数を表示し、正常停止時の最終値を保持する。エラー時の通知値は終了時未集計と明示する。長時間検証手順をREADMEに記載。30分実配信の同時操作は未実施。
+
+
+- 2026年10月17日にTUIの`g`で整数秒指定シークを追加。入力・取消では再生を維持し、確定要求には局ID＋開始日時を保持してワーカーでも照合する。ライブ・範囲外を拒否する。実配信TUIの位置確認と30分同時操作は未検証。
+
+
+- 2026年10月17日にTUI一覧の`l`で選択枠のライブ再生を追加。放送前・終了済みを通信前に拒否し、準備・再開時も局＋開始時刻を保持する。専用ライブ一覧画面とTUI実配信の長時間検証は未完了。
+
+
+- 2026年10月17日にbによる名前付き検索条件の保存・削除・呼び出し画面を追加。保存日付・期間を含めて編集画面へ渡し、検索確定まで取得しない。ファイル操作は単一ワーカー、表示世代で古い応答を破棄し、受理済み更新は画面を閉じても中断しない。仮想端末で保存・同名更新・削除取消／確定・期間呼び出し・保存直後の終了と端末復元を確認。fmt・clippy・全185テスト成功。実配信30分の同時操作、ライブ画面、チャプタージャンプは未検証／未接続。
+
+
+- 2026年10月17日にfで全検索条件を編集するTUIフォームを追加。日付・期間・地域／局・分類ID・キーワード・軸別未分類を、確定まで通信せず編集する。入力検証・取消、観測分類の参考表示、UTF-8カーソル操作に対応。仮想端末で不正日付拒否・取消・JP44の2日間検索・条件保存と端末復元を確認。fmt・clippy・全175テスト成功。名前付き条件の画面呼び出し、実配信30分と同時操作は未実装／未検証。
+
+
+- 2026年10月17日にTUI起動時の保存セッション確認とa再確認を追加。検索・再生から独立して、未ログイン・破損／未対応形式／不正権限・失効・通信失敗と契約フラグを表示する。認証情報は状態・通知へ渡さず、ファイルを変更しない。古い確認結果を破棄し、再生時の再確認は維持する。仮想端末で破損表示・ファイル保持・a再確認・終了時の復元を確認。fmt・clippy・全168テスト成功。実アカウントでの新しい表示経路の再検証、ログイン／ログアウトのTUI入力は未実施／未接続。
+
+
+- 2026年10月17日にTUIのcによる公式AIチャプター閲覧を追加。r再取得、上下／j k選択と要約、Escで取消・破棄。独立した要求IDと単一取得・最新待機要求で古い応答を破棄し、音声位置未検証の候補はジャンプ・現在位置強調へ接続しない。TBSの10月15日12時枠で13件表示・再取得・開き直し・ジャンプ拒否と端末復元を確認。fmt・clippy・全160テスト成功。チャプタージャンプ、30分同時操作は未検証／未接続。
+
+
+- 2026年10月17日にTUIのタイムフリー再生を接続。一覧Enter、Space一時停止／再開、s停止、左右15秒シーク、+／-音量に対応。容量4の操作と最新状態通知を独立サービスへ渡し、音声出力制御は専用スレッドで行う。保存済みセッションは再生準備時に検証し、放送前は通信しない。生成AACのミュート実機出力で一時停止位置・再開・停止、仮想端末で未ログイン時の表示と端末復元を確認。fmt・clippy・全150テスト成功。実配信とTUIの30分同時操作、ライブ画面・チャプターは未検証／未接続。
+
 
 - 2026年10月16日に閲覧専用`tui`を追加。番組一覧／詳細、キーワード編集・確定・取消、再取得、条件の当日復元・終了時保存に対応。appの検索世代・最新待機要求・容量4の通知とcatalogの協調キャンセルで古い結果を破棄し、全体4並列を維持する。仮想端末で公開番組表表示・編集・q／Ctrl+C／SIGINT終了と端末復元を確認。fmt・clippy・全143テスト成功。画面からの再生・チャプターと30分同時操作は未接続／未検証。
 

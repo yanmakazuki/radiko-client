@@ -20,6 +20,22 @@ pub struct PlaybackSnapshot {
     pub output: Option<OutputSummary>,
     pub segments: u64,
 }
+/// Counters describe only the current output generation, not accumulated listening time.
+pub fn output_diagnostics(output: Option<&OutputSummary>, segments: u64) -> String {
+    match output.filter(|o| o.sample_rate > 0) {
+        Some(o) => format!(
+            "今回の出力 {:.1}秒 / 不足 {}フレーム（{:.3}秒） / {}Hz {}ch / {}セグメント",
+            o.frames as f64 / f64::from(o.sample_rate),
+            o.underrun_frames,
+            o.underrun_frames as f64 / f64::from(o.sample_rate),
+            o.sample_rate,
+            o.channels,
+            segments
+        ),
+        None => format!("出力未確認 / {}セグメント", segments),
+    }
+}
+
 impl PlaybackSnapshot {
     pub(crate) fn active(
         info: &StreamInfo,
@@ -56,6 +72,28 @@ impl PlaybackSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn output_diagnostics_distinguish_output_time_underruns_and_missing_measurements() {
+        let output = OutputSummary {
+            frames: 72000,
+            underrun_frames: 240,
+            sample_rate: 48000,
+            channels: 2,
+        };
+        let text = output_diagnostics(Some(&output), 3);
+        assert!(text.contains("1.5秒"));
+        assert!(text.contains("240フレーム（0.005秒）"));
+        assert!(text.contains("48000Hz 2ch / 3セグメント"));
+        assert_eq!(output_diagnostics(None, 0), "出力未確認 / 0セグメント");
+        let unknown = OutputSummary {
+            sample_rate: 0,
+            ..output
+        };
+        assert_eq!(
+            output_diagnostics(Some(&unknown), 4),
+            "出力未確認 / 4セグメント"
+        );
+    }
     fn info(mode: ProbeMode) -> StreamInfo {
         let start = chrono::DateTime::parse_from_rfc3339("2026-10-15T03:00:00Z").unwrap();
         StreamInfo {

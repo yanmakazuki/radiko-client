@@ -35,6 +35,7 @@ pub enum ProbeError {
     InvalidInput,
     InvalidPosition,
     Network,
+    Cancelled,
     Http(u16),
     Authentication,
     Denied,
@@ -65,6 +66,7 @@ impl fmt::Display for ProbeError {
                     "シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
                 }
                 Self::InvalidInput => "局IDまたは日時が不正です（日時は日本時間のYYYYMMDDHHmmss）",
+                Self::Cancelled => "配信取得を取り消しました",
                 Self::Network => "配信の検証中に通信に失敗しました",
                 Self::Authentication => {
                     "配信認証が拒否されました。sessionで会員認証を確認してください"

@@ -27,11 +27,16 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .with_timezone(&jst)
             .format("%Y-%m-%d %H:%M:%S")
     );
+    let aligned = matches!(&report.outcome, Outcome::Aligned(_, _));
     match report.outcome {
         Outcome::Unresolved => println!("番組との対応付け未確認（取得・位置補正を省略）"),
         Outcome::Unavailable => println!("チャプター未提供（生成待ちの場合があります）"),
-        Outcome::Candidates(set) => {
-            println!("メタデータ一致・音声位置未検証（ジャンプ再生には未接続）");
+        Outcome::Candidates(set) | Outcome::Aligned(set, _) => {
+            if aligned {
+                println!("放送枠・イベント原点一致（このCLIは閲覧のみ）");
+            } else {
+                println!("メタデータ一致・音声位置未検証（閲覧のみ）");
+            }
             println!(
                 "{}件 / 楽曲除外{}件 / 不正位置等{}件",
                 set.chapters.len(),

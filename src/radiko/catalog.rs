@@ -57,6 +57,7 @@ impl From<ProbeError> for CatalogError {
     fn from(error: ProbeError) -> Self {
         match error {
             ProbeError::Network => Self::Network,
+            ProbeError::Cancelled => Self::Cancelled,
             ProbeError::Http(status) => Self::Http(status),
             ProbeError::Authentication => Self::Http(401),
             ProbeError::Denied => Self::Http(403),
@@ -376,6 +377,18 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    fn cancelled_catalog_client_rejects_construction_before_network_and_preserves_error_kind() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(matches!(
+            CatalogClient::new_cancellable(flag),
+            Err(CatalogError::Cancelled)
+        ));
+        assert_eq!(
+            CatalogError::from(ProbeError::Cancelled),
+            CatalogError::Cancelled
+        );
+    }
+    #[test]
     fn gzip_is_bounded_after_decompression_and_corruption_is_rejected() {
         use std::io::Write;
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -449,6 +462,17 @@ pub struct CatalogClient {
 impl CatalogClient {
     pub fn new() -> Result<Self, CatalogError> {
         Ok(Self { http: Http::new()? })
+    }
+    pub fn new_cancellable(
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, CatalogError> {
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::Acquire) {
+            return Err(CatalogError::Cancelled);
+        }
+        let mut http = Http::new()?;
+        http.set_cancellation(std::sync::Arc::new(move || cancel.load(Ordering::Acquire)));
+        Ok(Self { http })
     }
     pub fn programs(&self, station: &str, day: NaiveDate) -> Result<ProgramList, CatalogError> {
         fetch_programs(&self.http, station, day)

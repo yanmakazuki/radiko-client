@@ -10,7 +10,7 @@ use radiko_client::{
         auth::MemberClient,
         stream::{
             self, ProbeMode,
-            playback::{SegmentSource, prepare_at},
+            playback::{SegmentSource, prepare_at_controlled},
         },
     },
     storage::SessionStore,
@@ -180,6 +180,15 @@ fn describe(p: &playback::Progress) -> String {
         pending
     )
 }
+fn check_preparation(stop: &StopToken) -> Result<(), playback::PlaybackError> {
+    if stop.is_cancelled() {
+        Err(playback::PlaybackError::Source(
+            radiko_client::radiko::stream::ProbeError::Cancelled,
+        ))
+    } else {
+        Ok(())
+    }
+}
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() == 2 && args[1] == "--help" {
         println!("{USAGE}");
@@ -198,20 +207,30 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     let stop = StopToken::default();
     let signal = stop.clone();
     ctrlc::set_handler(move || signal.cancel()).map_err(|_| "Ctrl+Cの停止処理を登録できません")?;
-    let membership = MemberClient::new()?.check(&session)?;
+    let auth_stop = stop.clone();
+    let membership = MemberClient::new_cancellable(Arc::new(move || auth_stop.is_cancelled()))
+        .and_then(|client| client.check(&session));
     if stop.is_cancelled() {
         println!("中断しました");
         return Ok(());
     }
+    let membership = membership?;
     eprintln!("放送枠・配信条件を確認して連続再生を準備しています…");
-    let source = prepare_at(
+    let initial_stop = stop.clone();
+    let prepared = prepare_at_controlled(
         &request.station,
         request.mode,
         request.cursor,
         &session,
         &membership,
         request.offset,
-    )?;
+        Arc::new(move || initial_stop.is_cancelled()),
+    );
+    if stop.is_cancelled() {
+        println!("中断しました");
+        return Ok(());
+    }
+    let source = prepared?;
     let info = source.info();
     let jst = FixedOffset::east_opt(9 * 3600).ok_or("日本時間を構成できません")?;
     println!(
@@ -248,17 +267,22 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                 }
             }
         });
-        let mut controls = Controller::new(rx, stop.clone(), move |target| {
-            let membership = MemberClient::new()
-                .and_then(|c| c.check(&session))
-                .map_err(playback::PlaybackError::Auth)?;
-            prepare_at(
+        let mut controls = Controller::new_cancellable(rx, stop.clone(), move |target, cancel| {
+            check_preparation(&cancel)?;
+            let auth_cancel = cancel.clone();
+            let membership =
+                MemberClient::new_cancellable(Arc::new(move || auth_cancel.is_cancelled()))
+                    .and_then(|c| c.check(&session))
+                    .map_err(playback::PlaybackError::Auth)?;
+            check_preparation(&cancel)?;
+            prepare_at_controlled(
                 &target.station,
                 target.mode,
                 target.cursor,
                 &session,
                 &membership,
                 target.position,
+                Arc::new(move || cancel.is_cancelled()),
             )
             .map(|s| Box::new(s) as Box<dyn SegmentSource>)
             .map_err(playback::PlaybackError::Source)

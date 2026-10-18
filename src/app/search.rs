@@ -81,6 +81,11 @@ impl Service {
     pub fn new<S: Source + Send + 'static>(
         factory: impl Fn() -> Result<S, CatalogError> + Send + Sync + 'static,
     ) -> Self {
+        Self::new_cancellable(move |_| factory())
+    }
+    pub fn new_cancellable<S: Source + Send + 'static>(
+        factory: impl Fn(Arc<AtomicBool>) -> Result<S, CatalogError> + Send + Sync + 'static,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(4);
         let work = Arc::new(
             move |id,
@@ -90,7 +95,7 @@ impl Service {
                 if cancel.load(Ordering::Acquire) {
                     return Err(CatalogError::Cancelled);
                 }
-                let source = factory()?;
+                let source = factory(cancel.clone())?;
                 let progress = |p: catalog::Progress<'_>| {
                     if cancel.load(Ordering::Acquire) {
                         return;

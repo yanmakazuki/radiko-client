@@ -1,4 +1,8 @@
 //! メインループが所有するアプリ状態。検索の状態更新から再生コマンドは送らない。
+pub mod auth;
+pub mod chapters;
+pub mod named;
+pub mod playback;
 pub mod search;
 use crate::{
     catalog,
@@ -29,6 +33,8 @@ pub struct AppState {
     pub invalid_count: usize,
     pub notification: String,
     pub playback: Option<PlaybackSnapshot>,
+    pub chapters: chapters::State,
+    pub authentication: auth::State,
     id: SearchId,
 }
 impl AppState {
@@ -45,11 +51,20 @@ impl AppState {
             invalid_count: 0,
             notification: String::new(),
             playback: None,
+            chapters: chapters::State::default(),
+            authentication: auth::State::default(),
             id: SearchId(0),
         }
     }
     pub fn begin_edit(&mut self) {
         self.draft = Some(self.committed.clone());
+    }
+    pub fn edit_criteria(&mut self, criteria: SearchCriteria) -> Result<(), &'static str> {
+        if self.draft.is_none() {
+            return Err("検索条件を編集中ではありません");
+        }
+        self.draft = Some(criteria);
+        Ok(())
     }
     pub fn edit_keyword(&mut self, keyword: Option<String>) -> Result<(), &'static str> {
         let draft = self

@@ -362,7 +362,11 @@ fn tui_help_and_nonterminal_rejection_do_not_start_network_or_write_preferences(
     let path = directory.to_str().unwrap();
     let help = run(&["--data-dir", path, "tui", "--help"]);
     assert!(help.status.success());
-    assert!(String::from_utf8(help.stdout).unwrap().contains("閲覧専用"));
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("g 秒数指定")
+    );
     let output = run(&["--data-dir", path, "tui"]);
     assert!(!output.status.success());
     assert!(

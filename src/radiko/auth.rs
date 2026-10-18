@@ -1,14 +1,14 @@
 //! 明示的な会員認証の検証。HTTP本文やトークンをエラーへ含めない。
+use super::{http::Http, stream::ProbeError};
 use crate::session::{MemberSession, Membership};
 use reqwest::{
-    blocking::Client,
-    header::{COOKIE, HeaderValue},
-    redirect::Policy,
+    Url,
+    header::{COOKIE, HeaderMap, HeaderValue},
 };
 use serde_json::Value;
 use std::{
     fmt,
-    io::Read,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +22,7 @@ pub enum AuthError {
     InvalidCredentials,
     SessionExpired,
     Network,
+    Cancelled,
     Http(u16),
     RateLimited,
     InvalidResponse,
@@ -37,6 +38,7 @@ impl fmt::Display for AuthError {
             Self::SessionExpired => {
                 f.write_str("セッションが失効しました。loginで再ログインしてください")
             }
+            Self::Cancelled => f.write_str("認証処理を取り消しました"),
             Self::Network => f.write_str("認証サーバーと通信できません"),
             Self::Http(status) => write!(f, "認証サーバーがHTTP {status}を返しました"),
             Self::RateLimited => {
@@ -66,17 +68,19 @@ pub struct MemberClient {
 
 impl MemberClient {
     pub fn new() -> Result<Self, AuthError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .redirect(Policy::none())
-            .https_only(true)
-            .user_agent(concat!("radiko-client/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| AuthError::Network)?;
         Ok(Self {
-            transport: HttpTransport { client },
+            transport: HttpTransport {
+                http: Http::new().map_err(auth_error)?,
+            },
         })
+    }
+    pub fn new_cancellable(cancel: Arc<dyn Fn() -> bool + Send + Sync>) -> Result<Self, AuthError> {
+        if cancel() {
+            return Err(AuthError::Cancelled);
+        }
+        let mut client = Self::new()?;
+        client.transport.http.set_cancellation(cancel);
+        Ok(client)
     }
 
     /// POST is not retried: a lost response may already have created a session.
@@ -85,11 +89,15 @@ impl MemberClient {
         mail: &str,
         password: &str,
     ) -> Result<(MemberSession, Membership), AuthError> {
-        login(&self.transport, mail, password, wait)
+        login(&self.transport, mail, password, |duration| {
+            self.transport.wait(duration)
+        })
     }
 
     pub fn check(&self, session: &MemberSession) -> Result<Membership, AuthError> {
-        check(&self.transport, session, wait)
+        check(&self.transport, session, |duration| {
+            self.transport.wait(duration)
+        })
     }
 }
 
@@ -144,14 +152,6 @@ fn check(
     parse_membership(&response.bytes)
 }
 
-fn wait(duration: Duration) {
-    let jitter = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.subsec_millis() % 50)
-        .unwrap_or(0);
-    std::thread::sleep(duration + Duration::from_millis(u64::from(jitter)));
-}
-
 fn ensure_success(status: u16) -> Result<(), AuthError> {
     match status {
         200 => Ok(()),
@@ -191,58 +191,60 @@ fn flag(value: Option<&Value>) -> Result<Option<bool>, AuthError> {
     }
 }
 
+fn auth_error(error: ProbeError) -> AuthError {
+    match error {
+        ProbeError::Cancelled => AuthError::Cancelled,
+        ProbeError::TooLarge => AuthError::ResponseTooLarge,
+        _ => AuthError::Network,
+    }
+}
 struct HttpTransport {
-    client: Client,
+    http: Http,
+}
+impl HttpTransport {
+    fn wait(&self, duration: Duration) {
+        let jitter = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|v| v.subsec_millis() % 50)
+            .unwrap_or(0);
+        let _ = self
+            .http
+            .retry_wait(duration + Duration::from_millis(u64::from(jitter)));
+    }
+
+    fn request(
+        &self,
+        path: &str,
+        headers: HeaderMap,
+        form: Option<&[(&str, &str)]>,
+    ) -> Result<Response, AuthError> {
+        let url = Url::parse(&format!("{BASE}{path}")).map_err(|_| AuthError::InvalidInput)?;
+        let response = self
+            .http
+            .request_once(url, headers, form, MAX_RESPONSE)
+            .map_err(auth_error)?;
+        Ok(Response {
+            status: response.status,
+            bytes: response.bytes,
+        })
+    }
 }
 impl Transport for HttpTransport {
     fn login(&self, mail: &str, password: &str) -> Result<Response, AuthError> {
-        read_response(
-            self.client
-                .post(format!("{BASE}{LOGIN}"))
-                .form(&[("mail", mail), ("pass", password)])
-                .send(),
+        self.request(
+            LOGIN,
+            HeaderMap::new(),
+            Some(&[("mail", mail), ("pass", password)]),
         )
     }
-
     fn check(&self, session: &MemberSession) -> Result<Response, AuthError> {
         let mut cookie = HeaderValue::from_str(&format!("radiko_session={}", session.token()))
             .map_err(|_| AuthError::InvalidResponse)?;
         cookie.set_sensitive(true);
-        read_response(
-            self.client
-                .get(format!("{BASE}{CHECK}"))
-                .header(COOKIE, cookie)
-                .send(),
-        )
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, cookie);
+        self.request(CHECK, headers, None)
     }
-}
-
-fn read_response(
-    response: Result<reqwest::blocking::Response, reqwest::Error>,
-) -> Result<Response, AuthError> {
-    let response = response.map_err(|_| AuthError::Network)?;
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Ok(Response {
-            status,
-            bytes: Vec::new(),
-        });
-    }
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_RESPONSE as u64)
-    {
-        return Err(AuthError::ResponseTooLarge);
-    }
-    let mut bytes = Vec::new();
-    response
-        .take((MAX_RESPONSE + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| AuthError::Network)?;
-    if bytes.len() > MAX_RESPONSE {
-        return Err(AuthError::ResponseTooLarge);
-    }
-    Ok(Response { status, bytes })
 }
 
 #[cfg(test)]
@@ -281,6 +283,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cancellation_is_not_retried_or_reported_as_expiry_and_can_prevent_construction() {
+        assert!(matches!(
+            MemberClient::new_cancellable(Arc::new(|| true)),
+            Err(AuthError::Cancelled)
+        ));
+        let session = MemberSession::new("SYNTHETIC_SESSION".into()).unwrap();
+        let transport = mock(
+            Err(AuthError::Cancelled),
+            vec![Err(AuthError::Network), Err(AuthError::Cancelled)],
+        );
+        let waits = Cell::new(0);
+        assert_eq!(
+            check(&transport, &session, |_| waits.set(waits.get() + 1)).unwrap_err(),
+            AuthError::Cancelled
+        );
+        assert_eq!(transport.calls.get(), 2);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(
+            login(
+                &transport,
+                "user@example.invalid",
+                "SYNTHETIC_PASSWORD",
+                |_| panic!("cancelled POST must not retry")
+            )
+            .unwrap_err(),
+            AuthError::Cancelled
+        );
+        assert_eq!(
+            auth_error(ProbeError::TooLarge),
+            AuthError::ResponseTooLarge
+        );
+    }
     #[test]
     fn login_requires_verified_session_not_just_privileges() {
         let transport = mock(

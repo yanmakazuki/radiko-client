@@ -4,9 +4,11 @@ use crate::{
     domain::ChapterSet,
     radiko::{ChapterError, MAX_CHAPTER_BYTES, parse_chapters},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub enum Error {
+    Cancelled,
     Request(ProbeError),
     Parse(ChapterError),
     MismatchedResponse,
@@ -14,6 +16,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("チャプター取得を取り消しました"),
             Self::Request(error) => write!(f, "チャプター取得失敗: {error}"),
             Self::Parse(error) => write!(f, "チャプター解析失敗: {error}"),
             Self::MismatchedResponse => {
@@ -25,7 +28,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 impl From<ProbeError> for Error {
     fn from(value: ProbeError) -> Self {
-        Self::Request(value)
+        match value {
+            ProbeError::Cancelled => Self::Cancelled,
+            other => Self::Request(other),
+        }
     }
 }
 
@@ -33,6 +39,7 @@ impl From<ProbeError> for Error {
 pub enum Outcome {
     /// Metadata agrees, but audio synchronization remains unverified. Not a seek target.
     Candidates(ChapterSet),
+    Aligned(ChapterSet, EventBinding),
     Unavailable,
     Unresolved,
 }
@@ -44,6 +51,42 @@ pub struct Report {
     pub ends_at: DateTime<FixedOffset>,
     pub outcome: Outcome,
 }
+/// Same-origin annex timelines were checked against actual audio on 2026-10-18.
+/// A binding is not listening permission. Different episode origins remain unsupported.
+#[derive(Debug)]
+pub struct EventBinding {
+    key: crate::domain::ProgramKey,
+    ends_at: DateTime<FixedOffset>,
+    event_id: String,
+}
+impl EventBinding {
+    pub fn matching_origin(
+        key: crate::domain::ProgramKey,
+        ends_at: DateTime<FixedOffset>,
+        event_id: String,
+        origin: DateTime<FixedOffset>,
+    ) -> Option<Self> {
+        if validate_station(&key.station_id).is_err()
+            || origin != key.starts_at
+            || ends_at <= key.starts_at
+            || event_id.is_empty()
+            || event_id.len() > 128
+            || !event_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return None;
+        }
+        Some(Self {
+            key,
+            ends_at,
+            event_id,
+        })
+    }
+    pub fn matches(&self, key: &crate::domain::ProgramKey, ends_at: DateTime<FixedOffset>) -> bool {
+        self.key == *key && self.ends_at == ends_at && !self.event_id.is_empty()
+    }
+}
 
 pub fn inspect(station: &str, cursor: DateTime<FixedOffset>) -> Result<Report, Error> {
     inspect_with(&Http::new()?, station, cursor)
@@ -53,8 +96,44 @@ fn inspect_with(
     station: &str,
     cursor: DateTime<FixedOffset>,
 ) -> Result<Report, Error> {
+    inspect_with_cancel(http, station, cursor, &AtomicBool::new(false))
+}
+pub fn inspect_controlled(
+    station: &str,
+    cursor: DateTime<FixedOffset>,
+    cancelled: &AtomicBool,
+) -> Result<Report, Error> {
+    check_cancelled(cancelled)?;
+    inspect_with_cancel(&Http::new()?, station, cursor, cancelled)
+}
+pub fn inspect_cancellable(
+    station: &str,
+    cursor: DateTime<FixedOffset>,
+    cancelled: std::sync::Arc<AtomicBool>,
+) -> Result<Report, Error> {
+    check_cancelled(&cancelled)?;
+    let mut http = Http::new()?;
+    let flag = cancelled.clone();
+    http.set_cancellation(std::sync::Arc::new(move || flag.load(Ordering::Acquire)));
+    inspect_with_cancel(&http, station, cursor, &cancelled)
+}
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Error> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+fn inspect_with_cancel(
+    http: &impl Fetch,
+    station: &str,
+    cursor: DateTime<FixedOffset>,
+    cancelled: &AtomicBool,
+) -> Result<Report, Error> {
+    check_cancelled(cancelled)?;
     validate_station(station)?;
     let selected = program(http, station, cursor)?;
+    check_cancelled(cancelled)?;
     let mut report = Report {
         station: station.into(),
         title: selected.title,
@@ -73,7 +152,9 @@ fn inspect_with(
         "https://api.annex-cf.radiko.jp/v1/programs/{}/chapters",
         event.id
     ))?;
+    check_cancelled(cancelled)?;
     let reply = http.get(endpoint, HeaderMap::new(), MAX_CHAPTER_BYTES, None, false)?;
+    check_cancelled(cancelled)?;
     if reply.bytes.len() > MAX_CHAPTER_BYTES {
         return Err(Error::Parse(ChapterError::TooLarge));
     }
@@ -87,12 +168,23 @@ fn inspect_with(
     let length = (selected.end - selected.start)
         .to_std()
         .map_err(|_| Error::Parse(ChapterError::InvalidTimeline))?;
-    // These are inspection candidates only; API metadata alone does not prove audio alignment.
+    // Only the empirically checked same-origin form may receive a binding.
     let chapters = parse_chapters(&reply.bytes, length, 0.0).map_err(Error::Parse)?;
     report.outcome = if chapters.chapters.is_empty() && chapters.invalid_count == 0 {
         Outcome::Unavailable
     } else {
-        Outcome::Candidates(chapters)
+        match EventBinding::matching_origin(
+            crate::domain::ProgramKey {
+                station_id: station.into(),
+                starts_at: selected.start,
+            },
+            selected.end,
+            event.id,
+            event.origin,
+        ) {
+            Some(binding) => Outcome::Aligned(chapters, binding),
+            None => Outcome::Unresolved,
+        }
     };
     Ok(report)
 }
@@ -151,6 +243,58 @@ mod tests {
         inspect_with(mock, "TBS", parse_time("20261015120030").unwrap())
     }
     #[test]
+    fn owned_cancellation_rejects_before_metadata_and_maps_to_the_cancelled_status() {
+        let flag = std::sync::Arc::new(AtomicBool::new(true));
+        let cursor = parse_time("20261015120000").unwrap();
+        assert!(matches!(
+            inspect_cancellable("TBS", cursor, flag),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            Error::from(ProbeError::Cancelled),
+            Error::Cancelled
+        ));
+    }
+    #[test]
+    fn cancellation_before_or_after_metadata_skips_chapter_http() {
+        let cancelled = AtomicBool::new(true);
+        let untouched = mock(vec![]);
+        let cursor = parse_time("20261015120000").unwrap();
+        assert!(matches!(
+            inspect_with_cancel(&untouched, "TBS", cursor, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(untouched.paths.borrow().is_empty());
+        struct Cancelling<'a> {
+            mock: Mock,
+            flag: &'a AtomicBool,
+        }
+        impl Fetch for Cancelling<'_> {
+            fn get(
+                &self,
+                url: Url,
+                headers: HeaderMap,
+                limit: usize,
+                range: Option<(u64, u64)>,
+                redirects: bool,
+            ) -> Result<Reply, ProbeError> {
+                let reply = self.mock.get(url, headers, limit, range, redirects);
+                self.flag.store(true, Ordering::Release);
+                reply
+            }
+        }
+        cancelled.store(false, Ordering::Release);
+        let source = Cancelling {
+            mock: mock(vec![Ok(metadata())]),
+            flag: &cancelled,
+        };
+        assert!(matches!(
+            inspect_with_cancel(&source, "TBS", cursor, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(source.mock.paths.borrow().len(), 1);
+    }
+    #[test]
     fn metadata_event_matches_selected_split_slot_and_music_and_bad_positions_are_excluded() {
         let items: Value =
             serde_json::from_slice(include_bytes!("../../../tests/fixtures/chapters.json"))
@@ -161,7 +305,7 @@ mod tests {
         ]);
         let report = inspect_mock(&mock).unwrap();
         assert_eq!(report.title.as_deref(), Some("合成分割枠 (2)"));
-        let Outcome::Candidates(set) = report.outcome else {
+        let Outcome::Aligned(set, _) = report.outcome else {
             panic!()
         };
         assert_eq!(set.chapters.len(), 2);

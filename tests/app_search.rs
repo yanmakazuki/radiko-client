@@ -247,3 +247,41 @@ fn cancellation_stops_unstarted_catalog_jobs_and_does_not_report_an_incomplete_r
     ));
     assert_eq!(calls.load(Ordering::SeqCst), before);
 }
+
+#[test]
+fn cancellable_factory_receives_the_search_generation_and_releases_the_next_request() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (entered, seen) = std::sync::mpsc::channel();
+        let mut service = Service::new_cancellable(
+            move |cancel| -> Result<radiko_client::radiko::catalog::CatalogClient, CatalogError> {
+                entered.send(cancel.clone()).unwrap();
+                let began = Instant::now();
+                while !cancel.load(Ordering::Acquire) {
+                    assert!(began.elapsed() < Duration::from_secs(3));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(CatalogError::Cancelled)
+            },
+        );
+        service.submit(radiko_client::app::search::SearchId(1), criteria("TBS"));
+        let first = seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        service.submit(radiko_client::app::search::SearchId(2), criteria("OBS"));
+        assert!(first.load(Ordering::Acquire));
+        let began = Instant::now();
+        let second = loop {
+            service.poll().await;
+            if let Ok(flag) = seen.try_recv() {
+                break flag;
+            }
+            assert!(began.elapsed() < Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        assert!(!second.load(Ordering::Acquire));
+        drop(service);
+        assert!(second.load(Ordering::Acquire));
+    });
+}
