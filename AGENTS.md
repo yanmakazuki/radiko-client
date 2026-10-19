@@ -11,6 +11,7 @@ This macOS Rust client provides filtered station and regional/nationwide date-ra
 - `src/app/chapters.rs`: chapter request generations, bounded acquisition, and origin/slot-bound jump validation; listening permission is rechecked by playback.
 - `src/app/auth.rs`: asynchronous session checks, explicit login/logout jobs, and contract-only snapshots; credential drafts are zeroized and never logged.
 - `src/tui/filters.rs`: local date/scope/classification/keyword editing, validation, and observed-classification display; no I/O.
+- `src/tui/viewport.rs`: global list selection and visible row ranges; format only the visible catalog rows. `src/tui/help.rs`: read-only key guide.
 - `src/app/named.rs` and `src/tui/named.rs`: serialized local saved-search operations and browser; recalls populate drafts without fetching.
 
 - `src/domain/search.rs`: validated criteria and startup date reset; `src/storage/searches.rs`: atomic versioned criteria storage; `src/searches.rs`: offline named-search management CLI.
@@ -66,6 +67,20 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 実装前に[設計書](docs/design.md)と[アーキテクチャ設計](docs/architecture.md)を読む。仕様の判断は設計書とユーザーの最新の指示に従い、仕様変更時は設計書とアーキテクチャ設計も整合させる。
 
 ## 現在の状態
+
+- 2026年10月19日にユーザーが新TUIで実アカウントのログイン成功を確認。保存権限0700／0600・versionと保存項目を内容非表示で確認し、新セッションでライブから章への切替・同枠シーク・124.8秒の停止位置保持と再開・端末復元が成功。一時ストアは削除した。現在の確認範囲と残る項目はdocs/validation.mdを参照。
+
+- 2026年10月19日に番組一覧の可視行だけを整形する描画へ変更。合成50,000枠のデバッグ描画で約210〜217msから約3.5〜5.7msとなり、全体選択と端末サイズ変更・結果縮小を検証。fmt・clippy・全240テスト、固定ビルドでの60.8秒のミュート操作回帰が成功した。実機の全国30日検索全体の負荷測定とは区別する。
+
+- 2026年10月19日にAAC取消・操作一覧を含む固定ビルドでTBSの20261006120000（13日前）を1800.5秒ミュート出力。39操作サイクル・検索確定4回・最終不足0・正常終了と端末復元が成功した。後続の大量一覧描画変更とはビルドを分けて記録する。
+
+- 2026年10月19日にRN1の20:20〜20:50枠でミュート出力769.5秒・16操作サイクル・最終不足0を確認。自然終了時の番組終了表示、次枠へ移らないこと、正常終了と端末復元が成功した。別の前回試行の終了待ちタイムアウトと区別して実装状況へ記録。
+
+- 2026年10月19日にAACの世代取消をADTS走査・パケット前後へ接続。部分PCMとデコーダー状態を破棄し、単一パケットの途中中断はしない。?による読み取り専用操作一覧も追加し、入力欄の文字入力と区別する。全238テストと実配信の短時間開閉確認が成功。
+
+- 2026年10月19日に最新ビルドの固定コピーでTBSの20261015120000を1800.3秒ミュート出力し、38操作サイクル・検索確定4回・最終不足0・正常終了と端末復元を確認。早期終了を検索0件時の検証スクリプトのEsc送信で再現し、画面の開閉確認を修正した。scripts/verify_tui_playback.pyで明示的に再検証できる。詳細とビルドのハッシュは実装状況を参照。
+
+- 2026年10月19日に放送状態とは別の配信確認表示を追加。局・開始終了・モードと出力済みフレームが一致する現在の再生だけを確認済みとし、停止後や準備だけの状態は未確認へ戻す。新しい再生の権限判定は省略しない。現在章も出力前には強調しない。
 
 - 2026年10月18日にユーザーの聴感で、TBSの10月15日・10月6日12時枠の交通情報とチャプター開始秒数の対応を確認。原点一致のEventBindingを持つ章だけEnterから通常の権限確認・シーク／別枠切替へ接続した。原点が異なる枠の補正は未対応。区切り時点の検証・中断状況は実装状況を参照。
 

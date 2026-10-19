@@ -1,4 +1,5 @@
 /target/
+__pycache__/
 /local-data/
 session.json
 session.json.*

@@ -1,6 +1,6 @@
 //! Bounded command handoff; the owning worker creates and drops CPAL on its own thread.
 use crate::{
-    domain::{BroadcastStatus, Program, broadcast_status},
+    domain::{BroadcastStatus, ListeningAvailability, Program, broadcast_status},
     player::{
         output::StopToken,
         playback,
@@ -29,6 +29,37 @@ type Factory = Arc<
         + Send
         + Sync,
 >;
+/// Only the active output is evidence of stream permission; no result is cached.
+pub fn availability(
+    program: &Program,
+    mode: ProbeMode,
+    now: DateTime<FixedOffset>,
+    active: Option<&PlaybackSnapshot>,
+) -> ListeningAvailability {
+    match broadcast_status(program.key.starts_at, program.ends_at, now) {
+        Err(_) => return ListeningAvailability::Unavailable("放送枠が不正なため再生できません"),
+        Ok(BroadcastStatus::Upcoming) => {
+            return ListeningAvailability::Unavailable("放送前のため再生できません");
+        }
+        Ok(BroadcastStatus::Finished) if mode == ProbeMode::Live => {
+            return ListeningAvailability::Unavailable("放送終了のためライブ再生できません");
+        }
+        _ => (),
+    }
+    if active.is_some_and(|p| {
+        p.info.station == program.key.station_id
+            && p.info.starts_at == program.key.starts_at
+            && p.info.ends_at == program.ends_at
+            && p.info.mode == mode
+            && p.output
+                .as_ref()
+                .is_some_and(|o| o.sample_rate > 0 && o.frames > 0)
+    }) {
+        ListeningAvailability::CurrentOutput
+    } else {
+        ListeningAvailability::Unknown
+    }
+}
 #[derive(Default)]
 pub struct Update {
     pub snapshot: Option<PlaybackSnapshot>,
@@ -331,6 +362,89 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(3));
             thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn availability_never_infers_permission_from_finished_status_or_another_slot() {
+        use crate::player::{output::OutputSummary, state::PlaybackState};
+        let p = program();
+        let mut snapshot = PlaybackSnapshot {
+            info: StreamInfo {
+                station: p.key.station_id.clone(),
+                title: Some(p.title.clone()),
+                starts_at: p.key.starts_at,
+                ends_at: p.ends_at,
+                mode: ProbeMode::TimeFree,
+                position: Duration::ZERO,
+            },
+            state: PlaybackState::Playing,
+            pending: None,
+            volume: 0,
+            position: Some(Duration::from_secs(1)),
+            segments: 1,
+            output: Some(OutputSummary {
+                frames: 48000,
+                underrun_frames: 0,
+                sample_rate: 48000,
+                channels: 2,
+            }),
+        };
+        assert_eq!(
+            availability(&p, ProbeMode::TimeFree, p.ends_at, None),
+            ListeningAvailability::Unknown
+        );
+        assert_eq!(
+            availability(&p, ProbeMode::TimeFree, p.ends_at, Some(&snapshot)),
+            ListeningAvailability::CurrentOutput
+        );
+        snapshot.state = PlaybackState::Paused;
+        assert_eq!(
+            availability(&p, ProbeMode::TimeFree, p.ends_at, Some(&snapshot)),
+            ListeningAvailability::CurrentOutput
+        );
+        assert!(matches!(
+            availability(
+                &p,
+                ProbeMode::TimeFree,
+                p.key.starts_at - chrono::Duration::seconds(1),
+                Some(&snapshot)
+            ),
+            ListeningAvailability::Unavailable(_)
+        ));
+        assert!(matches!(
+            availability(&p, ProbeMode::Live, p.ends_at, Some(&snapshot)),
+            ListeningAvailability::Unavailable(_)
+        ));
+        assert_eq!(
+            availability(&p, ProbeMode::Live, p.key.starts_at, Some(&snapshot)),
+            ListeningAvailability::Unknown
+        );
+        snapshot.output.as_mut().unwrap().frames = 0;
+        assert_eq!(
+            availability(&p, ProbeMode::TimeFree, p.ends_at, Some(&snapshot)),
+            ListeningAvailability::Unknown
+        );
+        snapshot.output.as_mut().unwrap().frames = 48000;
+        for changed in 0..3 {
+            let mut different = p.clone();
+            match changed {
+                0 => different.key.station_id = "OBS".into(),
+                1 => different.key.starts_at += chrono::Duration::seconds(1),
+                _ => different.ends_at += chrono::Duration::seconds(1),
+            }
+            assert_eq!(
+                availability(
+                    &different,
+                    ProbeMode::TimeFree,
+                    different.ends_at,
+                    Some(&snapshot)
+                ),
+                ListeningAvailability::Unknown
+            );
+        }
+        assert_eq!(
+            availability(&p, ProbeMode::TimeFree, p.ends_at, None),
+            ListeningAvailability::Unknown
+        );
     }
     #[test]
     fn chapter_position_rejection_never_starts_output_or_fetches() {

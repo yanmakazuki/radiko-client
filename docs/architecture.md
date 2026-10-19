@@ -1,5 +1,23 @@
 # アーキテクチャ設計
 
+## 一覧の表示範囲だけの整形（2026年10月19日）
+
+src/tui/viewport.rsは全体のListState・行数・表示可能高さから半開区間を求める。選択とoffsetは全体の添字として保持し、描画用にだけ相対選択を持つ一時ListStateと可視範囲のListItemを作る。行は折り返さない一行の番組項目に限定する。結果縮小時に選択を補正し、0件で解除する。高さ0でも範囲外参照をせず、選択を表示用の相対添字で上書きしない。検索・再生・チャプター状態は変更しない。
+
+## 読み取り専用の操作一覧（2026年10月19日）
+
+Screen.help_openだけで表示を切り替え、src/tui/help.rsはキー一覧と現在のPlaybackSnapshotを描画する。通信・保存・プレイヤー制御を呼ばず、メインループの状態通知は継続して反映する。キー処理はCtrl+Cの直後に開いている一覧を優先し、閉じるキー以外を消費する。通常画面でのみ?を開く操作へ解釈し、各エディターの文字入力を優先する。
+
+## パケット境界でのデコード取消（2026年10月19日）
+
+AdtsDecoder::decode_segment_pcm_controlledは所有ワーカーの世代取消を借用したFnMutで受ける。PCM確保前・ADTS走査・デコーダー初期化前・各パケットの前後・成功返却前を確認し、AacError::Cancelledで部分PCMとデコーダー状態を破棄する。既存の非制御APIは常にfalseのアダプターを使う。連続再生ワーカーは同じStopTokenを渡し、取消後の結果配送も従来どおり拒否する。別スレッドや共有ロックは追加せず、単一パケット実行中は既存デコーダーが戻るまで待つ。
+
+## 配信確認の表示と手動検証境界（2026年10月19日）
+
+domain::ListeningAvailabilityはUnknown／Unavailable(reason)／CurrentOutputを区別し、app::playback::availabilityが取得や永続保存なしで算出する。放送前とライブ終了を先に判定し、現在のPlaybackSnapshotの局ID・開始終了・モード・正の出力フレームが一致する場合だけCurrentOutputとする。契約フラグや放送終了を配信許可へ変換せず、再生要求では従来の認証・配信条件確認を必ず行う。
+
+scripts/verify_tui_playback.pyは明示実行するmacOS向け手動検証である。0700の一時領域へ実行ファイルを独立コピーしSHA-256を報告、0600でセッションを一時複製する。番組一覧は毎回取得してメモリだけで選択し、PTYの有界な画面投影から数値診断を読み取る。UTF-8とCSIを分割受信できる増分処理を用い、端末内容をログへ出さない。検索0件時はcで画面が開いたことを確認してからEscを送る。SIGINT／SIGTERMでも子を終了して一時領域を削除する。
+
 ## 原点一致のEventBindingとジャンプ（2026年10月18日）
 
 7日以内と8〜30日前のTBS各一章で音声との対応をユーザーが確認した。取得器は局・eventId・放送枠・episodeIntroductionStartAtを照合し、原点が枠開始と一致する場合だけEventBindingを生成しOutcome::Alignedへ付ける。異なる原点の補正は行わない。従来のCandidatesは閲覧専用のままとする。
@@ -192,7 +210,7 @@ HTTPやプレイヤーの境界は差し替え可能なインターフェース�
 | `BroadcastDay` | 日本時間の午前5時区切りの日付。実際の開始日時とは別に保持 |
 | `SearchCriteria` | 単日／期間、地域、番組ジャンル、出演者分類、キーワード |
 | `BroadcastStatus` | `Upcoming / OnAir / Finished`。時刻から算出 |
-| `ListeningAvailability` | `Unknown / Allowed / Denied(reason)`。モード・契約・期限に依存 |
+| `ListeningAvailability` | `Unknown / Unavailable(reason) / CurrentOutput`。放送状態とモード・現在の出力に基づく表示。新規再生の権限判定は配信解決で実施 |
 | `PlaybackTarget` | 放送枠のスナップショット、ライブ／タイムフリー、希望開始位置 |
 | `EventBinding` | 対象キー、`eventId`、イベントの音声原点、放送枠との対応根拠。検証済みの場合のみ作成 |
 | `Chapter` | 表示タイトル、要約、放送枠冒頭からの開始・終了時間、元配列の順序 |

@@ -11,6 +11,7 @@ const MAX_PCM_SAMPLES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AacError {
+    Cancelled,
     TooLarge,
     InvalidMetadata,
     InvalidHeader,
@@ -28,6 +29,7 @@ pub enum AacError {
 impl fmt::Display for AacError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Cancelled => "AACデコードを取り消しました",
             Self::TooLarge => "AACセグメントのサイズ上限を超えました",
             Self::InvalidMetadata => "AACに付加されたID3の形式が不正です",
             Self::InvalidHeader => "ADTSヘッダーが不正です",
@@ -88,7 +90,13 @@ struct Frame<'a> {
     payload: &'a [u8],
 }
 
-fn frames(bytes: &[u8]) -> Result<Vec<Frame<'_>>, AacError> {
+fn frames<'a>(
+    bytes: &'a [u8],
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Vec<Frame<'a>>, AacError> {
+    if cancelled() {
+        return Err(AacError::Cancelled);
+    }
     if bytes.len() > MAX_SEGMENT_BYTES {
         return Err(AacError::TooLarge);
     }
@@ -96,6 +104,9 @@ fn frames(bytes: &[u8]) -> Result<Vec<Frame<'_>>, AacError> {
     let mut remaining = &bytes[offset..];
     let mut frames = Vec::new();
     while !remaining.is_empty() {
+        if cancelled() {
+            return Err(AacError::Cancelled);
+        }
         if frames.len() >= MAX_PACKETS {
             return Err(AacError::TooManyPackets);
         }
@@ -150,7 +161,7 @@ impl AdtsDecoder {
         bytes: &[u8],
         declared_codec: Option<&str>,
     ) -> Result<AacSummary, AacError> {
-        let result = self.decode(bytes, declared_codec, None);
+        let result = self.decode(bytes, declared_codec, None, &mut || false);
         if result.is_err() {
             self.decoder = None;
             self.format = None;
@@ -163,8 +174,23 @@ impl AdtsDecoder {
         bytes: &[u8],
         declared_codec: Option<&str>,
     ) -> Result<DecodedPcm, AacError> {
+        self.decode_segment_pcm_controlled(bytes, declared_codec, || false)
+    }
+    /// Cancellation is checked between ADTS headers and before/after each packet.
+    /// One decoder call is not interrupted; cancelled state and partial PCM are discarded.
+    pub fn decode_segment_pcm_controlled(
+        &mut self,
+        bytes: &[u8],
+        declared_codec: Option<&str>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<DecodedPcm, AacError> {
+        if cancelled() {
+            self.decoder = None;
+            self.format = None;
+            return Err(AacError::Cancelled);
+        }
         let mut samples = Vec::with_capacity(MAX_PCM_SAMPLES);
-        match self.decode(bytes, declared_codec, Some(&mut samples)) {
+        match self.decode(bytes, declared_codec, Some(&mut samples), &mut cancelled) {
             Ok(summary) => Ok(DecodedPcm { summary, samples }),
             Err(error) => {
                 self.decoder = None;
@@ -178,9 +204,13 @@ impl AdtsDecoder {
         bytes: &[u8],
         declared_codec: Option<&str>,
         mut pcm: Option<&mut Vec<f32>>,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<AacSummary, AacError> {
         let started = Instant::now();
-        let frames = frames(bytes)?;
+        let frames = frames(bytes, cancelled)?;
+        if cancelled() {
+            return Err(AacError::Cancelled);
+        }
         let format = frames[0].format;
         if frames.iter().any(|f| f.format != format)
             || self.format.is_some_and(|previous| previous != format)
@@ -211,7 +241,13 @@ impl AdtsDecoder {
             nonzero_samples: 0,
         };
         for frame in frames {
+            if cancelled() {
+                return Err(AacError::Cancelled);
+            }
             let audio = decoder.decode(frame.payload, None).map_err(map_error)?;
+            if cancelled() {
+                return Err(AacError::Cancelled);
+            }
             if audio.sample_rate == 0
                 || audio.sample_rate > 192_000
                 || audio.channels == 0
@@ -266,6 +302,9 @@ impl AdtsDecoder {
         if declared_he && !summary.sbr_detected {
             return Err(AacError::DeclaredSbrMissing);
         }
+        if cancelled() {
+            return Err(AacError::Cancelled);
+        }
         Ok(summary)
     }
 }
@@ -307,6 +346,41 @@ mod tests {
         }
         assert!(result.len() >= 3);
         result
+    }
+    #[test]
+    fn cancellation_at_every_checkpoint_discards_partial_pcm_and_resets_decoder_state() {
+        let bytes = generated_adts(24000, false).concat();
+        let mut checkpoints = 0;
+        let reference = AdtsDecoder::new()
+            .decode_segment_pcm_controlled(&bytes, None, || {
+                checkpoints += 1;
+                false
+            })
+            .unwrap();
+        assert!(checkpoints > 3);
+        for stop_at in 1..=checkpoints {
+            let mut decoder = AdtsDecoder::new();
+            // Include previously valid overlap state: cancellation must discard it too.
+            decoder.decode_segment(&bytes, None).unwrap();
+            let mut seen = 0;
+            let result = decoder.decode_segment_pcm_controlled(&bytes, None, || {
+                seen += 1;
+                seen >= stop_at
+            });
+            assert_eq!(result.unwrap_err(), AacError::Cancelled);
+            assert!(decoder.decoder.is_none());
+            assert!(decoder.format.is_none());
+            let recovered = decoder.decode_segment_pcm(&bytes, None).unwrap();
+            assert_eq!(recovered.samples, reference.samples);
+            assert_eq!(recovered.summary.frames, reference.summary.frames);
+        }
+        let mut decoder = AdtsDecoder::new();
+        assert_eq!(
+            decoder
+                .decode_segment_pcm_controlled(b"invalid", None, || true)
+                .unwrap_err(),
+            AacError::Cancelled
+        );
     }
     #[test]
     fn retained_pcm_is_complete_validated_and_bounded_before_output() {

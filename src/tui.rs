@@ -1,10 +1,12 @@
 //! 検索とライブ／タイムフリー再生のTUI。描画処理は状態を参照するだけで、通信や再生を実行しない。
 mod areas;
 mod filters;
+mod help;
 mod login;
 mod named;
 mod picker;
 mod seek;
+mod viewport;
 use chrono::{DateTime, FixedOffset, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use radiko_client::{
@@ -81,6 +83,7 @@ enum PlaybackAction {
     Stop,
 }
 struct Screen {
+    help_open: bool,
     login: Option<login::Editor>,
     login_requested: Option<Credentials>,
     logout_confirm: bool,
@@ -294,6 +297,12 @@ impl Screen {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
         }
+        if self.help_open {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
+                self.help_open = false;
+            }
+            return Ok(false);
+        }
         if self.logout_confirm {
             match key.code {
                 KeyCode::Char('y') => {
@@ -479,6 +488,7 @@ impl Screen {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('?') => self.help_open = true,
             KeyCode::Char('a') => self.auth_refresh = true,
             KeyCode::Char('O') => self.logout_confirm = true,
             KeyCode::Char('I') => self.login = Some(login::Editor::default()),
@@ -672,7 +682,7 @@ fn preview(text: &str) -> String {
     }
     output.chars().take(1200).collect()
 }
-fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect) {
+fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTime<FixedOffset>) {
     let state = &screen.app.chapters;
     let Some(target) = &state.target else {
         return;
@@ -708,9 +718,12 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect) {
             return None;
         }
         let (bound, _) = state.jump(0).ok()?;
-        if bound.key.station_id != p.info.station
-            || bound.key.starts_at != p.info.starts_at
-            || bound.ends_at != p.info.ends_at
+        if radiko_client::app::playback::availability(
+            bound,
+            radiko_client::radiko::stream::ProbeMode::TimeFree,
+            now,
+            Some(p),
+        ) != radiko_client::domain::ListeningAvailability::CurrentOutput
         {
             return None;
         }
@@ -777,6 +790,10 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect) {
     );
 }
 fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
+    if screen.help_open {
+        help::draw(frame, screen.app.playback.as_ref(), screen.volume);
+        return;
+    }
     let areas = Layout::vertical([
         Constraint::Length(7),
         Constraint::Min(1),
@@ -834,12 +851,25 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     } else if let Some(editor) = &mut screen.filters {
         editor.draw(frame, areas[1]);
     } else if screen.app.chapters.target.is_some() {
-        draw_chapters(frame, screen, areas[1]);
+        draw_chapters(frame, screen, areas[1], now);
     } else {
         let panes = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
             .split(areas[1]);
-        let items: Vec<_> = screen
-            .rows()
+        let count = screen.rows().len();
+        let visible = viewport::visible(
+            &mut screen.list,
+            count,
+            usize::from(panes[0].height.saturating_sub(2)),
+        );
+        let mut local_list = ListState::default();
+        local_list.select(
+            screen
+                .list
+                .selected()
+                .filter(|i| visible.contains(i))
+                .map(|i| i - visible.start),
+        );
+        let items: Vec<_> = screen.rows()[visible]
             .iter()
             .map(|i| {
                 let p = &screen.app.programs[*i];
@@ -862,18 +892,29 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ "),
             panes[0],
-            &mut screen.list,
+            &mut local_list,
         );
         let mut detail = screen
             .selected()
             .map(|p| {
                 format!(
-                    "{}\n{} / {}〜{} JST\n{} / 再生可否未確認\n出演: {}\n\n{}\n{}",
+                    "{}\n{} / {}〜{} JST\n{} / {}\n出演: {}\n\n{}\n{}",
                     p.title,
                     p.key.station_id,
                     local(p.key.starts_at).format("%m/%d %H:%M"),
                     local(p.ends_at).format("%m/%d %H:%M"),
                     status(p, now),
+                    radiko_client::app::playback::availability(
+                        p,
+                        if screen.live_mode {
+                            radiko_client::radiko::stream::ProbeMode::Live
+                        } else {
+                            radiko_client::radiko::stream::ProbeMode::TimeFree
+                        },
+                        now,
+                        screen.app.playback.as_ref(),
+                    )
+                    .label(),
                     p.performer,
                     preview(&p.description),
                     preview(&p.info)
@@ -984,7 +1025,9 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
                     "Enter TF再生 / v ライブ画面 / l ライブ / f 条件 / b 保存条件 / c チャプター"
                 }
             };
-            format!("{enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了")
+            format!(
+                "? 操作一覧 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了"
+            )
         };
         let footer = format!(
             "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}\n{} {}",
@@ -1077,6 +1120,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         let _restore = RestoreTerminal;
         let mut terminal = ratatui::try_init()?;
         let mut screen = Screen {
+            help_open: false,
             login: None,
             login_requested: None,
             logout_confirm: false,
@@ -1315,6 +1359,7 @@ mod tests {
         let now = radiko_client::radiko::stream::parse_time("20261015060000").unwrap();
         let criteria = crate::programs::criteria(&["TBS".into(), "20261015".into()], now).unwrap();
         Screen {
+            help_open: false,
             login: None,
             login_requested: None,
             logout_confirm: false,
@@ -2033,6 +2078,152 @@ mod tests {
         assert_eq!(screen.input.as_deref(), Some("a"));
     }
     #[test]
+    fn large_catalog_keeps_global_selection_visible_at_the_end_and_after_moving_up() {
+        let mut screen = screen();
+        let mut search =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("navigation must not fetch") });
+        let template = radiko_client::radiko::catalog::parse_programs(
+            include_bytes!("../tests/fixtures/schedule.xml"),
+            "TBS",
+            radiko_client::radiko::catalog::parse_day("20261015").unwrap(),
+        )
+        .unwrap()
+        .programs
+        .remove(0);
+        const ROWS: usize = 50000;
+        screen.app.programs = (0..ROWS)
+            .map(|i| {
+                let mut program = template.clone();
+                program.title = format!("CATALOG_{i:05}");
+                program.key.station_id = format!("S{}", i % 100);
+                program.key.starts_at += chrono::Duration::minutes((i / 100) as i64 * 30);
+                program.ends_at = program.key.starts_at + chrono::Duration::minutes(30);
+                program
+            })
+            .collect();
+        screen.app.visible = (0..ROWS).collect();
+        screen.list.select(Some(ROWS - 1));
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        for expected in [ROWS - 1, ROWS - 2] {
+            let began = std::time::Instant::now();
+            terminal
+                .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+                .unwrap();
+            eprintln!(
+                "catalog rows={ROWS}, draw_us={}",
+                began.elapsed().as_micros()
+            );
+            assert_eq!(screen.list.selected(), Some(expected));
+            let mut left = String::new();
+            for y in 7..21 {
+                for x in 0..67 {
+                    left.push_str(terminal.backend().buffer()[(x, y)].symbol());
+                }
+            }
+            assert!(left.contains(&format!("CATALOG_{expected:05}")));
+            assert_eq!(
+                screen.selected().unwrap().title,
+                format!("CATALOG_{expected:05}")
+            );
+            screen
+                .key(
+                    KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+                    &mut search,
+                )
+                .unwrap();
+        }
+    }
+    #[test]
+    fn help_never_dispatches_search_authentication_or_playback_and_closes_without_quitting() {
+        let mut screen = screen();
+        let mut search =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("help must not fetch") });
+        screen.volume = 17;
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
+        assert!(screen.help_open);
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('s'),
+            KeyCode::Char('I'),
+            KeyCode::Char('O'),
+            KeyCode::Char('r'),
+            KeyCode::Char('v'),
+            KeyCode::Char(' '),
+            KeyCode::Char('+'),
+        ] {
+            assert!(
+                !screen
+                    .key(KeyEvent::new(code, KeyModifiers::NONE), &mut search)
+                    .unwrap()
+            );
+        }
+        assert!(screen.playback_action.is_none());
+        assert!(screen.chapter_action.is_none());
+        assert!(screen.login_requested.is_none());
+        assert!(!screen.logout_requested);
+        assert!(!screen.auth_refresh);
+        assert_eq!(screen.volume, 17);
+        assert_eq!(screen.app.status, SearchStatus::Idle);
+        for size in [(100, 30), (40, 10)] {
+            let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.replace(' ', "").contains("操作一覧を閉じる"));
+        }
+        for close in [KeyCode::Esc, KeyCode::Char('?'), KeyCode::Char('q')] {
+            screen.help_open = true;
+            assert!(
+                !screen
+                    .key(KeyEvent::new(close, KeyModifiers::NONE), &mut search)
+                    .unwrap()
+            );
+            assert!(!screen.help_open);
+        }
+        screen.help_open = true;
+        assert!(
+            screen
+                .key(
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &mut search
+                )
+                .unwrap()
+        );
+    }
+    #[test]
+    fn question_mark_in_keyword_draft_does_not_open_help_or_fetch() {
+        let mut screen = screen();
+        let mut search =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("draft must not fetch") });
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
+        assert_eq!(screen.input.as_deref(), Some("?"));
+        assert!(!screen.help_open);
+        assert_eq!(screen.app.status, SearchStatus::Idle);
+    }
+    #[test]
     fn aligned_chapter_enter_seeks_only_same_timefree_slot_and_switches_other_targets() {
         use radiko_client::radiko::stream::{
             ProbeMode,
@@ -2104,7 +2295,12 @@ mod tests {
                 pending: None,
                 volume: 25,
                 position: Some(expected),
-                output: None,
+                output: Some(radiko_client::player::output::OutputSummary {
+                    frames: 1,
+                    underrun_frames: 0,
+                    sample_rate: 48000,
+                    channels: 2,
+                }),
                 segments: 1,
             });
             screen
@@ -2136,6 +2332,18 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect();
             assert_eq!(text.replace(' ', "").contains("[再生位置]"), same);
+            screen.app.playback.as_mut().unwrap().output = None;
+            terminal
+                .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+                .unwrap();
+            let preparing: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(!preparing.replace(' ', "").contains("[再生位置]"));
         }
         screen.app.authentication.status = AuthStatus::LoggingOut;
         screen

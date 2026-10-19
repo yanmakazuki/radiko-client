@@ -145,7 +145,11 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                     if segment.discontinuity {
                         decoder = AdtsDecoder::new();
                     }
-                    match decoder.decode_segment_pcm(&segment.bytes, segment.codec.as_deref()) {
+                    match decoder.decode_segment_pcm_controlled(
+                        &segment.bytes,
+                        segment.codec.as_deref(),
+                        || control.is_cancelled(),
+                    ) {
                         Ok(mut pcm) => {
                             if seeking {
                                 match trim_to(&mut pcm, segment.starts_at, target) {

@@ -129,10 +129,8 @@ impl State {
         let length = (target.ends_at - target.key.starts_at)
             .to_std()
             .map_err(|_| "放送枠の長さが不正です")?;
-        let start = std::time::Duration::try_from_secs_f64(chapter.start.as_secs_f64())
-            .map_err(|_| "チャプター位置が不正です")?;
-        let end = std::time::Duration::try_from_secs_f64(chapter.end.as_secs_f64())
-            .map_err(|_| "チャプター位置が不正です")?;
+        let start = chapter.start;
+        let end = chapter.end;
         if start >= end || end > length {
             return Err("放送枠外のチャプターにはジャンプできません");
         }

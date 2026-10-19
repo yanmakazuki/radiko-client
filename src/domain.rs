@@ -48,6 +48,23 @@ pub enum BroadcastStatus {
     Finished,
 }
 
+/// A display assessment, never authorization to skip the stream resolver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListeningAvailability {
+    Unknown,
+    Unavailable(&'static str),
+    CurrentOutput,
+}
+impl ListeningAvailability {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "再生可否未確認",
+            Self::Unavailable(reason) => reason,
+            Self::CurrentOutput => "現在の再生で配信確認済み（再操作時は再確認）",
+        }
+    }
+}
+
 pub fn broadcast_status(
     start: DateTime<FixedOffset>,
     end: DateTime<FixedOffset>,
