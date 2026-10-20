@@ -59,3 +59,15 @@ fn distinguishes_empty_schedule_from_invalid_or_wrong_day_data() {
         Err(CatalogError::NoValidPrograms(5))
     ));
 }
+
+#[test]
+fn backwards_overnight_end_is_excluded_without_guessing_a_replacement_date() {
+    let xml = br#"<radiko><stations><station id="TBS"><name>synthetic</name><progs>
+      <prog id="valid" ft="20261015060000" to="20261015070000"><title>valid</title></prog>
+      <prog id="backwards" ft="20261016041000" to="20261015051000"><title>invalid</title></prog>
+    </progs></station></stations></radiko>"#;
+    let list = parse_programs(xml, "TBS", parse_day("20261015").unwrap()).unwrap();
+    assert_eq!(list.invalid_count, 1);
+    assert_eq!(list.programs.len(), 1);
+    assert_eq!(list.programs[0].program_id, "valid");
+}

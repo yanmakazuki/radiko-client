@@ -11,7 +11,7 @@ This macOS Rust client provides filtered station and regional/nationwide date-ra
 - `src/app/chapters.rs`: chapter request generations, bounded acquisition, and origin/slot-bound jump validation; listening permission is rechecked by playback.
 - `src/app/auth.rs`: asynchronous session checks, explicit login/logout jobs, and contract-only snapshots; credential drafts are zeroized and never logged.
 - `src/tui/filters.rs`: local date/scope/classification/keyword editing, validation, and observed-classification display; no I/O.
-- `src/tui/viewport.rs`: global list selection and visible row ranges; format only the visible catalog rows. `src/tui/help.rs`: read-only key guide.
+- `src/tui/viewport.rs`: global list/page selection and visible row ranges; format only visible rows. `src/tui/failures.rs`: read-only current acquisition failures and malformed-slot provenance. `src/tui/scroll.rs`: bounded wrap-aware help/chapter-summary scrolling. `src/tui/help.rs`: read-only key guide.
 - `src/app/named.rs` and `src/tui/named.rs`: serialized local saved-search operations and browser; recalls populate drafts without fetching.
 
 - `src/domain/search.rs`: validated criteria and startup date reset; `src/storage/searches.rs`: atomic versioned criteria storage; `src/searches.rs`: offline named-search management CLI.
@@ -67,6 +67,16 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 実装前に[設計書](docs/design.md)と[アーキテクチャ設計](docs/architecture.md)を読む。仕様の判断は設計書とユーザーの最新の指示に従い、仕様変更時は設計書とアーキテクチャ設計も整合させる。
 
 ## 現在の状態
+
+- 2026年10月20日のビルドa7007461でTBS 10月6日枠の30分再試行は1060.3秒・不足139,264フレームの後に停止し、原因未確定。後続ca0b3d46では1000秒位置から120.6秒・不足0・正常終了を確認。冒頭からの再試行は1154.8秒・25操作・不足70,144フレームまで観測後にユーザー指示で中断し、30分成功とはしない。同じ位置付近の不足と先の停止原因は継続調査。安全な停止診断・チャプター対応付け未確認の理由表示・入力修飾キー処理を追加し、Rust 249／Python 7テスト・fmt・clippyが成功。詳細はdocs/implementation.mdを参照。
+
+- 2026年10月20日にFMJライブをUSB機器から25秒・アプリ音量25%で出力。48kHz・2ch・5セグメント・不足0・指定時間停止・終了0、ユーザーの「自然に聞こえ、音切れ・雑音は気にならなかった」を確認。全局・全形式の品質保証とは区別する。
+
+- 2026年10月20日にヘルプと章要約の折り返し後スクロール、Tabによる要約拡大を追加。停止と配信終端受信の競合を生成データで再現・修正し、停止要求がなければ本来のエラーを残す。Esc二連送信で条件フォームが残る検証手順も修正。ビルドa7007461の8.4秒停止・再開後60.5秒・14操作・不足0・端末復元、Rust 248／Python 6テスト成功。30分停止の別ビルドの結果と区別する。
+
+- 2026年10月20日に番組・ライブ・章一覧のページ／先頭末尾移動と、eで今回の取得失敗の地域・局／日を閲覧する専用画面を追加。新規検索で古い失敗を消去し、閲覧キーを通信・認証・再生へ転送しない。全国30日132,595枠の部分取得を152.61秒・ピークRSS約476MB・ヘルプ応答最大214msで確認。全件取得成功とはしない。
+
+- 2026年10月20日にユーザー操作のUSB機器切断・再接続と、再接続後の明示的ミュート再生15.6秒・不足0・端末復元を確認。切断時も出力が進み機器エラーは発生せず、OSの出力先切替の可能性がある。実機エラー経路は未検証。再試行では1,800.4秒の停止・位置保持・再開後30.5秒出力・不足0と端末復元に成功。422.2秒までを観測して判定中断した前試行とは区別する。
 
 - 2026年10月19日にユーザーが新TUIで実アカウントのログイン成功を確認。保存権限0700／0600・versionと保存項目を内容非表示で確認し、新セッションでライブから章への切替・同枠シーク・124.8秒の停止位置保持と再開・端末復元が成功。一時ストアは削除した。現在の確認範囲と残る項目はdocs/validation.mdを参照。
 

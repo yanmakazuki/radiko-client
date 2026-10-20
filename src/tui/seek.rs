@@ -72,7 +72,13 @@ impl Editor {
                 self.input.clear();
                 self.error.clear();
             }
-            KeyCode::Char(c) if c.is_ascii_digit() && self.input.len() < 20 => {
+            KeyCode::Char(c)
+                if c.is_ascii_digit()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.input.len() < 20 =>
+            {
                 self.input.push(c);
                 self.error.clear();
             }
@@ -142,5 +148,11 @@ mod tests {
         assert_eq!(editor.input.len(), 20);
         editor.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(editor.input.is_empty());
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            editor.handle(KeyEvent::new(KeyCode::Char('1'), modifier));
+        }
+        assert!(editor.input.is_empty());
+        editor.handle(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(editor.input, "1");
     }
 }

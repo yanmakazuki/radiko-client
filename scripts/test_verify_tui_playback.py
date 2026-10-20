@@ -6,7 +6,7 @@ import subprocess
 import sys
 import datetime
 
-from verify_tui_playback import Terminal, wait_exit, target_matches
+from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics
 
 
 class TerminalTests(unittest.TestCase):
@@ -19,6 +19,15 @@ class TerminalTests(unittest.TestCase):
         wrong = selected + '\n再生中: same title / TBS / TimeFree\n10/15 11:00〜10/15 12:00 JST'
         self.assertFalse(target_matches(wrong, 'TBS', start, end))
         self.assertTrue(target_matches('再生中: title / TBS / TimeFree\n' + selected, 'TBS', start, end))
+
+    def test_failure_diagnostics_ignore_program_text_and_never_return_raw_notice(self):
+        body = '再生停止: 配信取得: signed-url-secret\n' + '\n'.join(['body'] * 9)
+        self.assertFalse(failure_diagnostics(body)['notice_visible'])
+        footer = '\n'.join(['body'] * 10 + ['│再生中: 再生停止: title / TBS / TimeFree',
+            '│再生停止: 配信取得: 配信サーバーがHTTP 503を返しました', '│', '│'])
+        self.assertEqual(failure_diagnostics(footer), dict(notice_visible=True, error_kind='source_other', http_status=503))
+        unknown = '\n'.join(['body'] * 10 + ['│再生停止: sensitive-unrecognized-text', '│'])
+        self.assertNotIn('sensitive-unrecognized-text', str(failure_diagnostics(unknown)))
 
     def test_every_utf8_and_csi_split_preserves_japanese_and_restoration(self):
         content = '\x1b[2J\x1b[2;3H再生位置\x1b[?1049l'.encode()

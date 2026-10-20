@@ -1,7 +1,7 @@
 //! Independent chapter acquisition. Only slot-bound aligned timelines may request seeking.
 use crate::{
     domain::{ChapterSet, Program, ProgramKey},
-    radiko::stream::chapters::{self, EventBinding, Outcome, Report},
+    radiko::stream::chapters::{self, BindingIssue, EventBinding, Outcome, Report},
 };
 use std::{
     fmt,
@@ -20,7 +20,7 @@ pub enum Status {
     Loading,
     Ready,
     Unavailable,
-    Unresolved,
+    Unresolved(BindingIssue),
     Failed(String),
 }
 pub struct State {
@@ -74,13 +74,13 @@ impl State {
                     || report.starts_at != target.key.starts_at
                     || report.ends_at != target.ends_at
                 {
-                    self.status = Status::Unresolved;
+                    self.status = Status::Unresolved(BindingIssue::SlotMismatch);
                     return;
                 }
                 self.status = match report.outcome {
                     Outcome::Aligned(set, binding) => {
                         if !binding.matches(&target.key, target.ends_at) {
-                            self.status = Status::Unresolved;
+                            self.status = Status::Unresolved(BindingIssue::SlotMismatch);
                             return;
                         }
                         self.binding = Some(binding);
@@ -92,7 +92,7 @@ impl State {
                         Status::Ready
                     }
                     Outcome::Unavailable => Status::Unavailable,
-                    Outcome::Unresolved => Status::Unresolved,
+                    Outcome::Unresolved(issue) => Status::Unresolved(issue),
                 };
             }
             Err(error) => self.status = Status::Failed(error.to_string()),
@@ -107,7 +107,7 @@ impl State {
             }
             Status::Ready => "メタデータ一致・音声位置未検証（閲覧のみ）",
             Status::Unavailable => "チャプター未提供（生成待ちの場合があります）",
-            Status::Unresolved => "番組との対応付け未確認",
+            Status::Unresolved(issue) => issue.label(),
             Status::Failed(_) => "チャプター取得失敗",
         }
     }

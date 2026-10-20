@@ -315,6 +315,25 @@ trait AudioSink {
     fn poll(&mut self) -> Result<bool, OutputError>;
     fn finish(&mut self);
 }
+// Explicit parent shutdown wins over errors observed during the same loop iteration.
+// Check before CancelOnExit runs; otherwise its teardown cancellation would hide real errors.
+fn failure_or_cancelled<S: AudioSink>(
+    stop: &StopToken,
+    output: Option<&S>,
+    segments: u64,
+    error: PlaybackError,
+) -> Result<PlaybackReport, PlaybackError> {
+    if stop.is_cancelled() {
+        Ok(PlaybackReport {
+            output: output.map(AudioSink::summary),
+            segments,
+            reason: EndReason::Cancelled,
+        })
+    } else {
+        Err(error)
+    }
+}
+
 impl AudioSink for ContinuousOutput {
     fn configure(&self, paused: bool, volume: u32) {
         self.configure(paused, volume);
@@ -519,7 +538,11 @@ fn play_loop<S: AudioSink>(
             && !eof
             && !output.as_ref().is_some_and(|o| o.accepted() >= maximum)
         {
-            match rx.try_recv() {
+            let event = rx.try_recv();
+            if stop.is_cancelled() {
+                continue;
+            }
+            match event {
                 Ok(Event::Pcm(pcm)) => {
                     last_pcm_at = Instant::now();
                     if output.is_none() {
@@ -533,7 +556,17 @@ fn play_loop<S: AudioSink>(
                         } else {
                             None
                         };
-                        let sink = create(&pcm, maximum, remaining, local.clone())?;
+                        let sink = match create(&pcm, maximum, remaining, local.clone()) {
+                            Ok(sink) => sink,
+                            Err(error) => {
+                                return failure_or_cancelled(
+                                    &stop,
+                                    output.as_ref(),
+                                    segments,
+                                    error.into(),
+                                );
+                            }
+                        };
                         sink.configure(paused, volume);
                         output = Some(sink);
                         report_at = Instant::now();
@@ -542,22 +575,41 @@ fn play_loop<S: AudioSink>(
                     current = Some(pcm);
                     cursor = 0;
                 }
-                Ok(Event::Failed(error)) => return Err(error),
+                Ok(Event::Failed(error)) => {
+                    return failure_or_cancelled(&stop, output.as_ref(), segments, error);
+                }
                 Ok(Event::End) => {
                     let Some(out) = output.as_mut() else {
-                        return Err(PlaybackError::EarlyEnd);
+                        return failure_or_cancelled(
+                            &stop,
+                            output.as_ref(),
+                            segments,
+                            PlaybackError::EarlyEnd,
+                        );
                     };
                     if info.mode == ProbeMode::Live
                         || maximum.saturating_sub(out.accepted())
                             > u64::from(out.summary().sample_rate) / 10
                     {
-                        return Err(PlaybackError::EarlyEnd);
+                        return failure_or_cancelled(
+                            &stop,
+                            output.as_ref(),
+                            segments,
+                            PlaybackError::EarlyEnd,
+                        );
                     }
                     out.finish();
                     eof = true;
                 }
                 Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Disconnected) => return Err(PlaybackError::Worker),
+                Err(TryRecvError::Disconnected) => {
+                    return failure_or_cancelled(
+                        &stop,
+                        output.as_ref(),
+                        segments,
+                        PlaybackError::Worker,
+                    );
+                }
             }
         }
         if running_worker.is_some()
@@ -566,7 +618,12 @@ fn play_loop<S: AudioSink>(
             && !output.as_ref().is_some_and(|o| o.accepted() >= maximum)
             && last_pcm_at.elapsed() > Duration::from_secs(30)
         {
-            return Err(PlaybackError::SourceStalled);
+            return failure_or_cancelled(
+                &stop,
+                output.as_ref(),
+                segments,
+                PlaybackError::SourceStalled,
+            );
         }
         if let Some(out) = output.as_mut() {
             if let Some(pcm) = current.as_ref() {
@@ -580,7 +637,9 @@ fn play_loop<S: AudioSink>(
                             reason: EndReason::ProgramEnd,
                         });
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        return failure_or_cancelled(&stop, Some(&*out), segments, error.into());
+                    }
                 }
             }
             match out.poll() {
@@ -599,7 +658,9 @@ fn play_loop<S: AudioSink>(
                         reason: EndReason::ProgramEnd,
                     });
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return failure_or_cancelled(&stop, Some(&*out), segments, error.into());
+                }
             }
         }
         if running_worker.is_some() && Instant::now() >= report_at {
@@ -994,6 +1055,171 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert_eq!(result.output.unwrap().frames, 51_200);
     }
+    #[test]
+    fn stop_between_loop_check_and_source_end_returns_cancelled_with_final_counters() {
+        struct EndingSource {
+            inner: Source,
+            dropped: mpsc::Sender<()>,
+        }
+        impl SegmentSource for EndingSource {
+            fn info(&self) -> &StreamInfo {
+                self.inner.info()
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                self.inner.poll_segment()
+            }
+        }
+        impl Drop for EndingSource {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(());
+            }
+        }
+        struct StoppingSink {
+            inner: Sink,
+            stop: StopToken,
+            ended: std::rc::Rc<Receiver<()>>,
+        }
+        impl AudioSink for StoppingSink {
+            fn configure(&self, _: bool, _: u32) {
+                if self.inner.frames > 0 {
+                    // The loop already checked stop. Ensure EOF is queued before it receives.
+                    self.stop.cancel();
+                    self.ended.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+            }
+            fn enqueue(&mut self, p: &DecodedPcm, c: &mut usize) -> Result<bool, OutputError> {
+                self.inner.enqueue(p, c)
+            }
+            fn accepted(&self) -> u64 {
+                self.inner.accepted()
+            }
+            fn summary(&self) -> OutputSummary {
+                self.inner.summary()
+            }
+            fn poll(&mut self) -> Result<bool, OutputError> {
+                self.inner.poll()
+            }
+            fn finish(&mut self) {
+                self.inner.finish();
+            }
+        }
+        let (dropped, ended) = mpsc::channel();
+        let ended = std::rc::Rc::new(ended);
+        let stop = StopToken::default();
+        let cancel = stop.clone();
+        let result = play_loop(
+            Initial::Source(EndingSource {
+                inner: Source {
+                    info: info(3_600_000),
+                    events: VecDeque::from([
+                        event(packet(24_000).repeat(50), false),
+                        Ok(Next::End),
+                    ]),
+                },
+                dropped,
+            }),
+            None,
+            stop,
+            |_| (),
+            |p, n, d, s| {
+                Ok(StoppingSink {
+                    inner: sink(p, n, d, s)?,
+                    stop: cancel.clone(),
+                    ended: ended.clone(),
+                })
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.reason, EndReason::Cancelled);
+        assert_eq!(result.output.unwrap().frames, 51200);
+    }
+
+    #[test]
+    fn running_output_device_failure_drops_output_and_stops_the_source_worker() {
+        struct PendingSource {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+            dropped: mpsc::Sender<()>,
+        }
+        impl SegmentSource for PendingSource {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(10)),
+                })
+            }
+        }
+        impl Drop for PendingSource {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(());
+            }
+        }
+        struct FailedSink {
+            inner: Sink,
+            dropped: mpsc::Sender<()>,
+        }
+        impl Drop for FailedSink {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(());
+            }
+        }
+        impl AudioSink for FailedSink {
+            fn enqueue(
+                &mut self,
+                pcm: &DecodedPcm,
+                cursor: &mut usize,
+            ) -> Result<bool, OutputError> {
+                self.inner.enqueue(pcm, cursor)
+            }
+            fn accepted(&self) -> u64 {
+                self.inner.accepted()
+            }
+            fn summary(&self) -> OutputSummary {
+                self.inner.summary()
+            }
+            fn poll(&mut self) -> Result<bool, OutputError> {
+                Err(OutputError::Device)
+            }
+            fn finish(&mut self) {
+                self.inner.finish();
+            }
+        }
+        let (source_drop, source_dropped) = mpsc::channel();
+        let (sink_drop, sink_dropped) = mpsc::channel();
+        let result = play_loop(
+            Initial::Source(PendingSource {
+                info: info(3_600_000),
+                bytes: Some(packet(24_000).repeat(50)),
+                dropped: source_drop,
+            }),
+            None,
+            StopToken::default(),
+            |_| (),
+            |pcm, maximum, remaining, stop| {
+                Ok(FailedSink {
+                    inner: sink(pcm, maximum, remaining, stop)?,
+                    dropped: sink_drop.clone(),
+                })
+            },
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(PlaybackError::Output(OutputError::Device))
+        ));
+        sink_dropped.recv_timeout(Duration::from_secs(2)).unwrap();
+        source_dropped.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
     #[test]
     fn replacement_device_failure_keeps_old_output_alive_until_explicit_stop() {
         use super::super::seek::{Command, Controller, PlaybackRequest};

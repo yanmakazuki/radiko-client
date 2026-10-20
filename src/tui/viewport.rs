@@ -1,4 +1,5 @@
 //! One-line catalog rows only. Preserve global selection while formatting visible items.
+use crossterm::event::KeyCode;
 use ratatui::widgets::ListState;
 use std::ops::Range;
 
@@ -26,9 +27,51 @@ pub fn visible(state: &mut ListState, count: usize, height: usize) -> Range<usiz
     start..start.saturating_add(height).min(count)
 }
 
+/// Navigation changes selection only; a zero-height view still permits progress.
+pub fn navigate(state: &mut ListState, count: usize, height: usize, key: KeyCode) {
+    if count == 0 {
+        state.select(None);
+        return;
+    }
+    let current = state.selected().unwrap_or_default().min(count - 1);
+    let next = match key {
+        KeyCode::Home => 0,
+        KeyCode::End => count - 1,
+        KeyCode::PageUp => current.saturating_sub(height.max(1)),
+        KeyCode::PageDown => current.saturating_add(height.max(1)).min(count - 1),
+        KeyCode::Up | KeyCode::Char('k') => current.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => current.saturating_add(1).min(count - 1),
+        _ => return,
+    };
+    state.select(Some(next));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pages_clamp_to_bounds_and_follow_resized_height() {
+        let mut state = ListState::default();
+        for (key, height, expected) in [
+            (KeyCode::PageDown, 12, 12),
+            (KeyCode::PageDown, 4, 16),
+            (KeyCode::PageUp, 4, 12),
+            (KeyCode::End, 4, 49999),
+            (KeyCode::PageDown, usize::MAX, 49999),
+            (KeyCode::PageUp, usize::MAX, 0),
+            (KeyCode::PageDown, 0, 1),
+            (KeyCode::Home, 0, 0),
+        ] {
+            navigate(&mut state, 50000, height, key);
+            assert_eq!(state.selected(), Some(expected));
+        }
+        state.select(Some(49999));
+        navigate(&mut state, 3, 1, KeyCode::PageUp);
+        assert_eq!(state.selected(), Some(1));
+        navigate(&mut state, 0, 1, KeyCode::End);
+        assert_eq!(state.selected(), None);
+    }
+
     #[test]
     fn selection_stays_global_across_small_views_resizes_and_shrinking_results() {
         let mut state = ListState::default();

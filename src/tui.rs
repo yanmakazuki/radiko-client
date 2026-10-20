@@ -1,10 +1,12 @@
 //! 検索とライブ／タイムフリー再生のTUI。描画処理は状態を参照するだけで、通信や再生を実行しない。
 mod areas;
+mod failures;
 mod filters;
 mod help;
 mod login;
 mod named;
 mod picker;
+mod scroll;
 mod seek;
 mod viewport;
 use chrono::{DateTime, FixedOffset, Utc};
@@ -48,7 +50,7 @@ use std::{
     },
     time::Duration,
 };
-const USAGE: &str = "tui [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。";
+const USAGE: &str = "tui [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。";
 fn named_receipt(result: &Result<NamedOutcome, radiko_client::app::named::Error>) -> String {
     match result {
         Ok(NamedOutcome::Saved(name)) => format!("「{name}」を保存しました"),
@@ -84,6 +86,10 @@ enum PlaybackAction {
 }
 struct Screen {
     help_open: bool,
+    help_scroll: scroll::Scroll,
+    failures_open: bool,
+    failure_list: ListState,
+    failure_height: usize,
     login: Option<login::Editor>,
     login_requested: Option<Credentials>,
     logout_confirm: bool,
@@ -101,6 +107,9 @@ struct Screen {
     auth_refresh: bool,
     chapter_action: Option<ChapterAction>,
     chapter_list: ListState,
+    chapter_height: usize,
+    chapter_summary_focused: bool,
+    chapter_summary_scroll: scroll::Scroll,
     chapter_notice: String,
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
@@ -108,6 +117,7 @@ struct Screen {
     volume: u32,
     app: AppState,
     list: ListState,
+    list_height: usize,
     input: Option<String>,
     preferences_notice: String,
 }
@@ -239,6 +249,8 @@ impl Screen {
     fn open_chapters(&mut self, target: Program) -> Result<(), &'static str> {
         let id = self.app.chapters.open(target.clone())?;
         self.chapter_list.select(None);
+        self.chapter_summary_focused = false;
+        self.chapter_summary_scroll = scroll::Scroll::default();
         self.chapter_notice.clear();
         self.chapter_action = Some(ChapterAction::Fetch(id, Box::new(target)));
         Ok(())
@@ -246,6 +258,8 @@ impl Screen {
     fn close_chapters(&mut self) {
         self.app.chapters.close();
         self.chapter_list.select(None);
+        self.chapter_summary_focused = false;
+        self.chapter_summary_scroll = scroll::Scroll::default();
         self.chapter_notice.clear();
         self.chapter_action = Some(ChapterAction::Cancel);
     }
@@ -300,6 +314,20 @@ impl Screen {
         if self.help_open {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
                 self.help_open = false;
+            } else {
+                self.help_scroll.key(key.code);
+            }
+            return Ok(false);
+        }
+        if self.failures_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('e' | 'q') => self.failures_open = false,
+                key => viewport::navigate(
+                    &mut self.failure_list,
+                    failures::count(&self.app),
+                    self.failure_height,
+                    key,
+                ),
             }
             return Ok(false);
         }
@@ -389,7 +417,16 @@ impl Screen {
                 KeyCode::Backspace => {
                     input.pop();
                 }
-                KeyCode::Char(c) if !c.is_control() && input.len() + c.len_utf8() <= 1024 => {
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.clear()
+                }
+                KeyCode::Char(c)
+                    if !c.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && input.len() + c.len_utf8() <= 1024 =>
+                {
                     input.push(c)
                 }
                 _ => (),
@@ -422,6 +459,10 @@ impl Screen {
         }
         if self.app.chapters.target.is_some() {
             match key.code {
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.chapter_summary_focused = !self.chapter_summary_focused;
+                    return Ok(false);
+                }
                 KeyCode::Esc => {
                     self.close_chapters();
                     return Ok(false);
@@ -432,21 +473,33 @@ impl Screen {
                     }
                     return Ok(false);
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::Up
+                | KeyCode::Char('k')
+                | KeyCode::PageDown
+                | KeyCode::PageUp
+                | KeyCode::Home
+                | KeyCode::End => {
                     let count = self
                         .app
                         .chapters
                         .candidates
                         .as_ref()
                         .map_or(0, |set| set.chapters.len());
-                    if count > 0 {
-                        let current = self.chapter_list.selected().unwrap_or_default();
-                        let next = if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
-                            (current + 1).min(count - 1)
-                        } else {
-                            current.saturating_sub(1)
-                        };
-                        self.chapter_list.select(Some(next));
+                    if self.chapter_summary_focused {
+                        self.chapter_summary_scroll.key(key.code);
+                    } else {
+                        let previous = self.chapter_list.selected();
+                        viewport::navigate(
+                            &mut self.chapter_list,
+                            count,
+                            self.chapter_height,
+                            key.code,
+                        );
+                        if self.chapter_list.selected() != previous {
+                            self.chapter_summary_scroll = scroll::Scroll::default();
+                        }
                     }
                     return Ok(false);
                 }
@@ -488,7 +541,17 @@ impl Screen {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            KeyCode::Char('?') => self.help_open = true,
+            KeyCode::Char('?') => {
+                self.help_open = true;
+                self.help_scroll = scroll::Scroll::default();
+            }
+            KeyCode::Char('e') => {
+                self.failures_open = true;
+                self.failure_list = ListState::default();
+                if failures::count(&self.app) > 0 {
+                    self.failure_list.select(Some(0));
+                }
+            }
             KeyCode::Char('a') => self.auth_refresh = true,
             KeyCode::Char('O') => self.logout_confirm = true,
             KeyCode::Char('I') => self.login = Some(login::Editor::default()),
@@ -527,19 +590,16 @@ impl Screen {
                 self.toggle_live(service)?
             }
             KeyCode::Char('r') => self.submit(service)?,
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.rows().is_empty() {
-                    self.list.select(Some(
-                        (self.list.selected().unwrap_or_default() + 1).min(self.rows().len() - 1),
-                    ));
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if !self.rows().is_empty() {
-                    self.list.select(Some(
-                        self.list.selected().unwrap_or_default().saturating_sub(1),
-                    ));
-                }
+            KeyCode::Down
+            | KeyCode::Char('j')
+            | KeyCode::Up
+            | KeyCode::Char('k')
+            | KeyCode::PageDown
+            | KeyCode::PageUp
+            | KeyCode::Home
+            | KeyCode::End => {
+                let count = self.rows().len();
+                viewport::navigate(&mut self.list, count, self.list_height, key.code);
             }
             KeyCode::Enter => {
                 if let Some(program) = self.selected() {
@@ -687,12 +747,21 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
     let Some(target) = &state.target else {
         return;
     };
-    let panes = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Min(1),
-        Constraint::Length(3),
-    ])
-    .split(area);
+    let constraints = if screen.chapter_summary_focused {
+        [
+            Constraint::Length(7),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ]
+    } else {
+        [
+            Constraint::Length(7),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ]
+    };
+    let panes = Layout::vertical(constraints).split(area);
+    screen.chapter_height = usize::from(panes[1].height.saturating_sub(2));
     let counts = state
         .candidates
         .as_ref()
@@ -780,18 +849,46 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
         .and_then(|index| state.candidates.as_ref()?.chapters.get(index))
         .map(|chapter| preview(&chapter.summary))
         .unwrap_or_default();
+    let paragraph = Paragraph::new(summary).wrap(Wrap { trim: false });
+    let scroll = &mut screen.chapter_summary_scroll;
+    let lines = paragraph.line_count(panes[2].width.saturating_sub(2));
+    scroll.fit(lines, panes[2].height.saturating_sub(2));
+    let title = if screen.chapter_summary_focused {
+        "要約（先頭1200文字まで）・上下/ページ スクロール・Tab 章一覧"
+    } else {
+        "選択したチャプターの要約（Tabで拡大・スクロール）"
+    };
     frame.render_widget(
-        Paragraph::new(summary).wrap(Wrap { trim: false }).block(
+        paragraph.scroll((scroll.offset, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("選択したチャプターの要約"),
+                .title(title)
+                .border_style(if screen.chapter_summary_focused {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }),
         ),
         panes[2],
     );
 }
 fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
+    if screen.failures_open {
+        failures::draw(
+            frame,
+            &screen.app,
+            &mut screen.failure_list,
+            &mut screen.failure_height,
+        );
+        return;
+    }
     if screen.help_open {
-        help::draw(frame, screen.app.playback.as_ref(), screen.volume);
+        help::draw(
+            frame,
+            screen.app.playback.as_ref(),
+            screen.volume,
+            &mut screen.help_scroll,
+        );
         return;
     }
     let areas = Layout::vertical([
@@ -855,12 +952,9 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     } else {
         let panes = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
             .split(areas[1]);
+        screen.list_height = usize::from(panes[0].height.saturating_sub(2));
         let count = screen.rows().len();
-        let visible = viewport::visible(
-            &mut screen.list,
-            count,
-            usize::from(panes[0].height.saturating_sub(2)),
-        );
+        let visible = viewport::visible(&mut screen.list, count, screen.list_height);
         let mut local_list = ListState::default();
         local_list.select(
             screen
@@ -947,7 +1041,7 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     if let Some(input) = &screen.input {
         frame.render_widget(
             Paragraph::new(format!(
-                "キーワード: {input}\nEnter 検索 / Esc 取消（編集中は取得しません）"
+                "キーワード: {input}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）"
             ))
             .block(Block::default().borders(Borders::ALL).title("条件編集中")),
             areas[2],
@@ -1026,7 +1120,7 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
                 }
             };
             format!(
-                "? 操作一覧 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了"
+                "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了"
             )
         };
         let footer = format!(
@@ -1121,6 +1215,10 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         let mut terminal = ratatui::try_init()?;
         let mut screen = Screen {
             help_open: false,
+            help_scroll: scroll::Scroll::default(),
+            failures_open: false,
+            failure_list: ListState::default(),
+            failure_height: 1,
             login: None,
             login_requested: None,
             logout_confirm: false,
@@ -1138,6 +1236,9 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
             auth_refresh: false,
             chapter_action: None,
             chapter_list: ListState::default(),
+            chapter_height: 1,
+            chapter_summary_focused: false,
+            chapter_summary_scroll: scroll::Scroll::default(),
             chapter_notice: String::new(),
             playback_action: None,
             playback_notice: String::new(),
@@ -1145,6 +1246,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
             volume: 25,
             app: AppState::new(criteria),
             list: ListState::default(),
+            list_height: 1,
             input: None,
             preferences_notice,
         };
@@ -1360,6 +1462,10 @@ mod tests {
         let criteria = crate::programs::criteria(&["TBS".into(), "20261015".into()], now).unwrap();
         Screen {
             help_open: false,
+            help_scroll: scroll::Scroll::default(),
+            failures_open: false,
+            failure_list: ListState::default(),
+            failure_height: 1,
             login: None,
             login_requested: None,
             logout_confirm: false,
@@ -1377,6 +1483,9 @@ mod tests {
             auth_refresh: false,
             chapter_action: None,
             chapter_list: ListState::default(),
+            chapter_height: 1,
+            chapter_summary_focused: false,
+            chapter_summary_scroll: scroll::Scroll::default(),
             chapter_notice: String::new(),
             playback_action: None,
             playback_notice: String::new(),
@@ -1384,6 +1493,7 @@ mod tests {
             volume: 25,
             app: AppState::new(criteria),
             list: ListState::default(),
+            list_height: 1,
             input: None,
             preferences_notice: String::new(),
         }
@@ -2078,6 +2188,175 @@ mod tests {
         assert_eq!(screen.input.as_deref(), Some("a"));
     }
     #[test]
+    fn failure_browser_shows_all_missing_ranges_and_never_dispatches_actions() {
+        let mut screen = screen();
+        let mut search = Service::new(|| -> Result<CatalogClient, _> { panic!("read-only view") });
+        screen.app.status = SearchStatus::Partial;
+        for index in 0..100 {
+            screen
+                .app
+                .schedule_failures
+                .push(radiko_client::catalog::Failure {
+                    target: format!("MISSING_{index:03}"),
+                    day: Some(radiko_client::radiko::catalog::parse_day("20261015").unwrap()),
+                    error: radiko_client::radiko::catalog::CatalogError::Http(404),
+                });
+        }
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+            .unwrap();
+        for key in [
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::Char('r'),
+            KeyCode::Char('I'),
+            KeyCode::Char('s'),
+        ] {
+            assert!(
+                !screen
+                    .key(KeyEvent::new(key, KeyModifiers::NONE), &mut search)
+                    .unwrap()
+            );
+        }
+        terminal
+            .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("MISSING_099"));
+        assert!(text.contains("2026-10-15"));
+        assert!(text.replace(' ', "").contains("局・日失敗100"));
+        assert_eq!(screen.failure_list.selected(), Some(99));
+        assert!(screen.playback_action.is_none());
+        assert!(screen.chapter_action.is_none());
+        assert!(screen.login.is_none());
+        screen
+            .app
+            .invalid_schedules
+            .push(radiko_client::app::InvalidSchedule {
+                station_id: "BAD_SLOT_STATION".into(),
+                day: radiko_client::radiko::catalog::parse_day("20261015").unwrap(),
+                count: 2,
+            });
+        screen.app.invalid_count = 2;
+        screen
+            .key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &mut search)
+            .unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("BAD_SLOT_STATION"));
+        assert!(text.replace(' ', "").contains("2件（正常な枠は表示）"));
+        // A new acquisition clears failures; an open browser must not retain the old range.
+        screen.app.commit().unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+            .unwrap();
+        assert_eq!(screen.failure_list.selected(), None);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!text.contains("MISSING_"));
+        assert!(text.replace(' ', "").contains("取得中"));
+        screen
+            .app
+            .schedule_failures
+            .push(radiko_client::catalog::Failure {
+                target: "NEW_FAILURE".into(),
+                day: None,
+                error: radiko_client::radiko::catalog::CatalogError::Network,
+            });
+        terminal
+            .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+            .unwrap();
+        assert_eq!(screen.failure_list.selected(), Some(0));
+
+        assert!(
+            !screen
+                .key(
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    &mut search
+                )
+                .unwrap()
+        );
+        assert!(!screen.failures_open);
+    }
+
+    #[test]
+    fn catalog_page_keys_only_change_selection_and_use_the_rendered_height() {
+        let mut screen = screen();
+        let mut search =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("navigation must not fetch") });
+        let template = radiko_client::radiko::catalog::parse_programs(
+            include_bytes!("../tests/fixtures/schedule.xml"),
+            "TBS",
+            radiko_client::radiko::catalog::parse_day("20261015").unwrap(),
+        )
+        .unwrap()
+        .programs
+        .remove(0);
+        screen.app.programs = vec![template; 100];
+        screen.app.visible = (0..100).collect();
+        screen.list.select(Some(0));
+        for height in [30, 40] {
+            let mut terminal = Terminal::new(TestBackend::new(140, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+                .unwrap();
+            let page = screen.list_height;
+            let before = screen.list.selected().unwrap();
+            screen
+                .key(
+                    KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                    &mut search,
+                )
+                .unwrap();
+            assert_eq!(screen.list.selected(), Some(before + page));
+        }
+        for (key, expected) in [(KeyCode::End, 99), (KeyCode::Home, 0)] {
+            screen
+                .key(KeyEvent::new(key, KeyModifiers::NONE), &mut search)
+                .unwrap();
+            assert_eq!(screen.list.selected(), Some(expected));
+        }
+        screen.live_mode = true;
+        screen.live_rows = vec![2, 7];
+        screen
+            .key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &mut search)
+            .unwrap();
+        assert_eq!(screen.list.selected(), Some(1));
+        assert!(screen.playback_action.is_none());
+        assert!(screen.chapter_action.is_none());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(runtime.block_on(search.poll()).is_empty());
+    }
+
+    #[test]
     fn large_catalog_keeps_global_selection_visible_at_the_end_and_after_moving_up() {
         let mut screen = screen();
         let mut search =
@@ -2419,7 +2698,13 @@ mod tests {
                 }),
             });
         screen.chapter_list.select(Some(0));
-        for code in [KeyCode::Char('j'), KeyCode::Enter] {
+        for code in [
+            KeyCode::End,
+            KeyCode::Home,
+            KeyCode::PageDown,
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+        ] {
             screen
                 .key(KeyEvent::new(code, KeyModifiers::NONE), &mut search)
                 .unwrap();
@@ -2450,6 +2735,55 @@ mod tests {
         ] {
             assert!(text.contains(word), "{word}");
         }
+
+        screen.app.chapters.candidates.as_mut().unwrap().chapters[1].summary =
+            format!("{}SUMMARY_END", "説明 ".repeat(200));
+        screen
+            .key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut search)
+            .unwrap();
+        let mut small = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        small
+            .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+            .unwrap();
+        assert!(screen.chapter_summary_focused);
+        assert!(screen.chapter_summary_scroll.maximum > 0);
+        screen
+            .key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &mut search)
+            .unwrap();
+        small
+            .draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))
+            .unwrap();
+        let text: String = small
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("SUMMARY_END"));
+        assert_eq!(screen.chapter_list.selected(), Some(1));
+        assert!(screen.playback_action.is_none());
+        screen
+            .key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut search)
+            .unwrap();
+        assert_eq!(screen.chapter_list.selected(), Some(1));
+        screen
+            .key(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                &mut search,
+            )
+            .unwrap();
+        screen
+            .key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut search)
+            .unwrap();
+        assert_eq!(screen.chapter_list.selected(), Some(0));
+        assert_eq!(screen.chapter_summary_scroll.offset, 0);
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
         screen
             .key(
                 KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
@@ -2492,7 +2826,24 @@ mod tests {
         for (state, label) in [
             (ChapterStatus::Loading, "取得中"),
             (ChapterStatus::Unavailable, "未提供"),
-            (ChapterStatus::Unresolved, "対応付け未確認"),
+            (
+                ChapterStatus::Unresolved(
+                    radiko_client::radiko::stream::chapters::BindingIssue::EventMetadataMissing,
+                ),
+                "イベント情報を確認できません",
+            ),
+            (
+                ChapterStatus::Unresolved(
+                    radiko_client::radiko::stream::chapters::BindingIssue::OriginMismatch,
+                ),
+                "補正未対応",
+            ),
+            (
+                ChapterStatus::Unresolved(
+                    radiko_client::radiko::stream::chapters::BindingIssue::SlotMismatch,
+                ),
+                "放送枠が一致しません",
+            ),
             (ChapterStatus::Failed("合成エラー".into()), "取得失敗"),
         ] {
             screen.app.chapters.status = state;
@@ -2669,6 +3020,48 @@ mod tests {
         assert_eq!(preview("2 < 3 &lt; 4 &amp;lt;"), "2 < 3 < 4 &lt;");
         assert_eq!(preview(&"あ".repeat(20_000)).chars().count(), 1200);
     }
+    #[test]
+    fn keyword_clear_and_modified_keys_do_not_fetch_or_dispatch_global_commands() {
+        let mut screen = screen();
+        let mut service =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("editing must not fetch") });
+        for key in [
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('あ'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+        ] {
+            screen.key(key, &mut service).unwrap();
+        }
+        assert_eq!(screen.input.as_deref(), Some("あ"));
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(screen.input.as_deref(), Some(""));
+        for c in ['?', 'e'] {
+            screen
+                .key(
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                    &mut service,
+                )
+                .unwrap();
+        }
+        assert_eq!(screen.input.as_deref(), Some("?e"));
+        assert!(!screen.help_open && !screen.failures_open);
+        assert!(screen.playback_action.is_none());
+        assert_eq!(screen.app.status, SearchStatus::Idle);
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(screen.app.committed.filter().keyword(), None);
+    }
+
     #[test]
     fn unicode_editing_and_cancel_do_not_start_a_search() {
         let mut screen = screen();

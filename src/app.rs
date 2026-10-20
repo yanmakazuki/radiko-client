@@ -19,6 +19,12 @@ pub enum SearchStatus {
     Partial,
     Failed,
 }
+/// Provenance for excluded malformed slots in the current completed acquisition.
+pub struct InvalidSchedule {
+    pub station_id: String,
+    pub day: chrono::NaiveDate,
+    pub count: usize,
+}
 pub struct AppState {
     /// 検索に適用済みの条件。編集中の値とは独立して保持する。
     pub committed: SearchCriteria,
@@ -31,6 +37,7 @@ pub struct AppState {
     pub area_failures: Vec<catalog::Failure>,
     pub schedule_failures: Vec<catalog::Failure>,
     pub invalid_count: usize,
+    pub invalid_schedules: Vec<InvalidSchedule>,
     pub notification: String,
     pub playback: Option<PlaybackSnapshot>,
     pub chapters: chapters::State,
@@ -49,6 +56,7 @@ impl AppState {
             area_failures: vec![],
             schedule_failures: vec![],
             invalid_count: 0,
+            invalid_schedules: vec![],
             notification: String::new(),
             playback: None,
             chapters: chapters::State::default(),
@@ -95,6 +103,7 @@ impl AppState {
         self.area_failures.clear();
         self.schedule_failures.clear();
         self.invalid_count = 0;
+        self.invalid_schedules.clear();
         self.progress = None;
         self.notification.clear();
         Ok(self.id)
@@ -122,6 +131,18 @@ impl AppState {
                         SearchStatus::Partial
                     };
                     self.invalid_count = report.lists.iter().map(|list| list.invalid_count).sum();
+                    self.invalid_schedules = report
+                        .lists
+                        .iter()
+                        .filter(|list| list.invalid_count > 0)
+                        .map(|list| InvalidSchedule {
+                            station_id: list.station_id.clone(),
+                            day: list.broadcast_day,
+                            count: list.invalid_count,
+                        })
+                        .collect();
+                    self.invalid_schedules
+                        .sort_by(|a, b| (&a.station_id, a.day).cmp(&(&b.station_id, b.day)));
                     self.area_failures = report.area_failures;
                     self.schedule_failures = report.schedule_failures;
                     self.programs = report

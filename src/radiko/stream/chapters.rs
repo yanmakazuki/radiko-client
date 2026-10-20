@@ -35,13 +35,29 @@ impl From<ProbeError> for Error {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingIssue {
+    EventMetadataMissing,
+    OriginMismatch,
+    SlotMismatch,
+}
+impl BindingIssue {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EventMetadataMissing => "番組との対応付け未確認（イベント情報を確認できません）",
+            Self::OriginMismatch => "番組との対応付け未確認（開始位置のずれは補正未対応）",
+            Self::SlotMismatch => "番組との対応付け未確認（放送枠が一致しません）",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     /// Metadata agrees, but audio synchronization remains unverified. Not a seek target.
     Candidates(ChapterSet),
     Aligned(ChapterSet, EventBinding),
     Unavailable,
-    Unresolved,
+    Unresolved(BindingIssue),
 }
 #[derive(Debug)]
 pub struct Report {
@@ -139,13 +155,14 @@ fn inspect_with_cancel(
         title: selected.title,
         starts_at: selected.start,
         ends_at: selected.end,
-        outcome: Outcome::Unresolved,
+        outcome: Outcome::Unresolved(BindingIssue::EventMetadataMissing),
     };
     let Some(event) = selected.chapter_event else {
         return Ok(report);
     };
     // The meaning of a different episode origin is not yet established. Never guess a correction.
     if event.origin != selected.start {
+        report.outcome = Outcome::Unresolved(BindingIssue::OriginMismatch);
         return Ok(report);
     }
     let endpoint = url(&format!(
@@ -183,7 +200,7 @@ fn inspect_with_cancel(
             event.origin,
         ) {
             Some(binding) => Outcome::Aligned(chapters, binding),
-            None => Outcome::Unresolved,
+            None => Outcome::Unresolved(BindingIssue::SlotMismatch),
         }
     };
     Ok(report)
@@ -329,13 +346,18 @@ mod tests {
                 Value::String("2026-10-15T02:00:00Z".into()),
             ),
         ] {
+            let expected = if key == "episodeIntroductionStartAt" && value.is_string() {
+                BindingIssue::OriginMismatch
+            } else {
+                BindingIssue::EventMetadataMissing
+            };
             let mut meta = metadata();
             meta["programs"][0][key] = value;
             let mock = mock(vec![Ok(meta)]);
-            assert!(matches!(
-                inspect_mock(&mock).unwrap().outcome,
-                Outcome::Unresolved
-            ));
+            let Outcome::Unresolved(issue) = inspect_mock(&mock).unwrap().outcome else {
+                panic!("unresolved metadata")
+            };
+            assert_eq!(issue, expected);
             assert_eq!(mock.paths.borrow().len(), 1);
         }
     }

@@ -285,3 +285,31 @@ fn cancellable_factory_receives_the_search_generation_and_releases_the_next_requ
         assert!(second.load(Ordering::Acquire));
     });
 }
+
+#[test]
+fn malformed_slot_provenance_keeps_valid_slots_and_clears_on_new_search() {
+    let mut app = AppState::new(criteria("TBS"));
+    let id = app.commit().unwrap();
+    let day = parse_day("20261015").unwrap();
+    let mut slots = list("TBS", day);
+    slots.invalid_count = 2;
+    app.apply(Event::Finished {
+        id,
+        result: Ok(report(slots)),
+    });
+    assert_eq!(app.status, SearchStatus::Partial);
+    assert_eq!(app.programs.len(), 1);
+    assert_eq!(app.invalid_count, 2);
+    assert_eq!(app.invalid_schedules.len(), 1);
+    assert_eq!(app.invalid_schedules[0].station_id, "TBS");
+    assert_eq!(app.invalid_schedules[0].day, day);
+    assert_eq!(app.invalid_schedules[0].count, 2);
+    app.commit().unwrap();
+    assert!(app.invalid_schedules.is_empty());
+    app.apply(Event::Finished {
+        id,
+        result: Ok(report(list("OBS", day))),
+    });
+    assert!(app.invalid_schedules.is_empty());
+    assert_eq!(app.status, SearchStatus::Loading);
+}

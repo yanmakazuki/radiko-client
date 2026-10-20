@@ -4,7 +4,7 @@ use radiko_client::{
     radiko::{
         ChapterError,
         catalog::{parse_day, parse_programs},
-        stream::chapters::{self, Outcome, Report},
+        stream::chapters::{self, BindingIssue, Outcome, Report},
     },
 };
 use std::{
@@ -96,7 +96,7 @@ fn selected_key_and_response_start_end_are_checked_without_using_title_or_progra
             key: split.key.clone(),
             result: Ok(wrong),
         });
-        assert_eq!(state.status, Status::Unresolved);
+        assert_eq!(state.status, Status::Unresolved(BindingIssue::SlotMismatch));
         assert!(state.candidates.is_none());
     }
 }
@@ -107,7 +107,18 @@ fn empty_success_unresolved_parse_failure_and_network_failure_remain_distinct() 
     let id = state.open(target.clone()).unwrap();
     for (outcome, expected) in [
         (Outcome::Unavailable, Status::Unavailable),
-        (Outcome::Unresolved, Status::Unresolved),
+        (
+            Outcome::Unresolved(BindingIssue::EventMetadataMissing),
+            Status::Unresolved(BindingIssue::EventMetadataMissing),
+        ),
+        (
+            Outcome::Unresolved(BindingIssue::OriginMismatch),
+            Status::Unresolved(BindingIssue::OriginMismatch),
+        ),
+        (
+            Outcome::Unresolved(BindingIssue::SlotMismatch),
+            Status::Unresolved(BindingIssue::SlotMismatch),
+        ),
     ] {
         state.apply(Event {
             id,
@@ -411,6 +422,6 @@ fn aligned_binding_allows_only_the_same_slot_and_is_cleared_on_refresh() {
         key: target.key.clone(),
         result: Ok(report(&target, Outcome::Aligned(set(), wrong))),
     });
-    assert_eq!(state.status, Status::Unresolved);
+    assert_eq!(state.status, Status::Unresolved(BindingIssue::SlotMismatch));
     assert!(state.jump(0).is_err());
 }

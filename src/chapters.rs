@@ -29,7 +29,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     let aligned = matches!(&report.outcome, Outcome::Aligned(_, _));
     match report.outcome {
-        Outcome::Unresolved => println!("番組との対応付け未確認（取得・位置補正を省略）"),
+        Outcome::Unresolved(issue) => println!("{}（取得・位置補正を省略）", issue.label()),
         Outcome::Unavailable => println!("チャプター未提供（生成待ちの場合があります）"),
         Outcome::Candidates(set) | Outcome::Aligned(set, _) => {
             if aligned {
