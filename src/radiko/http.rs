@@ -1,6 +1,10 @@
 //! サイズ・時間・再試行回数を制限するHTTP処理。生のエラー・URL・本文を外部へ返さない。
 use super::stream::ProbeError;
+mod diagnostics;
 mod executor;
+pub use diagnostics::{
+    Measurements as RequestMeasurements, Snapshot as RequestSnapshot, Stage as RequestStage,
+};
 use reqwest::{
     Client, Url,
     header::{HeaderMap, LOCATION, RANGE},
@@ -15,6 +19,7 @@ use std::{
 
 pub(crate) struct Http {
     client: Client,
+    diagnostics: Option<Arc<RequestMeasurements>>,
     cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 pub(crate) trait Fetch {
@@ -65,8 +70,19 @@ impl Http {
             .map_err(|_| ProbeError::Network)?;
         Ok(Self {
             client,
+            diagnostics: None,
             cancelled: None,
         })
+    }
+    pub(crate) fn enable_diagnostics(&mut self) -> Arc<RequestMeasurements> {
+        self.diagnostics
+            .get_or_insert_with(|| Arc::new(RequestMeasurements::new()))
+            .clone()
+    }
+    fn observe(&self, stage: RequestStage) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.enter(stage);
+        }
     }
     pub(crate) fn set_cancellation(&mut self, cancelled: Arc<dyn Fn() -> bool + Send + Sync>) {
         self.cancelled = Some(cancelled);
@@ -177,101 +193,150 @@ impl Http {
         }
     }
 }
+enum GetStep {
+    Reply(Reply),
+    Redirect(Url),
+}
+
+// Only complete read-only GET attempts use this budget, including body reception.
+fn retry_get<T>(
+    mut attempt: impl FnMut() -> Result<T, ProbeError>,
+    mut backoff: impl FnMut(u32) -> Result<(), ProbeError>,
+) -> Result<T, ProbeError> {
+    let mut retries = 0;
+    loop {
+        match attempt() {
+            Err(error)
+                if retries < 3
+                    && matches!(
+                        error,
+                        ProbeError::Network | ProbeError::Http(408) | ProbeError::Http(500..=599)
+                    ) =>
+            {
+                backoff(retries)?;
+                retries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+impl Http {
+    fn get_once(
+        &self,
+        url: &Url,
+        headers: &HeaderMap,
+        limit: usize,
+        range: Option<(u64, u64)>,
+        redirects: bool,
+    ) -> Result<GetStep, ProbeError> {
+        self.check_cancelled()?;
+        let mut request = self.client.get(url.clone()).headers(headers.clone());
+        if let Some((offset, length)) = range {
+            let end = offset
+                .checked_add(length)
+                .and_then(|n| n.checked_sub(1))
+                .ok_or(ProbeError::InvalidPlaylist)?;
+            if length == 0 || length > limit as u64 {
+                return Err(ProbeError::TooLarge);
+            }
+            request = request.header(RANGE, format!("bytes={offset}-{end}"));
+        }
+        self.observe(RequestStage::Headers);
+        let mut response = self
+            .run(|| request.send())?
+            .map_err(|_| ProbeError::Network)?;
+        self.check_cancelled()?;
+        let status = response.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) && redirects {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .ok_or(ProbeError::UnsafeUrl)?;
+            return Ok(GetStep::Redirect(
+                url.join(location).map_err(|_| ProbeError::UnsafeUrl)?,
+            ));
+        }
+        match status {
+            200 if range.is_none() => (),
+            206 if range.is_some() => (),
+            401 => return Err(ProbeError::Authentication),
+            403 => return Err(ProbeError::Denied),
+            404 => return Err(ProbeError::NotFound),
+            429 => return Err(ProbeError::RateLimited),
+            other => return Err(ProbeError::Http(other)),
+        }
+        if response.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(ProbeError::TooLarge);
+        }
+        if let Some((offset, length)) = range {
+            let end = offset
+                .checked_add(length)
+                .and_then(|n| n.checked_sub(1))
+                .ok_or(ProbeError::InvalidPlaylist)?;
+            let prefix = format!("bytes {offset}-{end}/");
+            if !response
+                .headers()
+                .get("content-range")
+                .and_then(|h| h.to_str().ok())
+                .is_some_and(|h| h.starts_with(&prefix))
+            {
+                return Err(ProbeError::InvalidPlaylist);
+            }
+        }
+        let headers = response.headers().clone();
+        self.observe(RequestStage::Body);
+        let bytes = self.response_bytes(&mut response, limit)?;
+        if range.is_some_and(|(_, length)| bytes.len() as u64 != length) {
+            return Err(ProbeError::InvalidPlaylist);
+        }
+        Ok(GetStep::Reply(Reply {
+            headers,
+            bytes,
+            url: url.clone(),
+        }))
+    }
+}
+struct FinishRequest<'a>(Option<&'a RequestMeasurements>);
+impl Drop for FinishRequest<'_> {
+    fn drop(&mut self) {
+        if let Some(measurements) = self.0 {
+            measurements.enter(RequestStage::Idle);
+        }
+    }
+}
 impl Fetch for Http {
     fn get(
         &self,
-        url: Url,
+        mut url: Url,
         headers: HeaderMap,
         limit: usize,
         range: Option<(u64, u64)>,
         redirects: bool,
     ) -> Result<Reply, ProbeError> {
-        let mut url = url;
+        let _finish = FinishRequest(self.diagnostics.as_deref());
         for _ in 0..=5 {
             self.check_cancelled()?;
             if !trusted(&url) {
                 return Err(ProbeError::UnsafeUrl);
             }
-            let mut retries = 0;
-            let mut response = loop {
-                self.check_cancelled()?;
-                let mut request = self.client.get(url.clone()).headers(headers.clone());
-                if let Some((offset, length)) = range {
-                    let end = offset
-                        .checked_add(length)
-                        .and_then(|n| n.checked_sub(1))
-                        .ok_or(ProbeError::InvalidPlaylist)?;
-                    if length == 0 || length > limit as u64 {
-                        return Err(ProbeError::TooLarge);
-                    }
-                    request = request.header(RANGE, format!("bytes={offset}-{end}"));
-                }
-                let response = self.run(|| request.send())?;
-                self.check_cancelled()?;
-                let transient = match &response {
-                    Err(_) => true,
-                    Ok(r) => r.status().is_server_error() || r.status().as_u16() == 408,
-                };
-                if transient && retries < 3 {
+            let step = retry_get(
+                || self.get_once(&url, &headers, limit, range, redirects),
+                |retries| {
+                    self.observe(RequestStage::RetryWait);
                     let jitter = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|n| n.subsec_millis() % 50)
                         .unwrap_or(0);
                     self.retry_wait(Duration::from_millis(
                         100 * (1 << retries) + u64::from(jitter),
-                    ))?;
-                    retries += 1;
-                    continue;
-                }
-                break response.map_err(|_| ProbeError::Network)?;
-            };
-            let status = response.status().as_u16();
-            if matches!(status, 301 | 302 | 303 | 307 | 308) && redirects {
-                let location = response
-                    .headers()
-                    .get(LOCATION)
-                    .and_then(|h| h.to_str().ok())
-                    .ok_or(ProbeError::UnsafeUrl)?;
-                url = url.join(location).map_err(|_| ProbeError::UnsafeUrl)?;
-                continue;
+                    ))
+                },
+            )?;
+            match step {
+                GetStep::Reply(reply) => return Ok(reply),
+                GetStep::Redirect(next) => url = next,
             }
-            match status {
-                200 if range.is_none() => (),
-                206 if range.is_some() => (),
-                401 => return Err(ProbeError::Authentication),
-                403 => return Err(ProbeError::Denied),
-                404 => return Err(ProbeError::NotFound),
-                429 => return Err(ProbeError::RateLimited),
-                other => return Err(ProbeError::Http(other)),
-            }
-            if response.content_length().is_some_and(|n| n > limit as u64) {
-                return Err(ProbeError::TooLarge);
-            }
-            if let Some((offset, length)) = range {
-                let end = offset
-                    .checked_add(length)
-                    .and_then(|n| n.checked_sub(1))
-                    .ok_or(ProbeError::InvalidPlaylist)?;
-                let prefix = format!("bytes {offset}-{end}/");
-                if !response
-                    .headers()
-                    .get("content-range")
-                    .and_then(|h| h.to_str().ok())
-                    .is_some_and(|h| h.starts_with(&prefix))
-                {
-                    return Err(ProbeError::InvalidPlaylist);
-                }
-            }
-            let headers = response.headers().clone();
-            let bytes = self.response_bytes(&mut response, limit)?;
-            if range.is_some_and(|(_, length)| bytes.len() as u64 != length) {
-                return Err(ProbeError::InvalidPlaylist);
-            }
-            return Ok(Reply {
-                headers,
-                bytes,
-                url,
-            });
         }
         Err(ProbeError::UnsafeUrl)
     }
@@ -280,6 +345,125 @@ impl Fetch for Http {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn request_measurement_is_opt_in_and_invalid_or_cancelled_gets_never_start_attempts() {
+        let mut http = Http::new().unwrap();
+        assert!(http.diagnostics.is_none());
+        let measurements = http.enable_diagnostics();
+        assert!(Arc::ptr_eq(&measurements, &http.enable_diagnostics()));
+        assert!(matches!(
+            http.get(
+                Url::parse("https://untrusted.example/secret").unwrap(),
+                HeaderMap::new(),
+                1024,
+                None,
+                true
+            ),
+            Err(ProbeError::UnsafeUrl)
+        ));
+        http.set_cancellation(Arc::new(|| true));
+        assert!(matches!(
+            http.get(
+                Url::parse("https://radiko.jp/secret").unwrap(),
+                HeaderMap::new(),
+                1024,
+                None,
+                true
+            ),
+            Err(ProbeError::Cancelled)
+        ));
+        let snapshot = measurements.snapshot().unwrap();
+        assert_eq!(snapshot.stage, RequestStage::Idle);
+        assert_eq!((snapshot.attempts, snapshot.retry_waits), (0, 0));
+        assert!(!format!("{snapshot:?}").contains("secret"));
+    }
+    #[test]
+    fn readonly_get_discards_interrupted_body_and_restarts_with_a_shared_retry_budget() {
+        let http = Http::new().unwrap();
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let bytes = retry_get(
+            || {
+                attempts += 1;
+                match attempts {
+                    1 => Err(ProbeError::Http(503)),
+                    2 => {
+                        let mut chunks =
+                            [Ok(Some(b"discard".as_slice())), Err(ProbeError::Network)].into_iter();
+                        http.read_chunks(|| chunks.next().unwrap(), 32)
+                    }
+                    3 => {
+                        let mut chunks = [b"fresh".as_slice(), b"-body".as_slice()].into_iter();
+                        http.read_chunks(|| Ok(chunks.next()), 32)
+                    }
+                    _ => panic!("unexpected retry"),
+                }
+            },
+            |delay| {
+                delays.push(delay);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"fresh-body");
+        assert_eq!(attempts, 3);
+        assert_eq!(delays, [0, 1]);
+    }
+    #[test]
+    fn readonly_get_bounds_mixed_failures_and_cancels_before_another_attempt() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let result: Result<(), _> = retry_get(
+            || {
+                attempts += 1;
+                Err(match attempts {
+                    1 => ProbeError::Http(503),
+                    2 => ProbeError::Http(408),
+                    _ => ProbeError::Network,
+                })
+            },
+            |delay| {
+                delays.push(delay);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(ProbeError::Network));
+        assert_eq!(attempts, 4);
+        assert_eq!(delays, [0, 1, 2]);
+        let mut attempts = 0;
+        let cancelled: Result<(), _> = retry_get(
+            || {
+                attempts += 1;
+                Err(ProbeError::Network)
+            },
+            |_| Err(ProbeError::Cancelled),
+        );
+        assert_eq!(cancelled, Err(ProbeError::Cancelled));
+        assert_eq!(attempts, 1);
+    }
+    #[test]
+    fn readonly_get_never_retries_cancellation_denials_limits_or_malformed_ranges() {
+        for error in [
+            ProbeError::Cancelled,
+            ProbeError::Authentication,
+            ProbeError::Denied,
+            ProbeError::NotFound,
+            ProbeError::RateLimited,
+            ProbeError::TooLarge,
+            ProbeError::InvalidPlaylist,
+            ProbeError::UnsafeUrl,
+            ProbeError::Http(400),
+            ProbeError::Http(302),
+        ] {
+            let mut error = Some(error);
+            let result: Result<(), _> = retry_get(
+                || Err(error.take().expect("permanent failure must not retry")),
+                |_| panic!("permanent failure must not wait"),
+            );
+            assert!(result.is_err());
+            assert!(error.is_none());
+        }
+    }
     #[test]
     fn cancelled_auth_requests_never_start_get_or_post_and_unsafe_targets_are_rejected() {
         let mut http = Http::new().unwrap();

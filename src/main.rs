@@ -28,7 +28,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, data_dir) = arguments(std::env::args().skip(1).collect())?;
     if args.is_empty() || args == ["--help"] {
         println!(
-            "radiko-client: 検証用CLI・検索／ライブ・タイムフリー再生TUI\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client [--data-dir DIR] play-live STATION [--interactive] [--seconds N]\n  radiko-client [--data-dir DIR] play-timefree STATION YYYYMMDDHHmmss [--offset SECONDS] [--interactive] [--seconds N]\n  radiko-client probe-output [SECONDS]\n  radiko-client [--data-dir DIR] play-sample STATION [YYYYMMDDHHmmss]\n  radiko-client programs STATION [START [END]] [--json]\n  radiko-client programs (--areas JP13,JP14 | --all) [START [END]] [--json]\n  radiko-client programs --help（絞り込みオプション）\n  radiko-client tui [programsと同じ検索条件]\n  radiko-client searches --help（条件の保存・一覧・削除）\n  radiko-client programs --saved NAME / --restore\n  radiko-client chapters STATION YYYYMMDDHHmmss\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
+            "radiko-client: 検証用CLI・検索／ライブ・タイムフリー再生TUI\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client [--data-dir DIR] play-live STATION [--interactive] [--seconds N]\n  radiko-client [--data-dir DIR] play-timefree STATION YYYYMMDDHHmmss [--offset SECONDS] [--interactive] [--seconds N]\n  radiko-client probe-output [--mute] [SECONDS]\n  radiko-client [--data-dir DIR] play-sample STATION [YYYYMMDDHHmmss]\n  radiko-client programs STATION [START [END]] [--json]\n  radiko-client programs (--areas JP13,JP14 | --all) [START [END]] [--json]\n  radiko-client programs --help（絞り込みオプション）\n  radiko-client tui [programsと同じ検索条件]\n  radiko-client searches --help（条件の保存・一覧・削除）\n  radiko-client programs --saved NAME / --restore\n  radiko-client chapters STATION YYYYMMDDHHmmss\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
         );
         return Ok(());
     }
@@ -48,14 +48,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return play::run(&args, data_dir);
     }
     if args.first().is_some_and(|arg| arg == "probe-output") {
-        if args.len() > 2 {
-            return Err("probe-output [SECONDS]（1〜10秒）".into());
+        if args.get(1).is_some_and(|arg| arg == "--help") && args.len() == 2 {
+            println!(
+                "probe-output [SECONDS]（生成音・1〜10秒・既定2秒）\nprobe-output --mute [SECONDS]（無音・1〜1800秒・既定30秒、Ctrl+Cで中断）"
+            );
+            return Ok(());
         }
-        let seconds = args
-            .get(1)
+        let muted = args.get(1).is_some_and(|arg| arg == "--mute");
+        let values = &args[if muted { 2 } else { 1 }..];
+        if values.len() > 1 {
+            return Err("probe-output [--mute] [SECONDS]（--helpで範囲を確認）".into());
+        }
+        let seconds = values
+            .first()
             .map(|s| s.parse::<u32>())
             .transpose()?
-            .unwrap_or(2);
+            .unwrap_or(if muted { 30 } else { 2 });
+        if muted {
+            if !(1..=1800).contains(&seconds) {
+                return Err("無音の出力診断は1〜1800秒で指定してください".into());
+            }
+            let stop = output::StopToken::default();
+            let cancelled = stop.clone();
+            ctrlc::set_handler(move || cancelled.cancel())?;
+            let summary = output::probe_silent(seconds, stop.clone(), |summary| {
+                eprintln!(
+                    "無音出力中: {}フレーム / {}Hz / 不足{}フレーム",
+                    summary.frames, summary.sample_rate, summary.underrun_frames
+                );
+            })?;
+            println!(
+                "無音出力{}: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
+                if stop.is_cancelled() {
+                    "中断"
+                } else {
+                    "完了"
+                },
+                summary.frames,
+                summary.sample_rate,
+                summary.channels,
+                summary.underrun_frames
+            );
+            return Ok(());
+        }
         let summary = output::probe_tone(seconds)?;
         println!(
             "生成音の出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",

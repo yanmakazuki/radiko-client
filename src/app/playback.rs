@@ -62,6 +62,8 @@ pub fn availability(
 }
 #[derive(Default)]
 pub struct Update {
+    /// A previous control session has finished; reset its visible state before this update.
+    pub new_session: bool,
     pub snapshot: Option<PlaybackSnapshot>,
     pub notice: Option<String>,
     pub ended: bool,
@@ -245,7 +247,10 @@ impl Service {
                 position: Duration::ZERO,
             };
             if let Ok(mut update) = self.mailbox.lock() {
-                *update = Update::default();
+                *update = Update {
+                    new_session: true,
+                    ..Update::default()
+                };
             }
             let handle = thread::spawn(move || {
                 let mut controls = Controller::with_cancellable_reporter(
@@ -294,10 +299,16 @@ impl Service {
         self.command(Command::Volume(self.volume))?;
         self.command(Command::Select(target))
     }
-    pub fn command(&mut self, command: Command) -> Result<(), &'static str> {
-        if let Command::Volume(volume) = command {
-            self.volume = volume.min(100);
-            if self.running.is_none() {
+    pub fn command(&mut self, mut command: Command) -> Result<(), &'static str> {
+        let volume = if let Command::Volume(value) = &mut command {
+            *value = (*value).min(100);
+            Some(*value)
+        } else {
+            None
+        };
+        if self.running.is_none() {
+            if let Some(volume) = volume {
+                self.volume = volume;
                 return Ok(());
             }
         }
@@ -308,7 +319,11 @@ impl Service {
         running
             .commands
             .try_send(command)
-            .map_err(|_| "再生操作の処理待ちです。少し待って再度操作してください")
+            .map_err(|_| "再生操作の処理待ちです。少し待って再度操作してください")?;
+        if let Some(volume) = volume {
+            self.volume = volume;
+        }
+        Ok(())
     }
     pub fn stop(&self) {
         if let Some(running) = &self.running {
@@ -364,10 +379,69 @@ mod tests {
         }
     }
     #[test]
+    fn rejected_volume_commands_never_change_the_value_used_by_the_next_session() {
+        let mut service = Service::with_factory(|_| Err(playback::PlaybackError::LoginRequired));
+        service.command(Command::Volume(35)).unwrap();
+        let (commands, queued) = mpsc::sync_channel(1);
+        commands.try_send(Command::Status).unwrap();
+        let (release, waiting) = mpsc::channel();
+        service.running = Some(Running {
+            stop: StopToken::default(),
+            commands,
+            handle: thread::spawn(move || {
+                let _ = waiting.recv();
+            }),
+        });
+        assert!(service.command(Command::Volume(0)).is_err());
+        assert_eq!(service.volume, 35);
+        assert!(matches!(queued.try_recv().unwrap(), Command::Status));
+        service.command(Command::Volume(150)).unwrap();
+        assert_eq!(service.volume, 100);
+        assert!(matches!(queued.try_recv().unwrap(), Command::Volume(100)));
+        service.stop();
+        assert!(service.command(Command::Volume(0)).is_err());
+        assert_eq!(service.volume, 100);
+        release.send(()).unwrap();
+        service.running.take().unwrap().handle.join().unwrap();
+
+        let (commands, queued) = mpsc::sync_channel(1);
+        drop(queued);
+        service.running = Some(Running {
+            stop: StopToken::default(),
+            commands,
+            handle: thread::spawn(|| {}),
+        });
+        assert!(service.command(Command::Volume(0)).is_err());
+        assert_eq!(service.volume, 100);
+        service.running.take().unwrap().handle.join().unwrap();
+    }
+    #[test]
+    fn restarting_before_reading_the_end_notification_publishes_a_new_session_boundary() {
+        let mut service = Service::with_factory(|_| Err(playback::PlaybackError::LoginRequired));
+        let p = program();
+        service.select(&p, p.ends_at).unwrap();
+        assert!(service.poll().new_session);
+        service.stop();
+        // Deliberately leave the old terminal notification unread.
+        until(|| {
+            service
+                .running
+                .as_ref()
+                .is_some_and(|r| r.handle.is_finished())
+        });
+        assert!(service.mailbox.lock().unwrap().ended);
+        service.select(&p, p.ends_at).unwrap();
+        let update = service.poll();
+        assert!(update.new_session);
+        assert!(!update.ended);
+        assert!(update.snapshot.is_none());
+    }
+    #[test]
     fn availability_never_infers_permission_from_finished_status_or_another_slot() {
         use crate::player::{output::OutputSummary, state::PlaybackState};
         let p = program();
         let mut snapshot = PlaybackSnapshot {
+            pipeline: None,
             info: StreamInfo {
                 station: p.key.station_id.clone(),
                 title: Some(p.title.clone()),

@@ -9,15 +9,30 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-const KEYS: &str = "番組を探す\n上下 / j k : 番組選択　PageUp / PageDown : 1画面移動\nHome / End : 先頭／末尾（選択だけでは再生しません）\nEnter : 選択枠を再生（ライブ画面ではライブ）\nv : ライブ／タイムフリー画面切替　 l : 選択枠のライブ\ne : 今回の取得状況・未取得の地域／局・日を閲覧\nf : 全条件編集　 / : キーワード編集　 r : 新規取得\n条件のEnterで検索確定、Escで取消。地域・分類欄のF2で名称選択。\nb : 名前付き条件の保存・呼び出し（呼び出し後も検索確定が必要）\n\n再生する\nSpace : 一時停止／再開　 s : 停止　 + / - : 音量\n左右 : 15秒シーク　 g : 枠内の整数秒を入力（タイムフリーのみ）\nc : 公式AIチャプター。上下・ページ・Home/Endで閲覧、Enterで再生。rで再取得。\nTab : 章一覧／要約のスクロール切替（先頭1200文字まで）\n章の時刻原点を照合できない場合はジャンプできません。\n\n認証と終了\nI : ログイン入力　 O : ログアウト確認　 a : セッション再確認\nログアウトはyで確定、n / Escで取消。パスワードは表示・保存しません。\n通常画面のq / Esc、またはCtrl+Cで終了します。\n操作一覧を開いている間も検索・再生は継続します。";
+const KEYS: &str = "番組を探す\n上下 / j k : 番組選択　PageUp / PageDown : 1画面移動\nHome / End : 先頭／末尾（選択だけでは再生しません）\nEnter : 選択枠を再生（ライブ画面ではライブ）\nv : ライブ／タイムフリー画面切替　 l : 選択枠のライブ\ne : 今回の取得状況・未取得の地域／局・日を閲覧\nf : 全条件編集　 / : キーワード編集　 r : 新規取得\n条件のEnterで検索確定、Escで取消。地域・分類欄のF2で名称選択。\nb : 名前付き条件の保存・呼び出し（呼び出し後も検索確定が必要）\n\n再生する\nSpace : 一時停止／再開　 s : 停止　 + / - : 音量\n左右 : 15秒シーク　 g : 枠内の整数秒を入力（タイムフリーのみ）\nc : 公式AIチャプター。上下・ページ・Home/Endで閲覧、Enterで再生。rで再取得。\nTab : 章一覧／要約のスクロール切替（先頭1200文字まで）\n章の時刻原点を照合できない場合はジャンプできません。\nスリープ復帰・機器変更後に出力停止した場合：\nMacの出力先を確認し、番組一覧で対象を選びEnterで再生し直してください。\n自動再生はしません。ライブ画面では現在の放送枠を選んでください。\n\n認証と終了\nI : ログイン入力　 O : ログアウト確認　 a : セッション再確認\nログアウトはyで確定、n / Escで取消。パスワードは表示・保存しません。\n通常画面のq / Esc、またはCtrl+Cで終了します。\n操作一覧を開いている間も検索・再生は継続します。";
 
 pub fn draw(
     frame: &mut Frame,
     playback: Option<&PlaybackSnapshot>,
     volume: u32,
     scroll: &mut Scroll,
+    last_diagnostics: &str,
 ) {
-    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(frame.area());
+    let http = playback
+        .and_then(|playback| playback.pipeline.as_ref())
+        .filter(|pipeline| pipeline.http.is_some())
+        .map(|pipeline| pipeline.http_label())
+        .or_else(|| {
+            last_diagnostics
+                .lines()
+                .find(|line| line.contains("通信診断") && !line.ends_with("未取得"))
+                .map(str::to_owned)
+        });
+    let areas = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(if http.is_some() { 6 } else { 5 }),
+    ])
+    .split(frame.area());
     let paragraph = Paragraph::new(KEYS).wrap(Wrap { trim: false });
     // Ratatui 0.29's opt-in line-info API expects the text's inner width.
     let lines = paragraph.line_count(areas[0].width.saturating_sub(2));
@@ -39,15 +54,19 @@ pub fn draw(
     let active = playback
         .map(|p| {
             format!(
-                "再生中: {} / {} / {:?} / {:?} / 音量{}%",
-                p.info.title.as_deref().unwrap_or("番組名未取得"),
+                "再生中: [{} / {:?}] {:?} / 音量{}% / {}",
                 p.info.station,
                 p.info.mode,
                 p.state,
-                p.volume
+                p.volume,
+                p.info.title.as_deref().unwrap_or("番組名未取得"),
             )
         })
         .unwrap_or_else(|| format!("再生中: なし / 音量{volume}%"));
+    let active = match http {
+        Some(http) => format!("{active}\n{http}"),
+        None => active,
+    };
     frame.render_widget(
         Paragraph::new(format!(
             "{active}\nEsc / ? / q 操作一覧を閉じる\n↑↓ PgUp/Dn Home/End / Ctrl+C 終了"
@@ -67,12 +86,12 @@ mod tests {
         let mut scroll = Scroll::default();
         let mut terminal = Terminal::new(TestBackend::new(48, 16)).unwrap();
         terminal
-            .draw(|frame| draw(frame, None, 0, &mut scroll))
+            .draw(|frame| draw(frame, None, 0, &mut scroll, ""))
             .unwrap();
         assert!(scroll.maximum > 0);
         scroll.key(KeyCode::End);
         terminal
-            .draw(|frame| draw(frame, None, 0, &mut scroll))
+            .draw(|frame| draw(frame, None, 0, &mut scroll, ""))
             .unwrap();
         let body: String = terminal
             .backend()
@@ -93,13 +112,13 @@ mod tests {
         scroll.key(KeyCode::End);
         let mut large = Terminal::new(TestBackend::new(160, 45)).unwrap();
         large
-            .draw(|frame| draw(frame, None, 0, &mut scroll))
+            .draw(|frame| draw(frame, None, 0, &mut scroll, ""))
             .unwrap();
         assert_eq!(scroll.offset, 0);
         assert_eq!(scroll.maximum, 0);
         for (width, height) in [(0, 0), (1, 1), (2, 2), (10, 5)] {
             let mut tiny = Terminal::new(TestBackend::new(width, height)).unwrap();
-            tiny.draw(|frame| draw(frame, None, 0, &mut scroll))
+            tiny.draw(|frame| draw(frame, None, 0, &mut scroll, ""))
                 .unwrap();
             scroll.key(KeyCode::End);
             assert!(scroll.offset <= scroll.maximum);

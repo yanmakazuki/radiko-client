@@ -19,6 +19,7 @@ pub struct PlaybackSnapshot {
     pub position: Option<Duration>,
     pub output: Option<OutputSummary>,
     pub segments: u64,
+    pub pipeline: Option<super::diagnostics::Snapshot>,
 }
 /// Counters describe only the current output generation, not accumulated listening time.
 pub fn output_diagnostics(output: Option<&OutputSummary>, segments: u64) -> String {
@@ -65,6 +66,7 @@ impl PlaybackSnapshot {
                 .then(|| info.position.saturating_add(elapsed)),
             output,
             segments,
+            pipeline: None,
         }
     }
 }

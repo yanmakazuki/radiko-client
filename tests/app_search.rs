@@ -55,6 +55,7 @@ fn draft_edit_cancel_and_stale_results_never_change_committed_data_or_playback()
     let slot = list("TBS", parse_day("20261015").unwrap());
     let p = &slot.programs[0];
     app.playback = Some(PlaybackSnapshot {
+        pipeline: None,
         info: StreamInfo {
             title: Some("再生中".into()),
             station: "OBS".into(),

@@ -20,7 +20,8 @@ This macOS Rust client provides filtered station and regional/nationwide date-ra
 
 - `src/chapters.rs`: read-only chapter CLI; `src/radiko/stream/chapters.rs`: metadata identity checks and bounded chapter acquisition.
 
-- `src/player/state.rs`: owned playback snapshots and active playback states.
+- `src/radiko/http/diagnostics.rs`: opt-in bounded request-stage timings for active HLS workers; no URLs, headers, bodies, or audio callback work.
+- `src/player/state.rs`: owned playback snapshots and active playback states; `src/player/diagnostics.rs`: bounded worker-stage wall-clock measurements, independent of the audio callback.
 - `src/play.rs`: continuous playback, switching, and seek CLI; `src/player/seek.rs`: latest-request playback preparation; `src/player/playback.rs`: bounded worker and output control; `src/radiko/stream/playback.rs`: stateful HLS acquisition.
 - `src/programs.rs`: program listing CLI; `src/catalog.rs`: region selection and bounded acquisition; `src/radiko/catalog.rs`: uncached metadata HTTP/XML.
 - `src/main.rs`: CLI arguments and reporting; `src/lib.rs`: library exports.
@@ -67,6 +68,24 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 実装前に[設計書](docs/design.md)と[アーキテクチャ設計](docs/architecture.md)を読む。仕様の判断は設計書とユーザーの最新の指示に従い、仕様変更時は設計書とアーキテクチャ設計も整合させる。
 
 ## 現在の状態
+
+- 2026年10月21日の0f13dd20でRN1ライブを1248.3秒・40操作・不足0まで観測し、ユーザーの区切り指示で中断。子終了0・端末復元を確認し、自然終了・30分成功とはしない。公開チャプター6局12枠は原点一致で、異なる原点の補正は未対応。通信診断追加後はRust 262／Python 14テスト・fmt・clippyが成功。詳細はdocs/implementation.mdを参照。
+
+- 2026年10月21日に再生中HLSの応答待ち・本文受信・再試行待ちを有限の通信診断へ分離。応答待ちはDNS／接続／TLS等を含み、個別原因を断定しない。36行以上のTUIと操作一覧へ表示し、終了後は直近未集計として保持。30行の章表示回帰を修正し、Rust 262／Python 14テスト・fmt・clippy成功。先読み2の15e18c16による30分結果とはビルドを分ける。
+
+- 2026年10月21日に先読み2の固定15e18c16で1800.9秒・38操作・検索確定4回・章要約切替3回、最終不足166,400フレーム（約3.467秒）・終了0・端末復元を確認。再再生5.2秒は不足0。取得最大観測10,759ms・復号最大793ms。先読みを増やしても不足は残り、条件を揃えた比較ではないため効果は断定しない。
+
+- 2026年10月21日にPCM先読みキューを2セグメント（各最大4MiB）へ増やし、満杯時の追加取得停止・取消を生成音声で確認。機器リングは2秒のまま。固定15e18c16で1000秒位置から60.6秒・14操作・不足0、再再生5.2秒・不足0、終了0・端末復元。取得最大1,603msの短時間確認であり、約11秒の取得待ちの解消や30分の確認とはしない。Rust 260／Python 13テスト・fmt・clippy成功。
+
+- 2026年10月21日に固定c1980dc1でTBS 10月6日枠を1800.1秒・38操作・検索確定4回・章要約切替3回で継続。最終不足149,504フレーム（約3.115秒）、取得最大観測11,001ms・復号最大754ms。1060秒付近は通過し、停止後の再再生5.2秒は不足0、終了0・端末復元を確認。不足0や聴感成功とはせず、305秒と過去1060秒の停止原因は未確定。診断行に数値読取を限定したスクリプトも別試行16.3秒・不足0で確認し、Python 13テストが成功。
+
+- 2026年10月21日に固定47047852の30分試行が直近出力305.1秒後にsource_not_foundで停止。直近不足530,432フレーム・取得段階20,143ms、終了0・端末復元。最終カウンターと失敗GETの種別は不明で、以前の停止とは別記録。後続でHLS音声取得／一覧更新の固定段階名を追加し、元の原因と非再試行条件を維持した。音量要求がキュー満杯・切断・停止中に拒否された際の設定値保持も修正し、Rust 260／Python 12テスト・fmt・clippy成功。音量修正ビルド673c23f6の60.7秒・14操作・不足0・再再生5.2秒・終了と端末復元を確認。
+
+- 2026年10月21日に固定47047852でユーザー操作のMacスリープ復帰後のoutput_stalledを確認。同じTUIで操作一覧が応答し、明示的な再生し直し31.1秒・7操作・不足0、再再生5.2秒・不足0、終了0・端末復元を確認した。--sleep-checkで再現可能とし、通常のPython 11テストは偽入力／画面のみ。過去の1060秒付近の停止と同因とは断定しない。
+
+- 2026年10月21日に診断追加後の固定ビルド2acaa0a7でTBS 10月6日枠を1800.2秒ミュート出力。独立40×160 PTYで38操作・検索確定4回・章要約切替3回・最終不足0・終了0・端末復元を確認。後続のGET本文途中切断再試行・表示短縮・局／モード先頭表示は別ビルドとし、過去の停止原因の解決とは断定しない。
+
+- 2026年10月21日に再生ワーカーの取得・復号・配送待ちの数値診断を追加。検証子プロセスの親制御端末継承を修正し、独立した40×160で60.2秒・不足0と診断値、80×20で取得失敗表示・終了と端末復元を確認。別の冒頭からの再試行は141.7秒でoutput_stalledとなり、ユーザーが前後のMacスリープ・復帰を確認。過去の1060秒付近の停止と同因かは未確認。通信・復号なしのprobe-output --muteを追加し、無音180秒・不足0と、別試行の3秒後SIGINT・中断表示・終了0を確認した。現在の既定出力は読取時点で内蔵スピーカーだった。実施範囲とビルドはdocs/implementation.mdを参照。
 
 - 2026年10月20日のビルドa7007461でTBS 10月6日枠の30分再試行は1060.3秒・不足139,264フレームの後に停止し、原因未確定。後続ca0b3d46では1000秒位置から120.6秒・不足0・正常終了を確認。冒頭からの再試行は1154.8秒・25操作・不足70,144フレームまで観測後にユーザー指示で中断し、30分成功とはしない。同じ位置付近の不足と先の停止原因は継続調査。安全な停止診断・チャプター対応付け未確認の理由表示・入力修飾キー処理を追加し、Rust 249／Python 7テスト・fmt・clippyが成功。詳細はdocs/implementation.mdを参照。
 

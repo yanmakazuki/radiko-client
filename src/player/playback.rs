@@ -1,6 +1,7 @@
 //! 主スレッドで出力を制御し、通信・デコードは容量制限付きの単一ワーカーで実行する。
 use super::{
     aac::{AacError, AdtsDecoder, DecodedPcm},
+    diagnostics::{Stage, Tracker},
     output::{ContinuousOutput, OutputError, OutputSummary, StopToken},
 };
 use crate::radiko::stream::{
@@ -71,7 +72,19 @@ pub(super) enum Event {
 
 pub(super) struct Worker {
     pub(super) stop: StopToken,
+    diagnostics: std::sync::Arc<std::sync::Mutex<Tracker>>,
+    http_diagnostics: Option<std::sync::Arc<crate::radiko::stream::playback::RequestMeasurements>>,
     handle: Option<thread::JoinHandle<()>>,
+}
+impl Worker {
+    fn diagnostics(&self) -> Option<super::diagnostics::Snapshot> {
+        let mut snapshot = self.diagnostics.lock().ok()?.snapshot(Instant::now());
+        snapshot.http = self
+            .http_diagnostics
+            .as_ref()
+            .and_then(|measurements| measurements.snapshot());
+        Some(snapshot)
+    }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -99,12 +112,23 @@ fn send(tx: &mpsc::SyncSender<Event>, mut event: Event, stop: &StopToken) -> boo
         }
     }
 }
+// One extra decoded segment absorbs acquisition jitter without enlarging the device ring.
+const PCM_QUEUE_CAPACITY: usize = 2;
+
 pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker, Receiver<Event>) {
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = mpsc::sync_channel(PCM_QUEUE_CAPACITY);
+    let http_diagnostics = source.enable_http_diagnostics();
     let control = stop.clone();
     let cancelled = control.clone();
     source.set_cancellation(std::sync::Arc::new(move || cancelled.is_cancelled()));
+    let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Tracker::new(Instant::now())));
+    let measurements = diagnostics.clone();
     let handle = thread::spawn(move || {
+        let enter = |stage| {
+            if let Ok(mut tracker) = measurements.lock() {
+                tracker.enter(stage, Instant::now());
+            }
+        };
         let mut decoder = AdtsDecoder::new();
         let info = source.info().clone();
         let target = chrono::Duration::from_std(info.position)
@@ -116,15 +140,18 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
             if control.is_cancelled() {
                 break;
             }
+            enter(Stage::Acquisition);
             let next = match source.poll_segment() {
                 Ok(next) => next,
                 Err(error) => {
+                    enter(Stage::Finished);
                     send(&tx, Event::Failed(PlaybackError::Source(error)), &control);
                     break;
                 }
             };
             match next {
                 Next::Pending(delay) => {
+                    enter(Stage::Waiting);
                     if last_segment.elapsed() > Duration::from_secs(30) {
                         send(&tx, Event::Failed(PlaybackError::SourceStalled), &control);
                         break;
@@ -135,6 +162,7 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                     }
                 }
                 Next::End => {
+                    enter(Stage::Finished);
                     send(&tx, Event::End, &control);
                     break;
                 }
@@ -145,12 +173,18 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                     if segment.discontinuity {
                         decoder = AdtsDecoder::new();
                     }
-                    match decoder.decode_segment_pcm_controlled(
+                    enter(Stage::Decode);
+                    let decoded = decoder.decode_segment_pcm_controlled(
                         &segment.bytes,
                         segment.codec.as_deref(),
                         || control.is_cancelled(),
-                    ) {
+                    );
+                    enter(Stage::Backpressure);
+                    match decoded {
                         Ok(mut pcm) => {
+                            if let Ok(mut tracker) = measurements.lock() {
+                                tracker.decoded(pcm.summary.media_duration);
+                            }
                             if seeking {
                                 match trim_to(&mut pcm, segment.starts_at, target) {
                                     Ok(false) => continue,
@@ -174,10 +208,13 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                 }
             }
         }
+        enter(Stage::Finished);
     });
     (
         Worker {
             stop,
+            diagnostics,
+            http_diagnostics,
             handle: Some(handle),
         },
         rx,
@@ -664,7 +701,7 @@ fn play_loop<S: AudioSink>(
             }
         }
         if running_worker.is_some() && Instant::now() >= report_at {
-            progress(Progress::active(
+            let mut snapshot = Progress::active(
                 &info,
                 output.as_ref().map(|out| out.summary()),
                 segments,
@@ -673,7 +710,9 @@ fn play_loop<S: AudioSink>(
                 controls
                     .as_ref()
                     .and_then(|control| control.pending_target.clone()),
-            ));
+            );
+            snapshot.pipeline = running_worker.as_ref().and_then(Worker::diagnostics);
+            progress(snapshot);
             report_at = Instant::now()
                 + controls.as_ref().map_or(Duration::from_secs(5), |control| {
                     control.notification_interval
@@ -689,6 +728,65 @@ mod tests {
     use crate::radiko::stream::playback::Segment;
     use std::collections::VecDeque;
     #[test]
+    fn two_segment_prefetch_is_bounded_and_cancel_does_not_acquire_a_fourth_segment() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Counted {
+            source: Source,
+            polls: Arc<AtomicUsize>,
+        }
+        impl SegmentSource for Counted {
+            fn info(&self) -> &StreamInfo {
+                self.source.info()
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                self.source.poll_segment()
+            }
+        }
+        let polls = Arc::new(AtomicUsize::new(0));
+        let pcm = packet(24_000).repeat(50);
+        let stop = StopToken::default();
+        let (mut worker, receiver) = worker(
+            Counted {
+                source: Source {
+                    info: info(3_600_000),
+                    events: (0..4).map(|_| event(pcm.clone(), false)).collect(),
+                },
+                polls: polls.clone(),
+            },
+            stop.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = worker.diagnostics().unwrap();
+            if snapshot.decoded_segments == 3 && snapshot.stage == Stage::Backpressure {
+                assert!(!snapshot.media_last.is_zero());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not fill its bounded queue"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        stop.cancel();
+        worker.handle.take().unwrap().join().unwrap();
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        let queued: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(queued.len(), 2);
+        for event in queued {
+            let Event::Pcm(pcm) = event else {
+                panic!("queue must contain decoded PCM only");
+            };
+            assert!(pcm.samples.len() * std::mem::size_of::<f32>() <= 4 * 1024 * 1024);
+        }
+        assert_eq!(worker.diagnostics().unwrap().stage, Stage::Finished);
+    }
+    #[test]
     fn boxed_source_receives_generation_cancellation_before_polling() {
         use std::sync::Arc;
         struct Waiting {
@@ -696,8 +794,14 @@ mod tests {
             cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
             entered: mpsc::Sender<()>,
             done: mpsc::Sender<()>,
+            http: Arc<crate::radiko::stream::playback::RequestMeasurements>,
         }
         impl SegmentSource for Waiting {
+            fn enable_http_diagnostics(
+                &mut self,
+            ) -> Option<Arc<crate::radiko::stream::playback::RequestMeasurements>> {
+                Some(self.http.clone())
+            }
             fn info(&self) -> &StreamInfo {
                 &self.info
             }
@@ -709,12 +813,16 @@ mod tests {
                     .cancelled
                     .as_ref()
                     .expect("hook installed before polling");
+                self.http
+                    .enter(crate::radiko::stream::playback::RequestStage::Headers);
                 self.entered.send(()).unwrap();
                 let began = Instant::now();
                 while !check() {
                     assert!(began.elapsed() < Duration::from_secs(2));
                     thread::sleep(Duration::from_millis(1));
                 }
+                self.http
+                    .enter(crate::radiko::stream::playback::RequestStage::Idle);
                 self.done.send(()).unwrap();
                 Err(ProbeError::Cancelled)
             }
@@ -731,6 +839,7 @@ mod tests {
                 ends_at: start + chrono::Duration::hours(1),
                 position: Duration::ZERO,
             },
+            http: Arc::new(crate::radiko::stream::playback::RequestMeasurements::new()),
             cancelled: None,
             entered,
             done,
@@ -738,10 +847,18 @@ mod tests {
         let parent = StopToken::default();
         let (mut worker, events) = worker(source, parent.child());
         seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            worker.diagnostics().unwrap().http.unwrap().stage,
+            crate::radiko::stream::playback::RequestStage::Headers
+        );
         parent.cancel();
         finished.recv_timeout(Duration::from_secs(2)).unwrap();
         worker.handle.take().unwrap().join().unwrap();
         assert!(events.try_recv().is_err());
+        assert_eq!(
+            worker.diagnostics().unwrap().http.unwrap().stage,
+            crate::radiko::stream::playback::RequestStage::Idle
+        );
     }
     struct Source {
         info: StreamInfo,

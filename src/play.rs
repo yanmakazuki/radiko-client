@@ -166,7 +166,7 @@ fn describe(p: &playback::Progress) -> String {
         )
     });
     format!(
-        "{} / {} / {} / {:?} / {}–{} / {} / 音量{}% / {} / {}セグメント{}",
+        "{} / {} / {} / {:?} / {}–{} / {} / 音量{}% / {} / {}セグメント{}\n{}",
         state,
         p.info.title.as_deref().unwrap_or("番組名未取得"),
         p.info.station,
@@ -177,7 +177,11 @@ fn describe(p: &playback::Progress) -> String {
         p.volume,
         output,
         p.segments,
-        pending
+        pending,
+        p.pipeline
+            .as_ref()
+            .map(|p| p.lines())
+            .unwrap_or_else(|| "処理診断 未取得".into())
     )
 }
 fn check_preparation(stop: &StopToken) -> Result<(), playback::PlaybackError> {
@@ -327,6 +331,7 @@ mod tests {
         assert!(matches!(command("status"), Ok(Command::Status)));
         let start = DateTime::parse_from_rfc3339("2026-10-15T03:00:00Z").unwrap();
         let p = PlaybackSnapshot {
+            pipeline: None,
             info: StreamInfo {
                 title: Some("現在の番組".into()),
                 station: "TBS".into(),

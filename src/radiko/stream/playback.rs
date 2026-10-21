@@ -1,5 +1,6 @@
 //! 状態を保持するHLS取得。URL・ヘッダー・音声データはDebug出力の対象にしない。
 use super::*;
+pub use crate::radiko::http::{RequestMeasurements, RequestSnapshot, RequestStage};
 use std::time::{Duration as Wait, Instant};
 
 #[derive(Clone, Debug)]
@@ -24,10 +25,16 @@ pub enum Next {
 }
 pub trait SegmentSource: Send + 'static {
     fn info(&self) -> &StreamInfo;
+    fn enable_http_diagnostics(&mut self) -> Option<std::sync::Arc<RequestMeasurements>> {
+        None
+    }
     fn set_cancellation(&mut self, _cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {}
     fn poll_segment(&mut self) -> Result<Next, ProbeError>;
 }
 impl<T: SegmentSource + ?Sized> SegmentSource for Box<T> {
+    fn enable_http_diagnostics(&mut self) -> Option<std::sync::Arc<RequestMeasurements>> {
+        (**self).enable_http_diagnostics()
+    }
     fn set_cancellation(&mut self, cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
         (**self).set_cancellation(cancelled);
     }
@@ -43,6 +50,9 @@ pub struct PreparedStream {
     hls: HlsStream<Http>,
 }
 impl SegmentSource for PreparedStream {
+    fn enable_http_diagnostics(&mut self) -> Option<std::sync::Arc<RequestMeasurements>> {
+        Some(self.hls.http.enable_diagnostics())
+    }
     fn set_cancellation(&mut self, cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
         self.hls.http.set_cancellation(cancelled);
     }
@@ -82,7 +92,7 @@ pub fn prepare_at(
         std::sync::Arc::new(|| false),
     )
 }
-/// Cooperative cancellation between HTTP operations; in-flight blocking I/O retains its timeout.
+/// Cancels request futures and retry waits; OS name resolution itself remains bounded and non-cancellable.
 pub fn prepare_at_controlled(
     station: &str,
     mode: ProbeMode,
@@ -303,7 +313,8 @@ impl<F: Fetch> HlsStream<F> {
                 .map_err(|_| ProbeError::UnsafeUrl)?;
             let bytes = self
                 .http
-                .get(target, HeaderMap::new(), SAMPLE_LIMIT, None, true)?
+                .get(target, HeaderMap::new(), SAMPLE_LIMIT, None, true)
+                .map_err(|error| error.at("HLS音声取得"))?
                 .bytes;
             if bytes.is_empty() {
                 return Err(ProbeError::InvalidPlaylist);
@@ -329,13 +340,16 @@ impl<F: Fetch> HlsStream<F> {
         if now < self.reload_at {
             return Ok(Next::Pending(self.reload_at.duration_since(now)));
         }
-        let reply = self.http.get(
-            self.url.clone(),
-            self.headers.clone(),
-            TEXT_LIMIT,
-            None,
-            true,
-        )?;
+        let reply = self
+            .http
+            .get(
+                self.url.clone(),
+                self.headers.clone(),
+                TEXT_LIMIT,
+                None,
+                true,
+            )
+            .map_err(|error| error.at("HLS一覧更新"))?;
         let Playlist::MediaPlaylist(media) = parse_hls(&reply.bytes)? else {
             return Err(ProbeError::InvalidPlaylist);
         };
@@ -432,6 +446,70 @@ mod tests {
             Some("mp4a.40.2".into()),
         )
         .unwrap()
+    }
+    #[test]
+    fn runtime_http_failures_preserve_the_cause_and_only_add_a_static_stage() {
+        struct FailingFetch {
+            error: RefCell<Option<ProbeError>>,
+            calls: std::cell::Cell<usize>,
+        }
+        impl Fetch for FailingFetch {
+            fn get(
+                &self,
+                _: Url,
+                _: HeaderMap,
+                _: usize,
+                _: Option<(u64, u64)>,
+                _: bool,
+            ) -> Result<Reply, ProbeError> {
+                self.calls.set(self.calls.get() + 1);
+                Err(self
+                    .error
+                    .borrow_mut()
+                    .take()
+                    .expect("only one request is allowed"))
+            }
+        }
+        for reload in [false, true] {
+            for cause in [
+                ProbeError::NotFound,
+                ProbeError::Network,
+                ProbeError::Http(503),
+                ProbeError::Authentication,
+                ProbeError::RateLimited,
+                ProbeError::Cancelled,
+            ] {
+                let original = cause.to_string();
+                let mut source = HlsStream::new(
+                    FailingFetch {
+                        error: RefCell::new(Some(cause)),
+                        calls: std::cell::Cell::new(0),
+                    },
+                    Url::parse("https://radiko.jp/secret/media.m3u8?signature=synthetic-secret")
+                        .unwrap(),
+                    HeaderMap::new(),
+                    parsed(&media(0, 1, false, "synthetic-secret", false)),
+                    None,
+                )
+                .unwrap();
+                source.next = u64::from(reload);
+                let Err(ProbeError::At(stage, error)) = source.poll(Instant::now()) else {
+                    panic!("runtime request failure must identify its stage");
+                };
+                assert_eq!(
+                    stage,
+                    if reload {
+                        "HLS一覧更新"
+                    } else {
+                        "HLS音声取得"
+                    }
+                );
+                assert_eq!(error.to_string(), original);
+                assert!(!format!("{stage}: {error}").contains("synthetic-secret"));
+                assert_eq!(source.next, u64::from(reload));
+                assert_eq!(source.http.calls.get(), 1);
+            }
+        }
     }
     #[test]
     fn segment_timestamp_is_inferred_only_from_an_explicit_anchor() {

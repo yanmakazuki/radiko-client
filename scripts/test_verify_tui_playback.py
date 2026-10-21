@@ -1,15 +1,158 @@
 """Offline tests for measurement parsing; no radiko account, network, or audio."""
 import unittest
+from unittest import mock
 import os
 import pty
 import subprocess
 import sys
 import datetime
+import fcntl
+import struct
+import termios
+import json
+import tempfile
+from pathlib import Path
 
-from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics
+from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, number
 
 
 class TerminalTests(unittest.TestCase):
+    def test_sleep_check_observes_both_stop_and_continuation_before_explicit_replay(self):
+        start = datetime.datetime.fromisoformat('2026-10-06T12:00:00+09:00')
+        end = start + datetime.timedelta(hours=1)
+        active = ('再生中: [TBS / TimeFree] synthetic\n'
+                  '10/06 12:00〜10/06 13:00 JST / Playing / 音量0% / 位置5.1秒\n'
+                  '今回の出力 5.1秒 / 不足 0フレーム')
+        for stopped in [False, True]:
+            with self.subTest(stopped=stopped):
+                state = dict(text=active, acknowledged=False)
+                events, keys = [], []
+                terminal = mock.Mock()
+                terminal.screen.side_effect = lambda: state['text']
+
+                def read(_fd, _limit):
+                    state['acknowledged'] = True
+                    if stopped:
+                        state['text'] = '再生中: なし\n再生停止: 音声コールバックが進まない sensitive-url'
+                    return b'awake\n'
+
+                def write(_fd, key):
+                    self.assertTrue(state['acknowledged'])
+                    keys.append(key)
+                    if key == b'?':
+                        state['text'] = '' if '┌操作一覧' in state['text'] else '┌操作一覧'
+                    elif key == b's':
+                        state['text'] = '再生中: なし'
+                    elif key == b'\r':
+                        state['text'] = active
+
+                def wait(predicate, *args, **kwargs):
+                    self.assertTrue(predicate(state['text']))
+                    return state['text']
+
+                with mock.patch('verify_tui_playback.select.select', return_value=([sys.stdin], [], [])), \
+                     mock.patch('verify_tui_playback.os.read', side_effect=read), \
+                     mock.patch('verify_tui_playback.os.write', side_effect=write), \
+                     mock.patch('verify_tui_playback.report', side_effect=lambda **event: events.append(event)):
+                    result = sleep_check(terminal, mock.Mock(poll=lambda: None), -1, 'TBS', start, end, wait)
+                self.assertEqual(result['inactive_observed'], stopped)
+                self.assertEqual(result['playback_error_observed'], stopped)
+                self.assertEqual(result['error_kind'], 'output_stalled' if stopped else None)
+                self.assertNotIn('sensitive-url', str(events))
+                self.assertEqual(keys, [b'?', b'?', b's', b'\r'])
+                self.assertEqual(events[-1]['phase'], 'sleep_replay_started')
+
+    def test_failed_verification_reports_actual_terminal_cleanup_and_removes_private_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'synthetic-client'
+            binary.write_text('''#!/usr/bin/env python3
+import json, os, sys, termios, tty
+if 'programs' in sys.argv:
+    print(json.dumps({'programs':[{'starts_at':'2026-10-06T12:00:00+09:00','ends_at':'2026-10-06T13:00:00+09:00'}]}))
+else:
+    before = termios.tcgetattr(0)
+    tty.setraw(0)
+    os.write(1, b'\\x1b[?1049h')
+    if os.environ['RESTORE_ON_EXIT'] == 'yes':
+        termios.tcsetattr(0, termios.TCSANOW, before)
+        # This synthetic child has no user input; clear macOS's transient PENDIN state.
+        termios.tcflush(0, termios.TCIFLUSH)
+        os.write(1, b'\\x1b[?1049l')
+    sys.exit(7)
+''')
+            binary.chmod(0o700)
+            session = root / 'synthetic-session.json'
+            session.write_text('{}')
+            session.chmod(0o600)
+            script = Path(__file__).with_name('verify_tui_playback.py')
+            for restore in [False, True]:
+                with self.subTest(restore=restore):
+                    proc = subprocess.run([sys.executable, str(script), '--binary', str(binary),
+                        '--session-file', str(session), '--station', 'TBS', '--date', '20261006',
+                        '--start', '20261006120000', '--seconds', '1'], capture_output=True,
+                        env=dict(os.environ, TMPDIR=directory, RESTORE_ON_EXIT='yes' if restore else 'no'),
+                        timeout=10)
+                    self.assertEqual(proc.returncode, 1)
+                    events = [json.loads(line) for line in proc.stdout.splitlines()]
+                    cleanup = next(event for event in events if event['phase'] == 'cleanup')
+                    self.assertEqual(cleanup['child_exit_code'], 7)
+                    self.assertEqual(cleanup['terminal_attributes_restored'], restore)
+                    self.assertEqual(cleanup['alternate_screen_restored'], restore)
+                    self.assertEqual(cleanup['terminal_restored'], restore)
+                    self.assertEqual(events[-1]['phase'], 'failed')
+                    self.assertEqual(list(root.glob('radiko-tui-verification-*')), [])
+
+    def test_child_session_uses_requested_pty_size_without_parent_controlling_terminal(self):
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 160, 0, 0))
+        code = """import os, fcntl, struct, termios
+assert os.getsid(0) == os.getpid()
+assert struct.unpack('HHHH', fcntl.ioctl(1, termios.TIOCGWINSZ, b'\\0'*8))[:2] == (40, 160)
+try:
+    fd = os.open('/dev/tty', os.O_RDONLY)
+except OSError:
+    print('ISOLATED_PTY_OK')
+else:
+    os.close(fd)
+    raise RuntimeError('inherited controlling terminal')
+"""
+        proc = subprocess.Popen([sys.executable, '-c', code], stdin=slave, stdout=slave,
+                                stderr=slave, start_new_session=True)
+        terminal = Terminal(master)
+        try:
+            wait_exit(proc, terminal)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn('ISOLATED_PTY_OK', terminal.screen())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+            os.close(slave)
+
+    def test_pipeline_returns_only_known_stage_and_numeric_measurements(self):
+        line = '処理診断 PCM配送待ち 4000ms / 取得最大120ms / 復号直近25ms・最大80ms / 音声5000ms'
+        self.assertEqual(pipeline_diagnostics(line), dict(stage='backpressure', elapsed_ms=4000,
+            acquisition_max_ms=120, decode_last_ms=25, decode_max_ms=80, media_last_ms=5000))
+        compact = '処理診断 配送待ち4000ms / 取得max120ms / 復号25/80ms / 音声5000ms'
+        self.assertEqual(pipeline_diagnostics(compact), pipeline_diagnostics(line))
+        self.assertIsNone(pipeline_diagnostics(line + '\n' + '\n'.join(['body'] * 11)))
+        self.assertIsNone(pipeline_diagnostics('処理診断 signed-url-secret'))
+
+    def test_http_diagnostics_use_only_known_footer_rows_and_numeric_fields(self):
+        pipeline = '処理診断 取得200ms / 取得max120ms / 復号25/80ms / 音声5000ms'
+        fake = '再生中: [TBS / TimeFree] 通信診断 本文受信999ms / 応答max999ms / 本文max999ms / 試行999・再試行待ち999'
+        row = '通信診断 本文受信12ms / 応答max300ms / 本文max40ms / 試行5・再試行待ち1'
+        parsed = pipeline_diagnostics(fake + '\n' + pipeline + '\n' + row)
+        self.assertEqual(parsed['http'], dict(stage='body', elapsed_ms=12, headers_max_ms=300,
+                                             body_max_ms=40, attempts=5, retry_waits=1))
+        self.assertEqual(pipeline_diagnostics('直近通知（終了時未集計）: ' + pipeline + '\n'
+                         + '直近通知（終了時未集計）: ' + row), parsed)
+        self.assertNotIn('http', pipeline_diagnostics(fake + '\n' + pipeline))
+        self.assertIsNone(pipeline_diagnostics('再生中: [TBS / TimeFree] ' + pipeline))
+        self.assertNotIn('http', pipeline_diagnostics(pipeline + '\n通信診断 secret-url'))
+
     def test_selected_detail_cannot_substitute_for_the_playing_slot(self):
         start = datetime.datetime.fromisoformat('2026-10-15T12:00:00+09:00')
         end = start + datetime.timedelta(hours=1)
@@ -19,15 +162,47 @@ class TerminalTests(unittest.TestCase):
         wrong = selected + '\n再生中: same title / TBS / TimeFree\n10/15 11:00〜10/15 12:00 JST'
         self.assertFalse(target_matches(wrong, 'TBS', start, end))
         self.assertTrue(target_matches('再生中: title / TBS / TimeFree\n' + selected, 'TBS', start, end))
+        self.assertTrue(target_matches('再生中: [TBS / TimeFree] long title\n' + selected, 'TBS', start, end))
+        self.assertFalse(target_matches('再生中: [TBS / Live] title\n' + selected, 'TBS', start, end, 'TimeFree'))
+        self.assertFalse(target_matches('再生中: title / TBS / Live\n' + selected, 'TBS', start, end, 'TimeFree'))
+        self.assertTrue(target_matches('再生中: [TBS / TimeFree] title\n' + selected, 'TBS', start, end, 'TimeFree'))
+        self.assertFalse(target_matches('再生中: [OBS / Live] title / TBS / TimeFree\n' + selected, 'TBS', start, end))
+        self.assertFalse(target_matches('再生中: title / TBS / TimeFree / OBS / Live\n' + selected, 'TBS', start, end))
 
     def test_failure_diagnostics_ignore_program_text_and_never_return_raw_notice(self):
         body = '再生停止: 配信取得: signed-url-secret\n' + '\n'.join(['body'] * 9)
         self.assertFalse(failure_diagnostics(body)['notice_visible'])
         footer = '\n'.join(['body'] * 10 + ['│再生中: 再生停止: title / TBS / TimeFree',
             '│再生停止: 配信取得: 配信サーバーがHTTP 503を返しました', '│', '│'])
-        self.assertEqual(failure_diagnostics(footer), dict(notice_visible=True, error_kind='source_other', http_status=503))
+        self.assertEqual(failure_diagnostics(footer), dict(notice_visible=True, error_kind='source_other', http_status=503, source_stage=None))
         unknown = '\n'.join(['body'] * 10 + ['│再生停止: sensitive-unrecognized-text', '│'])
         self.assertNotIn('sensitive-unrecognized-text', str(failure_diagnostics(unknown)))
+
+    def test_counters_ignore_program_titles_and_only_read_the_footer_diagnostic_rows(self):
+        output = r'今回の出力\s+([0-9.]+)秒'
+        underrun = r'不足\s+(\d+)フレーム'
+        position = r'位置([0-9.]+)秒'
+        title = '再生中: [TBS / TimeFree] 今回の出力 1800秒 不足 999フレーム 位置9000秒'
+        footer = (title + '\n10/06 12:00〜10/06 13:00 JST / Playing / 音量0% / 位置1023.4秒\n'
+                  '今回の出力 23.4秒 / 不足 512フレーム')
+        fake_body = '今回の出力 9999秒 / 不足 123フレーム\n' + '\n'.join(['body'] * 12)
+        self.assertEqual(number(fake_body + '\n' + footer, output), 23.4)
+        self.assertEqual(number(footer, underrun), 512)
+        self.assertEqual(number(footer, position), 1023.4)
+        self.assertIsNone(number(title, output))
+        self.assertIsNone(number(fake_body, output))
+        for prefix in ['停止時: ', '直近通知（終了時未集計）: ']:
+            self.assertEqual(number(prefix + '今回の出力 12.3秒 / 不足 0フレーム', output), 12.3)
+
+    def test_runtime_source_stage_is_allowlisted_and_never_inferred_from_program_text(self):
+        for stage, label in [('segment', 'HLS音声取得'), ('playlist', 'HLS一覧更新')]:
+            notice = '再生停止: 配信取得: ' + label + ': 対象の番組または配信が見つかりません'
+            result = failure_diagnostics(notice)
+            self.assertEqual(result['source_stage'], stage)
+            self.assertEqual(result['error_kind'], 'source_not_found')
+            self.assertIsNone(result['http_status'])
+            self.assertIsNone(failure_diagnostics(notice + '\n' + '\n'.join(['body'] * 9))['source_stage'])
+        self.assertIsNone(failure_diagnostics('再生停止: unknown-secret-url')['source_stage'])
 
     def test_every_utf8_and_csi_split_preserves_japanese_and_restoration(self):
         content = '\x1b[2J\x1b[2;3H再生位置\x1b[?1049l'.encode()

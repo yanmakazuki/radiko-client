@@ -37,7 +37,7 @@ def verify(args, directory):
     latencies = []
     try:
         proc = subprocess.Popen([str(binary), '--data-dir', directory, 'tui', args.station or '--all', args.start, args.end],
-                                stdin=slave, stdout=slave, stderr=slave,
+                                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
                                 env=dict(os.environ, TERM='xterm-256color'))
         report(phase='catalog_started', start=args.start, end=args.end, binary_sha256=digest)
 
@@ -54,7 +54,7 @@ def verify(args, directory):
         def check_keys():
             sent = time.monotonic()
             os.write(master, b'?')
-            wait(lambda t: '┌操作一覧' in t)
+            wait(lambda t: '┌操作一覧' in t and terminal.frame_matches_size())
             latencies.append(time.monotonic()-sent)
             heading = re.search(r'操作一覧 (\d+)/(\d+)行', terminal.screen())
             require(heading is not None, 'help scroll heading absent')

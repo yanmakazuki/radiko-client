@@ -114,6 +114,7 @@ struct Screen {
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
     playback_diagnostics: String,
+    pipeline_diagnostics: String,
     volume: u32,
     app: AppState,
     list: ListState,
@@ -122,6 +123,74 @@ struct Screen {
     preferences_notice: String,
 }
 impl Screen {
+    fn dispatch_playback(&mut self, player: &mut PlaybackService, now: DateTime<FixedOffset>) {
+        let Some(action) = self.playback_action.take() else {
+            return;
+        };
+        let volume = match &action {
+            PlaybackAction::Command(Command::Volume(volume)) => Some((*volume).min(100)),
+            _ => None,
+        };
+        let result = match action {
+            PlaybackAction::Select(program) => player.select(&program, now),
+            PlaybackAction::Chapter(program, position) => player.select_at(&program, position, now),
+            PlaybackAction::Live(program) => player.select_live(&program, now),
+            PlaybackAction::Command(command) => player.command(command),
+            PlaybackAction::Stop => {
+                player.stop();
+                Ok(())
+            }
+        };
+        match result {
+            Ok(()) => {
+                if let Some(volume) = volume {
+                    self.volume = volume;
+                }
+            }
+            Err(reason) => self.playback_notice = reason.into(),
+        }
+    }
+    fn apply_playback(&mut self, update: playback::Update) {
+        if update.new_session {
+            self.app.playback = None;
+            self.playback_diagnostics.clear();
+            self.pipeline_diagnostics.clear();
+            self.playback_notice.clear();
+        }
+        if let Some(snapshot) = &update.snapshot {
+            self.pipeline_diagnostics = snapshot
+                .pipeline
+                .as_ref()
+                .map(|p| p.lines())
+                .unwrap_or_default();
+            self.playback_diagnostics = radiko_client::player::state::output_diagnostics(
+                snapshot.output.as_ref(),
+                snapshot.segments,
+            );
+        }
+        if let Some(diagnostics) = update.final_diagnostics {
+            self.playback_diagnostics = format!("停止時: {diagnostics}");
+        } else if update.ended && !self.playback_diagnostics.is_empty() {
+            self.playback_diagnostics =
+                format!("直近通知（終了時未集計）: {}", self.playback_diagnostics);
+        }
+        if update.ended {
+            if !self.pipeline_diagnostics.is_empty() {
+                self.pipeline_diagnostics = self
+                    .pipeline_diagnostics
+                    .lines()
+                    .map(|line| format!("直近通知（終了時未集計）: {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            self.app.playback = None;
+        } else if let Some(snapshot) = update.snapshot {
+            self.app.playback = Some(snapshot);
+        }
+        if let Some(notice) = update.notice {
+            self.playback_notice = notice;
+        }
+    }
     fn rows(&self) -> &[usize] {
         if self.live_mode {
             &self.live_rows
@@ -657,12 +726,12 @@ impl Screen {
             }
             KeyCode::Char('+') | KeyCode::Char('-') => {
                 let volume = self.volume;
-                self.volume = if key.code == KeyCode::Char('+') {
+                let volume = if key.code == KeyCode::Char('+') {
                     (volume + 5).min(100)
                 } else {
                     volume.saturating_sub(5)
                 };
-                self.playback_action = Some(PlaybackAction::Command(Command::Volume(self.volume)));
+                self.playback_action = Some(PlaybackAction::Command(Command::Volume(volume)));
             }
             _ => (),
         }
@@ -888,18 +957,20 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
             screen.app.playback.as_ref(),
             screen.volume,
             &mut screen.help_scroll,
+            &screen.pipeline_diagnostics,
         );
         return;
     }
+    let show_http = frame.area().height >= 36;
     let areas = Layout::vertical([
         Constraint::Length(7),
         Constraint::Min(1),
         Constraint::Length(if screen.input.is_some() {
             4
         } else if screen.seek.is_some() {
-            10
+            11 + u16::from(show_http)
         } else {
-            9
+            10 + u16::from(show_http)
         }),
     ])
     .split(frame.area());
@@ -1076,10 +1147,10 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
             .as_ref()
             .map(|p| {
                 format!(
-                    "再生中: {} / {} / {:?}\n{}〜{} JST / {:?} / 音量{}% / {}",
-                    p.info.title.as_deref().unwrap_or("番組名未取得"),
+                    "再生中: [{} / {:?}] {}\n{}〜{} JST / {:?} / 音量{}% / {}",
                     p.info.station,
                     p.info.mode,
+                    p.info.title.as_deref().unwrap_or("番組名未取得"),
                     local(p.info.starts_at).format("%m/%d %H:%M"),
                     local(p.info.ends_at).format("%m/%d %H:%M"),
                     p.state,
@@ -1123,13 +1194,36 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
                 "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了"
             )
         };
+        let pipeline = screen
+            .app
+            .playback
+            .as_ref()
+            .and_then(|p| p.pipeline.as_ref())
+            .map(|p| p.lines())
+            .unwrap_or_else(|| {
+                if screen.pipeline_diagnostics.is_empty() {
+                    "処理診断 未取得\n通信診断 未取得".into()
+                } else {
+                    screen.pipeline_diagnostics.clone()
+                }
+            });
+        let pipeline = if show_http {
+            pipeline
+        } else {
+            pipeline
+                .lines()
+                .next()
+                .unwrap_or("処理診断 未取得")
+                .to_owned()
+        };
         let footer = format!(
-            "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}\n{} {}",
+            "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}\n{}\n{} {}",
             state,
             progress,
             screen.app.invalid_count,
             playing,
             screen.playback_diagnostics,
+            pipeline,
             controls,
             screen.playback_notice,
             screen
@@ -1243,6 +1337,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
             playback_action: None,
             playback_notice: String::new(),
             playback_diagnostics: String::new(),
+            pipeline_diagnostics: String::new(),
             volume: 25,
             app: AppState::new(criteria),
             list: ListState::default(),
@@ -1296,27 +1391,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                         screen.chapter_list.select(Some(0));
                     }
                 }
-                let update = player.poll();
-                if let Some(snapshot) = &update.snapshot {
-                    screen.playback_diagnostics = radiko_client::player::state::output_diagnostics(
-                        snapshot.output.as_ref(),
-                        snapshot.segments,
-                    );
-                }
-                if let Some(diagnostics) = update.final_diagnostics {
-                    screen.playback_diagnostics = format!("停止時: {diagnostics}");
-                } else if update.ended && !screen.playback_diagnostics.is_empty() {
-                    screen.playback_diagnostics =
-                        format!("直近通知（終了時未集計）: {}", screen.playback_diagnostics);
-                }
-                if update.ended {
-                    screen.app.playback = None;
-                } else if let Some(snapshot) = update.snapshot {
-                    screen.app.playback = Some(snapshot);
-                }
-                if let Some(notice) = update.notice {
-                    screen.playback_notice = notice;
-                }
+                screen.apply_playback(player.poll());
                 screen.refresh_live(Utc::now().fixed_offset());
                 terminal.draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))?;
                 let mut quit = false;
@@ -1349,27 +1424,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                                 ChapterAction::Cancel => chapters.cancel(),
                             }
                         }
-                        if let Some(action) = screen.playback_action.take() {
-                            let result = match action {
-                                PlaybackAction::Select(program) => {
-                                    player.select(&program, Utc::now().fixed_offset())
-                                }
-                                PlaybackAction::Chapter(program, position) => {
-                                    player.select_at(&program, position, Utc::now().fixed_offset())
-                                }
-                                PlaybackAction::Live(program) => {
-                                    player.select_live(&program, Utc::now().fixed_offset())
-                                }
-                                PlaybackAction::Command(command) => player.command(command),
-                                PlaybackAction::Stop => {
-                                    player.stop();
-                                    Ok(())
-                                }
-                            };
-                            if let Err(reason) = result {
-                                screen.playback_notice = reason.into();
-                            }
-                        }
+                        screen.dispatch_playback(&mut player, Utc::now().fixed_offset());
                         if should_quit {
                             player.stop();
                             let deadline = std::time::Instant::now() + Duration::from_millis(200);
@@ -1490,6 +1545,7 @@ mod tests {
             playback_action: None,
             playback_notice: String::new(),
             playback_diagnostics: String::new(),
+            pipeline_diagnostics: String::new(),
             volume: 25,
             app: AppState::new(criteria),
             list: ListState::default(),
@@ -1497,6 +1553,49 @@ mod tests {
             input: None,
             preferences_notice: String::new(),
         }
+    }
+    #[test]
+    fn volume_display_changes_only_after_the_playback_service_accepts_the_command() {
+        let mut screen = screen();
+        let mut search =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("volume keys must not fetch") });
+        let mut player = PlaybackService::with_factory(|_| {
+            Err(radiko_client::player::playback::PlaybackError::LoginRequired)
+        });
+        let now = Utc::now().fixed_offset();
+        for expected in [20, 15, 10, 5, 0] {
+            let before = screen.volume;
+            screen
+                .key(
+                    KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
+                    &mut search,
+                )
+                .unwrap();
+            assert_eq!(screen.volume, before);
+            screen.dispatch_playback(&mut player, now);
+            assert_eq!(screen.volume, expected);
+            assert!(screen.playback_action.is_none());
+        }
+        let program = radiko_client::radiko::catalog::parse_programs(
+            include_bytes!("../tests/fixtures/schedule.xml"),
+            "TBS",
+            radiko_client::radiko::catalog::parse_day("20261015").unwrap(),
+        )
+        .unwrap()
+        .programs
+        .remove(0);
+        player.select(&program, program.ends_at).unwrap();
+        player.stop();
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
+        screen.dispatch_playback(&mut player, now);
+        assert_eq!(screen.volume, 0);
+        assert!(screen.playback_notice.contains("停止処理中"));
+        assert!(screen.playback_action.is_none());
     }
     #[test]
     fn region_name_picker_does_not_acquire_until_the_form_is_confirmed() {
@@ -1795,6 +1894,7 @@ mod tests {
         ));
         let target = &screen.app.programs[0];
         screen.app.playback = Some(radiko_client::player::state::PlaybackSnapshot {
+            pipeline: None,
             info: radiko_client::radiko::stream::playback::StreamInfo {
                 station: target.key.station_id.clone(),
                 title: Some(target.title.clone()),
@@ -2188,6 +2288,142 @@ mod tests {
         assert_eq!(screen.input.as_deref(), Some("a"));
     }
     #[test]
+    fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
+        use radiko_client::player::diagnostics::{Snapshot, Stage};
+        let mut screen = screen();
+        let now = Utc::now().fixed_offset();
+        let visible = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for row in buffer.content.chunks(usize::from(buffer.area.width)) {
+                let mut x = 0;
+                while x < row.len() {
+                    let symbol = row[x].symbol();
+                    text.push_str(symbol);
+                    x += ratatui::text::Span::raw(symbol).width().max(1);
+                }
+                text.push('\n');
+            }
+            text
+        };
+        screen.app.playback = Some(radiko_client::player::state::PlaybackSnapshot {
+            info: radiko_client::radiko::stream::playback::StreamInfo {
+                title: Some("長い番組名".repeat(40)),
+                station: "TBS".into(),
+                mode: radiko_client::radiko::stream::ProbeMode::TimeFree,
+                starts_at: now,
+                ends_at: now + chrono::Duration::hours(1),
+                position: Duration::ZERO,
+            },
+            state: PlaybackState::Playing,
+            pending: None,
+            volume: 0,
+            position: None,
+            output: None,
+            segments: 1,
+            pipeline: Some(Snapshot {
+                stage: Stage::Backpressure,
+                elapsed: Duration::from_millis(4000),
+                acquisition_max: Duration::from_millis(120),
+                decode_last: Duration::from_millis(25),
+                decode_max: Duration::from_millis(80),
+                media_last: Duration::from_millis(5000),
+                decoded_segments: 1,
+                http: Some(radiko_client::radiko::stream::playback::RequestSnapshot {
+                    stage: radiko_client::radiko::stream::playback::RequestStage::Headers,
+                    elapsed: Duration::from_millis(12),
+                    headers_max: Duration::from_millis(300),
+                    body_max: Duration::from_millis(40),
+                    attempts: 5,
+                    retry_waits: 1,
+                }),
+            }),
+        });
+        screen.playback_notice = "NOTICE_END".into();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let text = visible(&terminal);
+        assert!(
+            text.replace(' ', "").contains("処理診断配送待ち4000ms"),
+            "{text}"
+        );
+        assert!(text.replace(' ', "").contains("音声5000ms"));
+        assert!(text.contains("NOTICE_END"));
+        assert!(text.replace(' ', "").contains("通信診断応答待ち12ms"));
+        let mut narrow = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut screen, now)).unwrap();
+        let text = visible(&narrow).replace(' ', "");
+        assert!(text.contains("取得max120ms/復号25/80ms/音声5000ms"));
+        assert!(text.contains("再生中:[TBS/TimeFree]"));
+        screen.help_open = true;
+        narrow.draw(|frame| draw(frame, &mut screen, now)).unwrap();
+        let text = visible(&narrow).replace(' ', "");
+        assert!(text.contains("再生中:[TBS/TimeFree]Playing/音量0%"));
+        assert!(text.contains("通信診断応答待ち12ms"));
+        screen.help_open = false;
+        let snapshot = screen.app.playback.take();
+        let fresh = snapshot
+            .as_ref()
+            .map(|p| radiko_client::player::state::PlaybackSnapshot {
+                info: radiko_client::radiko::stream::playback::StreamInfo {
+                    station: "OBS".into(),
+                    ..p.info.clone()
+                },
+                state: PlaybackState::Buffering,
+                pending: None,
+                volume: 0,
+                position: None,
+                output: None,
+                segments: 0,
+                pipeline: None,
+            });
+        screen.apply_playback(playback::Update {
+            snapshot,
+            ended: true,
+            notice: Some("再生停止: 音声コールバックが進まないため出力を停止しました".into()),
+            ..Default::default()
+        });
+        assert!(screen.app.playback.is_none());
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let text = visible(&terminal);
+        let compact = text.replace(' ', "");
+        assert!(compact.contains("直近通知（終了時未集計）:処理診断配送待ち4000ms"));
+        assert!(compact.contains("再生停止:音声コールバック"));
+        assert!(compact.contains("直近通知（終了時未集計）:通信診断応答待ち12ms"));
+        screen.help_open = true;
+        narrow.draw(|frame| draw(frame, &mut screen, now)).unwrap();
+        assert!(
+            visible(&narrow)
+                .replace(' ', "")
+                .contains("直近通知（終了時未集計）:通信診断")
+        );
+        screen.help_open = false;
+        screen.apply_playback(playback::Update {
+            new_session: true,
+            snapshot: fresh,
+            notice: Some("新しい準備".into()),
+            ..Default::default()
+        });
+        assert_eq!(screen.app.playback.as_ref().unwrap().info.station, "OBS");
+        assert_eq!(screen.playback_notice, "新しい準備");
+        assert!(screen.pipeline_diagnostics.is_empty());
+        assert!(!screen.playback_diagnostics.contains("終了時未集計"));
+        screen.apply_playback(playback::Update::default());
+        assert!(screen.app.playback.is_some());
+        screen.apply_playback(playback::Update {
+            new_session: true,
+            ..Default::default()
+        });
+        assert!(screen.app.playback.is_none());
+        assert!(screen.playback_diagnostics.is_empty());
+        assert!(screen.pipeline_diagnostics.is_empty());
+        assert!(screen.playback_notice.is_empty());
+    }
+    #[test]
     fn failure_browser_shows_all_missing_ranges_and_never_dispatches_actions() {
         let mut screen = screen();
         let mut search = Service::new(|| -> Result<CatalogClient, _> { panic!("read-only view") });
@@ -2562,6 +2798,7 @@ mod tests {
             ("TBS", program.key.starts_at, ProbeMode::Live, false),
         ] {
             screen.app.playback = Some(radiko_client::player::state::PlaybackSnapshot {
+                pipeline: None,
                 info: radiko_client::radiko::stream::playback::StreamInfo {
                     title: Some(program.title.clone()),
                     station: station.into(),
@@ -2650,6 +2887,7 @@ mod tests {
         screen.app.visible = vec![0];
         screen.list.select(Some(0));
         screen.app.playback = Some(radiko_client::player::state::PlaybackSnapshot {
+            pipeline: None,
             info: radiko_client::radiko::stream::playback::StreamInfo {
                 title: Some("現在の別番組".into()),
                 station: "OBS".into(),
@@ -2925,6 +3163,7 @@ mod tests {
         assert!(screen.playback_action.is_none());
         assert!(screen.playback_notice.contains("放送前"));
         screen.app.playback = Some(radiko_client::player::state::PlaybackSnapshot {
+            pipeline: None,
             info: radiko_client::radiko::stream::playback::StreamInfo {
                 title: Some(program.title),
                 station: program.key.station_id,

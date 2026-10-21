@@ -22,6 +22,7 @@ pub enum OutputError {
     UnsupportedFormat,
     Device,
     Stalled,
+    ProbeTimeout,
     Deadline,
 }
 impl fmt::Display for OutputError {
@@ -33,7 +34,10 @@ impl fmt::Display for OutputError {
                 "PCMと同じレートのmono/stereo・f32出力に機器が対応していません"
             }
             Self::Device => "音声出力機器の開始・実行に失敗しました",
-            Self::Stalled => "音声コールバックが進まないため出力を停止しました",
+            Self::Stalled => {
+                "音声コールバックが進まないため出力を停止しました。スリープ復帰・機器変更後は出力先を確認し、番組を選び直して再生してください"
+            }
+            Self::ProbeTimeout => "無音出力診断の実時間上限を超えたため停止しました",
             Self::Deadline => "番組終了：放送終了日時に達したため音声を停止しました",
         })
     }
@@ -476,6 +480,62 @@ fn validate_pcm(pcm: &DecodedPcm) -> Result<(), OutputError> {
     Ok(())
 }
 
+/// Explicit hardware-only probe: one second of zero PCM, no source or decoder.
+pub fn probe_silent(
+    seconds: u32,
+    stop: StopToken,
+    mut progress: impl FnMut(OutputSummary),
+) -> Result<OutputSummary, OutputError> {
+    if !(1..=1800).contains(&seconds) {
+        return Err(OutputError::InvalidPcm);
+    }
+    let pcm = silent_pcm();
+    let maximum = u64::from(pcm.summary.sample_rate) * u64::from(seconds);
+    let mut output = ContinuousOutput::new(&pcm, maximum, None, stop.clone())?;
+    output.configure(false, 0);
+    let mut cursor = 0;
+    let mut report_at = Instant::now();
+    let deadline = report_at + Duration::from_secs(u64::from(seconds) + 30);
+    loop {
+        if stop.is_cancelled() {
+            return Ok(output.summary());
+        }
+        if Instant::now() >= deadline {
+            return Err(OutputError::ProbeTimeout);
+        }
+        if output.enqueue(&pcm, &mut cursor)? {
+            cursor = 0;
+        }
+        if output.poll()? {
+            return Ok(output.summary());
+        }
+        if Instant::now() >= report_at {
+            progress(output.summary());
+            report_at = Instant::now() + Duration::from_secs(5);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn silent_pcm() -> DecodedPcm {
+    DecodedPcm {
+        samples: vec![0.0; 48_000 * 2],
+        summary: super::aac::AacSummary {
+            core_sample_rate: 48_000,
+            core_channels: 2,
+            sample_rate: 48_000,
+            channels: 2,
+            packets: 0,
+            frames: 48_000,
+            sbr_detected: false,
+            stereo_expansion: false,
+            media_duration: Duration::from_secs(1),
+            decode_duration: Duration::ZERO,
+            nonzero_samples: 0,
+        },
+    }
+}
+
 pub fn probe_tone(seconds: u32) -> Result<OutputSummary, OutputError> {
     if !(1..=10).contains(&seconds) {
         return Err(OutputError::InvalidPcm);
@@ -514,6 +574,21 @@ pub fn probe_tone(seconds: u32) -> Result<OutputSummary, OutputError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn silent_probe_pcm_is_bounded_zero_and_invalid_duration_never_opens_hardware() {
+        let pcm = silent_pcm();
+        validate_pcm(&pcm).unwrap();
+        assert!(pcm.samples.iter().all(|sample| *sample == 0.0));
+        assert_eq!(pcm.samples.len() * std::mem::size_of::<f32>(), 384_000);
+        assert_eq!(pcm.summary.media_duration, Duration::from_secs(1));
+        for seconds in [0, 1801, u32::MAX] {
+            assert_eq!(
+                probe_silent(seconds, StopToken::default(), |_| panic!("invalid probe"))
+                    .unwrap_err(),
+                OutputError::InvalidPcm
+            );
+        }
+    }
     #[test]
     fn paused_queue_keeps_position_and_volume_applies_to_already_queued_audio() {
         let (mut producer, mut renderer) = queue(48_000, 10, None);

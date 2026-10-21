@@ -95,6 +95,7 @@ mod tests {
     fn snapshot() -> PlaybackSnapshot {
         let start = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00+09:00").unwrap();
         PlaybackSnapshot {
+            pipeline: None,
             info: StreamInfo {
                 station: "TBS".into(),
                 title: None,

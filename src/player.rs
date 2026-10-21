@@ -1,5 +1,6 @@
 //! メモリ内でのデコード検証と容量制限付き音声出力。録音ファイルは保存しない。
 pub mod aac;
+pub mod diagnostics;
 pub mod output;
 pub mod playback;
 pub mod seek;
