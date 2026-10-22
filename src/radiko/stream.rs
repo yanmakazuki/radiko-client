@@ -341,15 +341,6 @@ fn prepare_with(
         .map(|endpoint| {
             let mut url = playlist_url(endpoint, station, mode, &program, outside_area)?;
             if !cursor.position.is_zero() {
-                let pairs: Vec<(String, String)> = url
-                    .query_pairs()
-                    .filter(|(key, _)| key != "l")
-                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                    .collect();
-                url.set_query(None);
-                url.query_pairs_mut()
-                    .extend_pairs(pairs)
-                    .append_pair("l", "60");
                 let seconds = cursor.position.as_secs().saturating_sub(10);
                 let seek = program
                     .start
@@ -723,7 +714,16 @@ fn playlist_url(
     pairs
         .append_pair("station_id", station)
         .append_pair("lsid", &lsid)
-        .append_pair("l", "15")
+        // Match the already verified seek request for all time-free starts.
+        // This only enlarges the requested playlist, never the bounded PCM queue.
+        .append_pair(
+            "l",
+            if mode == ProbeMode::TimeFree {
+                "60"
+            } else {
+                "15"
+            },
+        )
         .append_pair("type", if outside { "c" } else { "b" });
     if mode == ProbeMode::TimeFree {
         let jst = FixedOffset::east_opt(9 * 3600).unwrap_or_else(|| *program.start.offset());
@@ -1450,6 +1450,24 @@ mod tests {
         assert_eq!(pairs.get("start_at").unwrap(), "20261015010000");
         assert_eq!(pairs.get("to").unwrap(), "20261015020000");
         assert_eq!(pairs.get("type").unwrap(), "c");
+        assert_eq!(pairs.get("l").unwrap(), "60");
+        assert_eq!(
+            target.query_pairs().filter(|(key, _)| key == "l").count(),
+            1
+        );
+        assert!(!pairs.contains_key("seek"));
+        let live = playlist_url(
+            url("https://radiko.jp/playlist.m3u8").unwrap(),
+            "TBS",
+            ProbeMode::Live,
+            &program,
+            false,
+        )
+        .unwrap();
+        let live_pairs: std::collections::HashMap<_, _> = live.query_pairs().collect();
+        assert_eq!(live_pairs.get("l").unwrap(), "15");
+        assert!(!live_pairs.contains_key("start_at"));
+        assert!(!live_pairs.contains_key("seek"));
     }
 
     #[test]

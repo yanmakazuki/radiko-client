@@ -84,6 +84,13 @@ impl Http {
             measurements.enter(stage);
         }
     }
+    fn network_error(&self, error: reqwest::Error) -> ProbeError {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.failed(error.is_timeout(), error.is_connect());
+        }
+        // Drop the original error here: it can contain signed URLs.
+        ProbeError::Network
+    }
     pub(crate) fn set_cancellation(&mut self, cancelled: Arc<dyn Fn() -> bool + Send + Sync>) {
         self.cancelled = Some(cancelled);
     }
@@ -126,7 +133,7 @@ impl Http {
             || {
                 let response = &mut *response;
                 self.run(move || response.chunk())?
-                    .map_err(|_| ProbeError::Network)
+                    .map_err(|error| self.network_error(error))
             },
             limit,
         )
@@ -244,9 +251,12 @@ impl Http {
         self.observe(RequestStage::Headers);
         let mut response = self
             .run(|| request.send())?
-            .map_err(|_| ProbeError::Network)?;
+            .map_err(|error| self.network_error(error))?;
         self.check_cancelled()?;
         let status = response.status().as_u16();
+        if let Some(measurements) = &self.diagnostics {
+            measurements.received(status);
+        }
         if matches!(status, 301 | 302 | 303 | 307 | 308) && redirects {
             let location = response
                 .headers()
@@ -346,6 +356,205 @@ impl Fetch for Http {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "explicit loopback mock: requires local listening permission, no external network"]
+    fn local_mock_http_retry_discards_partial_body_and_keeps_numeric_diagnostics() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        for partial in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                for attempt in 0..2 {
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(std::time::Instant::now() < deadline);
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("local mock accept: {error}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut request = [0; 1024];
+                    assert!(socket.read(&mut request).unwrap() > 0);
+                    let response: &[u8] = if attempt == 1 {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    } else if partial {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nx"
+                    } else {
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    socket.write_all(response).unwrap();
+                }
+            });
+            let mut http = Http::new().unwrap();
+            // The production client and trusted-target policy remain HTTPS-only.
+            http.client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap();
+            let measurements = http.enable_diagnostics();
+            let target = Url::parse(&format!("http://{address}/synthetic")).unwrap();
+            let result = {
+                let _finish = FinishRequest(Some(&measurements));
+                retry_get(
+                    || http.get_once(&target, &HeaderMap::new(), 16, None, false),
+                    |_| {
+                        http.observe(RequestStage::RetryWait);
+                        let snapshot = measurements.snapshot().unwrap();
+                        assert_eq!(
+                            snapshot.response_status,
+                            Some(if partial { 200 } else { 503 })
+                        );
+                        Ok(())
+                    },
+                )
+            };
+            server.join().unwrap();
+            let Ok(GetStep::Reply(reply)) = result else {
+                panic!("local retry failed")
+            };
+            assert_eq!(reply.bytes, b"ok");
+            let snapshot = measurements.snapshot().unwrap();
+            assert_eq!(snapshot.stage, RequestStage::Idle);
+            assert_eq!((snapshot.attempts, snapshot.retry_waits), (2, 1));
+            assert_eq!(snapshot.response_status, Some(200));
+            assert_eq!(snapshot.network_failures, u64::from(partial));
+            assert_eq!((snapshot.timeouts, snapshot.connect_failures), (0, 0));
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit loopback mock: requires local listening permission, no external network"]
+    fn local_mock_http_retains_header_body_timeout_and_404_diagnostics() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::mpsc,
+            thread,
+        };
+        for status in [None, Some(200), Some(404)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release, wait) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "local client never connected"
+                            );
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("local mock accept: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                if status == Some(200) {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nx",
+                        )
+                        .unwrap();
+                }
+                if status == Some(404) {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                let _ = wait.recv_timeout(Duration::from_secs(3));
+            });
+            let mut http = Http::new().unwrap();
+            // Only this loopback mock uses HTTP. The production constructor and trusted
+            // target checks remain HTTPS-only; no account, DNS, or radiko request is used.
+            http.client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(250))
+                .build()
+                .unwrap();
+            let measurements = http.enable_diagnostics();
+            let result = {
+                let _finish = FinishRequest(Some(&measurements));
+                http.get_once(
+                    &Url::parse(&format!(
+                        "http://{address}/synthetic?signature=synthetic-secret"
+                    ))
+                    .unwrap(),
+                    &HeaderMap::new(),
+                    16,
+                    None,
+                    false,
+                )
+            };
+            let _ = release.send(());
+            server.join().unwrap();
+            assert!(matches!(
+                (&result, status),
+                (Err(ProbeError::NotFound), Some(404))
+                    | (Err(ProbeError::Network), None | Some(200))
+            ));
+            let snapshot = measurements.snapshot().unwrap();
+            assert_eq!(snapshot.stage, RequestStage::Idle);
+            assert_eq!((snapshot.attempts, snapshot.retry_waits), (1, 0));
+            assert_eq!(
+                (
+                    snapshot.network_failures,
+                    snapshot.timeouts,
+                    snapshot.connect_failures
+                ),
+                (
+                    u64::from(status != Some(404)),
+                    u64::from(status != Some(404)),
+                    0
+                )
+            );
+            assert!(!snapshot.headers_max.is_zero());
+            assert_eq!(snapshot.response_status, status);
+            assert_eq!(snapshot.body_max.is_zero(), status != Some(200));
+            assert!(!format!("{snapshot:?}").contains("synthetic-secret"));
+        }
+    }
+    #[test]
+    fn network_error_keeps_only_numeric_classification_and_never_the_original_url() {
+        let mut http = Http::new().unwrap();
+        let measurements = http.enable_diagnostics();
+        let url = Url::parse("https://radiko.jp/synthetic?signature=synthetic-secret").unwrap();
+        let error = http
+            .client
+            .get(url.clone())
+            .header("invalid\nheader", "value")
+            .build()
+            .unwrap_err()
+            .with_url(url);
+        let safe = http.network_error(error);
+        assert!(matches!(safe, ProbeError::Network));
+        let snapshot = measurements.snapshot().unwrap();
+        assert_eq!(
+            (
+                snapshot.network_failures,
+                snapshot.timeouts,
+                snapshot.connect_failures
+            ),
+            (1, 0, 0)
+        );
+        assert!(!format!("{safe:?} {snapshot:?}").contains("synthetic-secret"));
+    }
+    #[test]
     fn request_measurement_is_opt_in_and_invalid_or_cancelled_gets_never_start_attempts() {
         let mut http = Http::new().unwrap();
         assert!(http.diagnostics.is_none());
@@ -375,6 +584,14 @@ mod tests {
         let snapshot = measurements.snapshot().unwrap();
         assert_eq!(snapshot.stage, RequestStage::Idle);
         assert_eq!((snapshot.attempts, snapshot.retry_waits), (0, 0));
+        assert_eq!(
+            (
+                snapshot.network_failures,
+                snapshot.timeouts,
+                snapshot.connect_failures
+            ),
+            (0, 0, 0)
+        );
         assert!(!format!("{snapshot:?}").contains("secret"));
     }
     #[test]

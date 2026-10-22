@@ -2325,17 +2325,25 @@ mod tests {
                 stage: Stage::Backpressure,
                 elapsed: Duration::from_millis(4000),
                 acquisition_max: Duration::from_millis(120),
+                acquisition_max_pcm_start: Duration::from_millis(10000),
+                acquisition_max_pcm_min: Duration::from_millis(5000),
                 decode_last: Duration::from_millis(25),
                 decode_max: Duration::from_millis(80),
                 media_last: Duration::from_millis(5000),
                 decoded_segments: 1,
+                waiting_pcm_segments: 3,
+                waiting_pcm_media: Duration::from_millis(15000),
                 http: Some(radiko_client::radiko::stream::playback::RequestSnapshot {
                     stage: radiko_client::radiko::stream::playback::RequestStage::Headers,
+                    response_status: Some(200),
                     elapsed: Duration::from_millis(12),
                     headers_max: Duration::from_millis(300),
                     body_max: Duration::from_millis(40),
                     attempts: 5,
                     retry_waits: 1,
+                    network_failures: 2,
+                    timeouts: 1,
+                    connect_failures: 1,
                 }),
             }),
         });
@@ -2362,6 +2370,13 @@ mod tests {
         let text = visible(&narrow).replace(' ', "");
         assert!(text.contains("再生中:[TBS/TimeFree]Playing/音量0%"));
         assert!(text.contains("通信診断応答待ち12ms"));
+        assert!(text.replace('│', "").contains("通信失敗2・期限1・接続1"));
+        assert!(text.contains("HTTP200"));
+        assert!(text.replace(['│', '\n'], "").contains("待機PCM3個15000ms"));
+        assert!(
+            text.replace(['│', '\n'], "")
+                .contains("取得max時待機10000→5000ms")
+        );
         screen.help_open = false;
         let snapshot = screen.app.playback.take();
         let fresh = snapshot

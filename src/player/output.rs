@@ -19,6 +19,7 @@ use std::{
 pub enum OutputError {
     InvalidPcm,
     NoDevice,
+    DeviceInfo,
     UnsupportedFormat,
     Device,
     Stalled,
@@ -30,6 +31,7 @@ impl fmt::Display for OutputError {
         f.write_str(match self {
             Self::InvalidPcm => "出力用PCMまたは再生時間が不正です",
             Self::NoDevice => "既定の音声出力機器がありません",
+            Self::DeviceInfo => "音声出力機器の情報を取得できません",
             Self::UnsupportedFormat => {
                 "PCMと同じレートのmono/stereo・f32出力に機器が対応していません"
             }
@@ -43,6 +45,48 @@ impl fmt::Display for OutputError {
     }
 }
 impl std::error::Error for OutputError {}
+
+pub const PCM_SAMPLE_RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=192_000;
+
+/// Read-time OS capability declaration, not an opened stream or a playback result.
+pub struct OutputDeviceInfo {
+    pub name: String,
+    pub sample_rate: u32,
+    pub channels: Option<u16>,
+}
+
+fn compatible_config(
+    configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+    rate: u32,
+) -> Option<cpal::SupportedStreamConfigRange> {
+    configs
+        .filter(|config| {
+            config.sample_format() == SampleFormat::F32
+                && matches!(config.channels(), 1 | 2)
+                && config.min_sample_rate().0 <= rate
+                && config.max_sample_rate().0 >= rate
+        })
+        .max_by_key(|config| config.channels())
+}
+
+pub fn inspect_default_output(sample_rate: u32) -> Result<OutputDeviceInfo, OutputError> {
+    if !PCM_SAMPLE_RATE_RANGE.contains(&sample_rate) {
+        return Err(OutputError::InvalidPcm);
+    }
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or(OutputError::NoDevice)?;
+    let name = device.name().map_err(|_| OutputError::DeviceInfo)?;
+    let name: String = name.chars().filter(|c| !c.is_control()).take(256).collect();
+    let configs = device
+        .supported_output_configs()
+        .map_err(|_| OutputError::DeviceInfo)?;
+    Ok(OutputDeviceInfo {
+        name,
+        sample_rate,
+        channels: compatible_config(configs, sample_rate).map(|config| config.channels()),
+    })
+}
 
 #[derive(Default)]
 struct StopState {
@@ -197,17 +241,10 @@ impl Output {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or(OutputError::NoDevice)?;
-        let supported = device
+        let configs = device
             .supported_output_configs()
-            .map_err(|_| OutputError::Device)?
-            .filter(|c| {
-                c.sample_format() == SampleFormat::F32
-                    && matches!(c.channels(), 1 | 2)
-                    && c.min_sample_rate().0 <= rate
-                    && c.max_sample_rate().0 >= rate
-            })
-            .max_by_key(|c| c.channels())
-            .ok_or(OutputError::UnsupportedFormat)?;
+            .map_err(|_| OutputError::Device)?;
+        let supported = compatible_config(configs, rate).ok_or(OutputError::UnsupportedFormat)?;
         let config = supported.with_sample_rate(SampleRate(rate)).config();
         let channels = config.channels;
         let (producer, mut renderer) = queue(rate, total, deadline);
@@ -263,7 +300,7 @@ pub fn play_pcm(
 ) -> Result<OutputSummary, OutputError> {
     let rate = pcm.summary.sample_rate;
     let channels = usize::from(pcm.summary.channels);
-    if !(8_000..=192_000).contains(&rate)
+    if !PCM_SAMPLE_RATE_RANGE.contains(&rate)
         || !(1..=2).contains(&channels)
         || pcm.samples.is_empty()
         || pcm.samples.len() > 1_048_576
@@ -467,7 +504,7 @@ impl ContinuousOutput {
 }
 fn validate_pcm(pcm: &DecodedPcm) -> Result<(), OutputError> {
     let channels = usize::from(pcm.summary.channels);
-    if !(8_000..=192_000).contains(&pcm.summary.sample_rate)
+    if !PCM_SAMPLE_RATE_RANGE.contains(&pcm.summary.sample_rate)
         || !(1..=2).contains(&channels)
         || pcm.samples.is_empty()
         || pcm.samples.len() > 1_048_576
@@ -573,6 +610,47 @@ pub fn probe_tone(seconds: u32) -> Result<OutputSummary, OutputError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_inspection_and_playback_require_exact_rate_f32_and_mono_or_stereo() {
+        use super::*;
+        for rate in [0, 7999, 192001, u32::MAX] {
+            assert!(matches!(
+                inspect_default_output(rate),
+                Err(OutputError::InvalidPcm)
+            ));
+        }
+        let config = |channels, low, high, format| {
+            cpal::SupportedStreamConfigRange::new(
+                channels,
+                SampleRate(low),
+                SampleRate(high),
+                cpal::SupportedBufferSize::Unknown,
+                format,
+            )
+        };
+        let candidates = [
+            config(1, 24_000, 48_000, SampleFormat::F32),
+            config(2, 48_000, 48_000, SampleFormat::F32),
+            config(2, 8_000, 192_000, SampleFormat::I16),
+            config(6, 8_000, 192_000, SampleFormat::F32),
+        ];
+        assert_eq!(
+            compatible_config(candidates.into_iter(), 48_000)
+                .unwrap()
+                .channels(),
+            2
+        );
+        assert_eq!(
+            compatible_config(candidates.into_iter(), 24_000)
+                .unwrap()
+                .channels(),
+            1
+        );
+        for rate in [23_999, 48_001, 96_000] {
+            assert!(compatible_config(candidates.into_iter(), rate).is_none());
+        }
+    }
+
     use super::*;
     #[test]
     fn silent_probe_pcm_is_bounded_zero_and_invalid_duration_never_opens_hardware() {

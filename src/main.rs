@@ -28,7 +28,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, data_dir) = arguments(std::env::args().skip(1).collect())?;
     if args.is_empty() || args == ["--help"] {
         println!(
-            "radiko-client: 検証用CLI・検索／ライブ・タイムフリー再生TUI\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client [--data-dir DIR] play-live STATION [--interactive] [--seconds N]\n  radiko-client [--data-dir DIR] play-timefree STATION YYYYMMDDHHmmss [--offset SECONDS] [--interactive] [--seconds N]\n  radiko-client probe-output [--mute] [SECONDS]\n  radiko-client [--data-dir DIR] play-sample STATION [YYYYMMDDHHmmss]\n  radiko-client programs STATION [START [END]] [--json]\n  radiko-client programs (--areas JP13,JP14 | --all) [START [END]] [--json]\n  radiko-client programs --help（絞り込みオプション）\n  radiko-client tui [programsと同じ検索条件]\n  radiko-client searches --help（条件の保存・一覧・削除）\n  radiko-client programs --saved NAME / --restore\n  radiko-client chapters STATION YYYYMMDDHHmmss\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
+            "radiko-client: 検証用CLI・検索／ライブ・タイムフリー再生TUI\n\n  radiko-client [--data-dir DIR] login\n  radiko-client [--data-dir DIR] session\n  radiko-client [--data-dir DIR] logout\n  radiko-client [--data-dir DIR] probe-live STATION\n  radiko-client [--data-dir DIR] probe-timefree STATION YYYYMMDDHHmmss\n  radiko-client [--data-dir DIR] play-live STATION [--interactive] [--seconds N]\n  radiko-client [--data-dir DIR] play-timefree STATION YYYYMMDDHHmmss [--offset SECONDS] [--interactive] [--seconds N]\n  radiko-client output-info [SAMPLE_RATE]\n  radiko-client probe-output [--mute] [SECONDS]\n  radiko-client [--data-dir DIR] play-sample STATION [YYYYMMDDHHmmss]\n  radiko-client programs STATION [START [END]] [--json]\n  radiko-client programs (--areas JP13,JP14 | --all) [START [END]] [--json]\n  radiko-client programs --help（絞り込みオプション）\n  radiko-client tui [programsと同じ検索条件]\n  radiko-client searches --help（条件の保存・一覧・削除）\n  radiko-client programs --saved NAME / --restore\n  radiko-client chapters STATION YYYYMMDDHHmmss\n  radiko-client inspect-chapters FILE SLOT_SECONDS VERIFIED_OFFSET_SECONDS\n\nloginは端末でメールアドレスと非表示のパスワードを入力します。\nsessionは保存済みセッションの有効性と契約を確認します。\nlogoutはローカルの保存済みセッションを削除します。\ninspect-chaptersはローカルJSONを解析し、聴取権限は確認しません。"
         );
         return Ok(());
     }
@@ -46,6 +46,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .is_some_and(|arg| matches!(arg.as_str(), "play-live" | "play-timefree"))
     {
         return play::run(&args, data_dir);
+    }
+    if args.first().is_some_and(|arg| arg == "output-info") {
+        const USAGE: &str =
+            "output-info [SAMPLE_RATE]（8000〜192000Hz・既定48000Hz、出力機器の読み取りのみ）";
+        if args == ["output-info", "--help"] {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        if args.len() > 2 {
+            return Err(USAGE.into());
+        }
+        let rate = args
+            .get(1)
+            .map_or(Ok(48_000), |value| value.parse::<u32>())
+            .map_err(|_| "サンプルレートは正の整数Hzで指定してください")?;
+        if !output::PCM_SAMPLE_RATE_RANGE.contains(&rate) {
+            return Err("サンプルレートは8000〜192000Hzで指定してください".into());
+        }
+        let info = output::inspect_default_output(rate)?;
+        println!("現在の既定出力機器: {}", info.name);
+        match info.channels {
+            Some(channels) => println!(
+                "{}Hz / f32 / {}ch: 対応宣言あり（再生時に再確認）",
+                info.sample_rate, channels
+            ),
+            None => println!("{}Hz / f32 / mono・stereo: 対応宣言なし", info.sample_rate),
+        }
+        return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "probe-output") {
         if args.get(1).is_some_and(|arg| arg == "--help") && args.len() == 2 {

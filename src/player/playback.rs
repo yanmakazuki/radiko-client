@@ -65,9 +65,44 @@ pub struct PlaybackReport {
 }
 pub use super::state::PlaybackSnapshot as Progress;
 pub(super) enum Event {
-    Pcm(DecodedPcm),
+    Pcm(QueuedPcm),
     End,
     Failed(PlaybackError),
+}
+pub(super) struct QueuedPcm {
+    pcm: DecodedPcm,
+    charge: QueueCharge,
+}
+struct QueueCharge {
+    measurements: std::sync::Arc<std::sync::Mutex<Tracker>>,
+    media: Duration,
+}
+impl Drop for QueueCharge {
+    fn drop(&mut self) {
+        if let Ok(mut tracker) = self.measurements.lock() {
+            tracker.received(self.media);
+        }
+    }
+}
+impl QueuedPcm {
+    fn new(pcm: DecodedPcm, measurements: std::sync::Arc<std::sync::Mutex<Tracker>>) -> Self {
+        let media = pcm.summary.media_duration;
+        if let Ok(mut tracker) = measurements.lock() {
+            tracker.queued(media);
+        }
+        Self {
+            pcm,
+            charge: QueueCharge {
+                measurements,
+                media,
+            },
+        }
+    }
+    fn into_pcm(self) -> DecodedPcm {
+        let Self { pcm, charge } = self;
+        drop(charge);
+        pcm
+    }
 }
 
 pub(super) struct Worker {
@@ -195,6 +230,7 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                                     }
                                 }
                             }
+                            let pcm = QueuedPcm::new(pcm, measurements.clone());
                             if !send(&tx, Event::Pcm(pcm), &control) {
                                 break;
                             }
@@ -246,6 +282,7 @@ pub(super) fn prepare_ready(
         }
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(Event::Pcm(pcm)) => {
+                let pcm = pcm.into_pcm();
                 segments += 1;
                 if let Some(first) = primed.as_mut() {
                     if first.summary.sample_rate != pcm.summary.sample_rate
@@ -487,9 +524,9 @@ fn play_loop<S: AudioSink>(
     let mut eof = false;
     let mut report_at = Instant::now();
     let mut last_pcm_at = Instant::now();
-    loop {
+    let result = 'playback: loop {
         if stop.is_cancelled() {
-            return Ok(PlaybackReport {
+            break 'playback Ok(PlaybackReport {
                 output: output.as_ref().map(|o| o.summary()),
                 segments,
                 reason: EndReason::Cancelled,
@@ -563,7 +600,7 @@ fn play_loop<S: AudioSink>(
             last_pcm_at = Instant::now();
         }
         if running_worker.is_some() && info.mode == ProbeMode::Live && Utc::now() >= info.ends_at {
-            return Ok(PlaybackReport {
+            break 'playback Ok(PlaybackReport {
                 output: output.as_ref().map(|o| o.summary()),
                 segments,
                 reason: EndReason::ProgramEnd,
@@ -581,9 +618,14 @@ fn play_loop<S: AudioSink>(
             }
             match event {
                 Ok(Event::Pcm(pcm)) => {
+                    let pcm = pcm.into_pcm();
                     last_pcm_at = Instant::now();
                     if output.is_none() {
-                        (maximum, reason) = frame_limit(&info, pcm.summary.sample_rate, seconds)?;
+                        (maximum, reason) =
+                            match frame_limit(&info, pcm.summary.sample_rate, seconds) {
+                                Ok(limit) => limit,
+                                Err(error) => break 'playback Err(error),
+                            };
                         let remaining = if info.mode == ProbeMode::Live {
                             Some(
                                 (info.ends_at - Utc::now().fixed_offset())
@@ -596,7 +638,7 @@ fn play_loop<S: AudioSink>(
                         let sink = match create(&pcm, maximum, remaining, local.clone()) {
                             Ok(sink) => sink,
                             Err(error) => {
-                                return failure_or_cancelled(
+                                break 'playback failure_or_cancelled(
                                     &stop,
                                     output.as_ref(),
                                     segments,
@@ -613,11 +655,11 @@ fn play_loop<S: AudioSink>(
                     cursor = 0;
                 }
                 Ok(Event::Failed(error)) => {
-                    return failure_or_cancelled(&stop, output.as_ref(), segments, error);
+                    break 'playback failure_or_cancelled(&stop, output.as_ref(), segments, error);
                 }
                 Ok(Event::End) => {
                     let Some(out) = output.as_mut() else {
-                        return failure_or_cancelled(
+                        break 'playback failure_or_cancelled(
                             &stop,
                             output.as_ref(),
                             segments,
@@ -628,7 +670,7 @@ fn play_loop<S: AudioSink>(
                         || maximum.saturating_sub(out.accepted())
                             > u64::from(out.summary().sample_rate) / 10
                     {
-                        return failure_or_cancelled(
+                        break 'playback failure_or_cancelled(
                             &stop,
                             output.as_ref(),
                             segments,
@@ -640,7 +682,7 @@ fn play_loop<S: AudioSink>(
                 }
                 Err(TryRecvError::Empty) => (),
                 Err(TryRecvError::Disconnected) => {
-                    return failure_or_cancelled(
+                    break 'playback failure_or_cancelled(
                         &stop,
                         output.as_ref(),
                         segments,
@@ -655,7 +697,7 @@ fn play_loop<S: AudioSink>(
             && !output.as_ref().is_some_and(|o| o.accepted() >= maximum)
             && last_pcm_at.elapsed() > Duration::from_secs(30)
         {
-            return failure_or_cancelled(
+            break 'playback failure_or_cancelled(
                 &stop,
                 output.as_ref(),
                 segments,
@@ -668,20 +710,25 @@ fn play_loop<S: AudioSink>(
                     Ok(true) => current = None,
                     Ok(false) => (),
                     Err(OutputError::Deadline) => {
-                        return Ok(PlaybackReport {
+                        break 'playback Ok(PlaybackReport {
                             output: Some(out.summary()),
                             segments,
                             reason: EndReason::ProgramEnd,
                         });
                     }
                     Err(error) => {
-                        return failure_or_cancelled(&stop, Some(&*out), segments, error.into());
+                        break 'playback failure_or_cancelled(
+                            &stop,
+                            Some(&*out),
+                            segments,
+                            error.into(),
+                        );
                     }
                 }
             }
             match out.poll() {
                 Ok(true) => {
-                    return Ok(PlaybackReport {
+                    break 'playback Ok(PlaybackReport {
                         output: Some(out.summary()),
                         segments,
                         reason,
@@ -689,14 +736,19 @@ fn play_loop<S: AudioSink>(
                 }
                 Ok(false) => (),
                 Err(OutputError::Deadline) => {
-                    return Ok(PlaybackReport {
+                    break 'playback Ok(PlaybackReport {
                         output: Some(out.summary()),
                         segments,
                         reason: EndReason::ProgramEnd,
                     });
                 }
                 Err(error) => {
-                    return failure_or_cancelled(&stop, Some(&*out), segments, error.into());
+                    break 'playback failure_or_cancelled(
+                        &stop,
+                        Some(&*out),
+                        segments,
+                        error.into(),
+                    );
                 }
             }
         }
@@ -719,12 +771,158 @@ fn play_loop<S: AudioSink>(
                 });
         }
         thread::sleep(Duration::from_millis(5));
+    };
+    // An error can arrive between periodic notifications. Read the current generation once
+    // more before teardown; this is an observation, not a post-shutdown final aggregate.
+    if result.is_err() && running_worker.is_some() {
+        let mut snapshot = Progress::active(
+            &info,
+            output.as_ref().map(AudioSink::summary),
+            segments,
+            controls.as_ref().is_some_and(|control| control.paused),
+            controls.as_ref().map_or(25, |control| control.volume),
+            controls
+                .as_ref()
+                .and_then(|control| control.pending_target.clone()),
+        );
+        snapshot.pipeline = running_worker.as_ref().and_then(Worker::diagnostics);
+        // A reporting callback must not keep an errored output generation running.
+        local.cancel();
+        progress(snapshot);
     }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "explicit native output: always muted synthetic AAC, no account/network, about 50 seconds"]
+    fn native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Delayed {
+            info: StreamInfo,
+            adts: Vec<u8>,
+            started: Arc<AtomicBool>,
+            polls: usize,
+            gap_after: usize,
+            delayed: bool,
+            cancelled: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+        }
+        impl SegmentSource for Delayed {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn set_cancellation(
+                &mut self,
+                cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+            ) {
+                self.cancelled = Some(cancelled);
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                if self.polls == self.gap_after && !self.delayed {
+                    if !self.started.load(Ordering::Acquire) {
+                        return Ok(Next::Pending(Duration::from_millis(10)));
+                    }
+                    let began = Instant::now();
+                    while began.elapsed() < Duration::from_secs(11) {
+                        if self.cancelled.as_ref().is_some_and(|check| check()) {
+                            return Err(ProbeError::Cancelled);
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    self.delayed = true;
+                }
+                self.polls += 1;
+                event(self.adts.clone(), false)
+            }
+        }
+        let bytes = packet(48_000).repeat(240); // 5.12s segments, under the 4MiB PCM bound.
+        for (gap_after, seconds) in [(1, 12), (4, 25)] {
+            let started = Arc::new(AtomicBool::new(false));
+            let stop = StopToken::default();
+            let (_sender, receiver) = mpsc::channel();
+            let mut control = super::super::seek::Controller::new(receiver, stop.clone(), |_| {
+                panic!("no stream preparation is requested")
+            });
+            control.volume = 0; // Applied before the first enqueue starts the real stream.
+            control.notification_interval = Duration::from_millis(250);
+            let mut acquisition = Duration::ZERO;
+            let mut segment_media = Duration::ZERO;
+            let mut gate_frames = 0;
+            let mut gap_waiting_min = u32::MAX;
+            let mut gap_waiting_max = 0;
+            let began = Instant::now();
+            let report = play_controlled(
+                Delayed {
+                    info: info(60_000),
+                    adts: bytes.clone(),
+                    started: started.clone(),
+                    polls: 0,
+                    gap_after,
+                    delayed: false,
+                    cancelled: None,
+                },
+                Some(seconds),
+                stop.clone(),
+                &mut control,
+                |snapshot| {
+                    assert_eq!(snapshot.volume, 0);
+                    if snapshot
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.frames >= u64::from(output.sample_rate))
+                    {
+                        if gate_frames == 0 {
+                            gate_frames =
+                                snapshot.output.as_ref().map_or(0, |output| output.frames);
+                        }
+                        started.store(true, Ordering::Release);
+                    }
+                    if began.elapsed() > Duration::from_secs(50) {
+                        stop.cancel();
+                    }
+                    if let Some(pipeline) = snapshot.pipeline {
+                        assert!(pipeline.waiting_pcm_segments <= 3);
+                        if pipeline.stage == Stage::Acquisition
+                            && pipeline.elapsed >= Duration::from_secs(1)
+                        {
+                            gap_waiting_min = gap_waiting_min.min(pipeline.waiting_pcm_segments);
+                            gap_waiting_max = gap_waiting_max.max(pipeline.waiting_pcm_segments);
+                        }
+                        acquisition = acquisition.max(pipeline.acquisition_max);
+                        segment_media = segment_media.max(pipeline.media_last);
+                    }
+                },
+            )
+            .unwrap();
+            let output = report.output.unwrap();
+            println!(
+                "synthetic_muted gap_after={gap_after} gate_frames={gate_frames} gap_waiting_min={gap_waiting_min} gap_waiting_max={gap_waiting_max} output_frames={} underrun_frames={} acquisition_max_ms={} segment_media_ms={} wall_ms={}",
+                output.frames,
+                output.underrun_frames,
+                acquisition.as_millis(),
+                segment_media.as_millis(),
+                began.elapsed().as_millis()
+            );
+            assert_eq!(report.reason, EndReason::Limit);
+            assert_eq!(output.frames, u64::from(seconds) * 48_000);
+            assert!(acquisition >= Duration::from_secs(11));
+            assert_eq!(segment_media, Duration::from_millis(5120));
+            assert_ne!(gap_waiting_min, u32::MAX);
+            if gap_after == 1 {
+                assert!(output.underrun_frames > 0);
+                assert_eq!(gap_waiting_max, 0);
+            } else {
+                assert_eq!(output.underrun_frames, 0);
+                assert!(gap_waiting_max > 0);
+            }
+        }
+    }
+
     use crate::radiko::stream::playback::Segment;
     use std::collections::VecDeque;
     #[test]
@@ -762,8 +960,15 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let snapshot = worker.diagnostics().unwrap();
-            if snapshot.decoded_segments == 3 && snapshot.stage == Stage::Backpressure {
+            if snapshot.decoded_segments == 3
+                && snapshot.stage == Stage::Backpressure
+                && snapshot.waiting_pcm_segments == 3
+            {
                 assert!(!snapshot.media_last.is_zero());
+                assert_eq!(
+                    snapshot.waiting_pcm_media,
+                    snapshot.media_last.saturating_mul(3)
+                );
                 break;
             }
             assert!(
@@ -775,6 +980,7 @@ mod tests {
         assert_eq!(polls.load(Ordering::SeqCst), 3);
         stop.cancel();
         worker.handle.take().unwrap().join().unwrap();
+        assert_eq!(worker.diagnostics().unwrap().waiting_pcm_segments, 2);
         assert_eq!(polls.load(Ordering::SeqCst), 3);
         let queued: Vec<_> = receiver.try_iter().collect();
         assert_eq!(queued.len(), 2);
@@ -782,9 +988,43 @@ mod tests {
             let Event::Pcm(pcm) = event else {
                 panic!("queue must contain decoded PCM only");
             };
+            let pcm = pcm.into_pcm();
             assert!(pcm.samples.len() * std::mem::size_of::<f32>() <= 4 * 1024 * 1024);
         }
         assert_eq!(worker.diagnostics().unwrap().stage, Stage::Finished);
+        assert_eq!(worker.diagnostics().unwrap().waiting_pcm_segments, 0);
+        assert_eq!(
+            worker.diagnostics().unwrap().waiting_pcm_media,
+            Duration::ZERO
+        );
+    }
+    #[test]
+    fn waiting_pcm_measurements_clear_when_the_output_receiver_disconnects() {
+        let bytes = packet(24_000).repeat(50);
+        let (mut worker, receiver) = worker(
+            Source {
+                info: info(60_000),
+                events: (0..4).map(|_| event(bytes.clone(), false)).collect(),
+            },
+            StopToken::default(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.diagnostics().unwrap().waiting_pcm_segments != 3 {
+            assert!(Instant::now() < deadline, "prefetch never filled");
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(receiver);
+        while !worker.handle.as_ref().unwrap().is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "disconnected worker did not exit"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        worker.handle.take().unwrap().join().unwrap();
+        let snapshot = worker.diagnostics().unwrap();
+        assert_eq!(snapshot.waiting_pcm_segments, 0);
+        assert_eq!(snapshot.waiting_pcm_media, Duration::ZERO);
     }
     #[test]
     fn boxed_source_receives_generation_cancellation_before_polling() {
@@ -953,6 +1193,134 @@ mod tests {
             discontinuity,
             starts_at: None,
         }))
+    }
+    #[test]
+    fn failure_reports_latest_counters_before_the_next_periodic_notification() {
+        struct FailingSink {
+            polls: u64,
+        }
+        impl AudioSink for FailingSink {
+            fn enqueue(&mut self, _: &DecodedPcm, _: &mut usize) -> Result<bool, OutputError> {
+                Ok(false)
+            }
+            fn accepted(&self) -> u64 {
+                0
+            }
+            fn summary(&self) -> OutputSummary {
+                OutputSummary {
+                    frames: self.polls * 240,
+                    underrun_frames: self.polls * 17,
+                    sample_rate: 24_000,
+                    channels: 1,
+                }
+            }
+            fn poll(&mut self) -> Result<bool, OutputError> {
+                self.polls += 1;
+                if self.polls == 2 {
+                    Err(OutputError::Device)
+                } else {
+                    Ok(false)
+                }
+            }
+            fn finish(&mut self) {}
+        }
+        let output_stop = std::cell::RefCell::new(None::<StopToken>);
+        let mut snapshots = Vec::new();
+        let result = play_with(
+            Source {
+                info: info(60_000),
+                events: VecDeque::from([event(packet(24_000), false)]),
+            },
+            None,
+            StopToken::default(),
+            |snapshot| {
+                if snapshot
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.frames == 480)
+                {
+                    assert!(output_stop.borrow().as_ref().unwrap().is_cancelled());
+                }
+                snapshots.push(snapshot);
+            },
+            |_, _, _, stop| {
+                *output_stop.borrow_mut() = Some(stop);
+                Ok(FailingSink { polls: 0 })
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PlaybackError::Output(OutputError::Device))
+        ));
+        let last = snapshots.last().unwrap();
+        assert_eq!(last.output.as_ref().unwrap().frames, 480);
+        assert_eq!(last.output.as_ref().unwrap().underrun_frames, 34);
+        assert!(last.pipeline.is_some());
+    }
+    #[test]
+    fn failure_before_pcm_reports_no_output_and_preserves_the_original_error() {
+        use crate::radiko::stream::playback::{RequestMeasurements, RequestStage};
+        use std::sync::Arc;
+        struct FailingHttp {
+            info: StreamInfo,
+            measurements: Arc<RequestMeasurements>,
+            timeout: bool,
+        }
+        impl SegmentSource for FailingHttp {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn enable_http_diagnostics(&mut self) -> Option<Arc<RequestMeasurements>> {
+                Some(self.measurements.clone())
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                self.measurements.enter(RequestStage::Headers);
+                if self.timeout {
+                    self.measurements.failed(true, false);
+                } else {
+                    self.measurements.received(404);
+                }
+                self.measurements.enter(RequestStage::Idle);
+                Err(if self.timeout {
+                    ProbeError::Network
+                } else {
+                    ProbeError::NotFound
+                })
+            }
+        }
+        for timeout in [false, true] {
+            let source: Box<dyn SegmentSource> = Box::new(FailingHttp {
+                info: info(60_000),
+                measurements: Arc::new(RequestMeasurements::new()),
+                timeout,
+            });
+            let mut snapshots = Vec::new();
+            let result = play_with::<Sink>(
+                source,
+                None,
+                StopToken::default(),
+                |snapshot| snapshots.push(snapshot),
+                |_, _, _, _| panic!("a source failure cannot open an output device"),
+            );
+            assert!(matches!(
+                (&result, timeout),
+                (Err(PlaybackError::Source(ProbeError::NotFound)), false)
+                    | (Err(PlaybackError::Source(ProbeError::Network)), true)
+            ));
+            let last = snapshots.last().unwrap();
+            assert!(last.output.is_none());
+            assert_eq!(last.segments, 0);
+            let pipeline = last.pipeline.as_ref().unwrap();
+            assert_eq!(pipeline.stage, Stage::Finished);
+            let http = pipeline.http.as_ref().unwrap();
+            assert_eq!(http.stage, RequestStage::Idle);
+            assert_eq!((http.attempts, http.retry_waits), (1, 0));
+            assert_eq!(http.response_status, if timeout { None } else { Some(404) });
+            assert_eq!(
+                (http.network_failures, http.timeouts, http.connect_failures),
+                (u64::from(timeout), u64::from(timeout), 0)
+            );
+        }
     }
     #[test]
     fn idle_session_reports_preparation_failure_without_output_or_active_snapshot() {
@@ -1537,8 +1905,22 @@ mod tests {
                 events: vec![event(bytes.clone(), false), tail].into(),
             };
             let stop = StopToken::default();
-            assert!(play_with(source, None, stop.clone(), |_| {}, sink).is_err());
+            let mut snapshots = Vec::new();
+            assert!(
+                play_with(
+                    source,
+                    None,
+                    stop.clone(),
+                    |snapshot| snapshots.push(snapshot),
+                    sink
+                )
+                .is_err()
+            );
             assert!(stop.is_cancelled());
+            let last = snapshots.last().unwrap();
+            assert_eq!(last.segments, 1);
+            assert!(last.output.as_ref().is_some_and(|output| output.frames > 0));
+            assert!(last.pipeline.is_some());
         }
     }
     #[test]

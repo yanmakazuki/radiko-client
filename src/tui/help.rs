@@ -18,19 +18,35 @@ pub fn draw(
     scroll: &mut Scroll,
     last_diagnostics: &str,
 ) {
-    let http = playback
+    let diagnostics = playback
         .and_then(|playback| playback.pipeline.as_ref())
-        .filter(|pipeline| pipeline.http.is_some())
-        .map(|pipeline| pipeline.http_label())
+        .map(|pipeline| {
+            if pipeline.http.is_some() {
+                pipeline.lines()
+            } else {
+                pipeline.label()
+            }
+        })
         .or_else(|| {
-            last_diagnostics
+            let lines: Vec<_> = last_diagnostics
                 .lines()
-                .find(|line| line.contains("通信診断") && !line.ends_with("未取得"))
-                .map(str::to_owned)
+                .filter(|line| {
+                    (line.contains("通信診断") && !line.ends_with("通信診断 未取得"))
+                        || (line.contains("処理診断") && !line.ends_with("処理診断 未取得"))
+                })
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
         });
+    let diagnostic =
+        Paragraph::new(diagnostics.as_deref().unwrap_or_default()).wrap(Wrap { trim: false });
+    let diagnostic_lines = diagnostics.as_ref().map_or(0, |_| {
+        diagnostic.line_count(frame.area().width.saturating_sub(2))
+    });
     let areas = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(if http.is_some() { 6 } else { 5 }),
+        Constraint::Length(
+            5u16.saturating_add(u16::try_from(diagnostic_lines).unwrap_or(u16::MAX)),
+        ),
     ])
     .split(frame.area());
     let paragraph = Paragraph::new(KEYS).wrap(Wrap { trim: false });
@@ -63,16 +79,20 @@ pub fn draw(
             )
         })
         .unwrap_or_else(|| format!("再生中: なし / 音量{volume}%"));
-    let active = match http {
-        Some(http) => format!("{active}\n{http}"),
-        None => active,
-    };
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(areas[1]);
+    frame.render_widget(block, areas[1]);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    frame.render_widget(Paragraph::new(active), rows[0]);
+    frame.render_widget(diagnostic, rows[1]);
     frame.render_widget(
-        Paragraph::new(format!(
-            "{active}\nEsc / ? / q 操作一覧を閉じる\n↑↓ PgUp/Dn Home/End / Ctrl+C 終了"
-        ))
-        .block(Block::default().borders(Borders::ALL)),
-        areas[1],
+        Paragraph::new("Esc / ? / q 操作一覧を閉じる\n↑↓ PgUp/Dn Home/End / Ctrl+C 終了"),
+        rows[2],
     );
 }
 
@@ -80,6 +100,26 @@ pub fn draw(
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn failed_request_without_response_keeps_its_diagnostics_in_help() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut scroll = Scroll::default();
+        let diagnostics = "直近通知（終了時未集計）: 通信診断 待機0ms / 応答max250ms / 本文max0ms / 試行1・再試行待ち0 / 通信失敗1・期限1・接続0 / HTTP未取得";
+        terminal
+            .draw(|frame| draw(frame, None, 0, &mut scroll, diagnostics))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let text = text.replace([' ', '│'], "");
+        assert!(text.contains("通信失敗1・期限1・接続0"));
+        assert!(text.contains("HTTP未取得"));
+    }
 
     #[test]
     fn wrapped_help_reaches_the_end_and_clamps_after_resize() {

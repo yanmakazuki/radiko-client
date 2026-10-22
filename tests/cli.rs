@@ -161,10 +161,22 @@ fn region_commands_validate_before_network_and_document_both_selectors() {
 
 #[test]
 fn output_commands_reject_bad_arguments_and_require_session_without_hardware_or_network() {
+    let info_help = run(&["output-info", "--help"]);
+    assert!(info_help.status.success());
+    assert!(
+        String::from_utf8(info_help.stdout)
+            .unwrap()
+            .contains("読み取りのみ")
+    );
     let help = run(&["probe-output", "--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8(help.stdout).unwrap().contains("--mute"));
     for args in [
+        vec!["output-info", "0"],
+        vec!["output-info", "7999"],
+        vec!["output-info", "192001"],
+        vec!["output-info", "bad"],
+        vec!["output-info", "48000", "extra"],
         vec!["probe-output", "0"],
         vec!["probe-output", "11"],
         vec!["probe-output", "bad"],

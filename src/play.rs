@@ -210,7 +210,8 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     );
     let stop = StopToken::default();
     let signal = stop.clone();
-    ctrlc::set_handler(move || signal.cancel()).map_err(|_| "Ctrl+Cの停止処理を登録できません")?;
+    ctrlc::set_handler(move || signal.cancel())
+        .map_err(|_| "終了シグナルの停止処理を登録できません")?;
     let auth_stop = stop.clone();
     let membership = MemberClient::new_cancellable(Arc::new(move || auth_stop.is_cancelled()))
         .and_then(|client| client.check(&session));

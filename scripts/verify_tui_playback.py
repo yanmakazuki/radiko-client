@@ -199,6 +199,17 @@ def failure_diagnostics(text):
                 http_status=int(status[1]) if status else None, source_stage=stage)
 
 
+
+def failure_observation(text, previous_output):
+    failure = failure_diagnostics(text)
+    if not failure['notice_visible']:
+        return None
+    return dict(output_seconds=number(text, r'今回の出力\s+([0-9.]+)秒'),
+                previous_output_seconds=previous_output,
+                underrun_frames=number(text, r'不足\s+(\d+)フレーム'),
+                pipeline_last_notification=pipeline_diagnostics(text), **failure)
+
+
 def diagnostic_row(text, prefix):
     for line in text.splitlines()[-10:]:
         line = re.sub(r'^直近通知（終了時未集計）:\s*', '', line.strip(' │'))
@@ -221,6 +232,12 @@ def pipeline_diagnostics(text):
               '配送待ち': 'backpressure', '更新待ち': 'waiting', '終了': 'finished'}
     result = dict(stage=stages[match[1]], elapsed_ms=int(match[2]), acquisition_max_ms=int(match[3]),
                   decode_last_ms=int(match[4]), decode_max_ms=int(match[5]), media_last_ms=int(match[6]))
+    waiting = re.search(r'/待機PCM([0-9]+)個([0-9]+)ms(?:$|/)', footer)
+    if waiting:
+        result.update(waiting_pcm_segments=int(waiting[1]), waiting_pcm_media_ms=int(waiting[2]))
+    longest = re.search(r'/取得max時待機([0-9]+)→([0-9]+)ms(?:$|/)', footer)
+    if longest:
+        result.update(acquisition_max_pcm_start_ms=int(longest[1]), acquisition_max_pcm_min_ms=int(longest[2]))
     http = re.search(r'^通信診断(待機|応答待ち|本文受信|再試行待ち)([0-9]+)ms/'
                      r'応答max([0-9]+)ms/本文max([0-9]+)ms/試行([0-9]+)・再試行待ち([0-9]+)',
                      diagnostic_row(text, '通信診断'))
@@ -228,6 +245,13 @@ def pipeline_diagnostics(text):
         phases = {'待機': 'idle', '応答待ち': 'headers', '本文受信': 'body', '再試行待ち': 'retry_wait'}
         result['http'] = dict(stage=phases[http[1]], elapsed_ms=int(http[2]), headers_max_ms=int(http[3]),
                               body_max_ms=int(http[4]), attempts=int(http[5]), retry_waits=int(http[6]))
+        status = re.search(r'/HTTP([1-9][0-9]{2}|未取得)(?:$|/)', diagnostic_row(text, '通信診断'))
+        if status:
+            result['http']['response_status'] = None if status[1] == '未取得' else int(status[1])
+        failures = re.search(r'/通信失敗([0-9]+)・期限([0-9]+)・接続([0-9]+)', diagnostic_row(text, '通信診断'))
+        if failures:
+            result['http'].update(network_failures=int(failures[1]), timeouts=int(failures[2]),
+                                  connect_failures=int(failures[3]))
     return result
 
 
@@ -322,6 +346,9 @@ def sleep_check(terminal, proc, master, station, selected, ends_at, wait):
     inactive_observed |= '再生中: なし' in text
     result = dict(operator_acknowledged=True, playback_error_observed=error_observed,
                   inactive_observed=inactive_observed, **failure_diagnostics(text),
+                  output_seconds_before_sleep=number(before, r'今回の出力\s+([0-9.]+)秒'),
+                  output_seconds_after_wake=number(text, r'今回の出力\s+([0-9.]+)秒'),
+                  underrun_frames_after_wake=number(text, r'不足\s+(\d+)フレーム'),
                   pipeline_last_notification=pipeline_diagnostics(text))
     report(phase='sleep_observed', **result)
     os.write(master, b'?')
@@ -367,6 +394,42 @@ def restart_check(terminal, master, wait, args, selected, ends_at, index, filter
     return result
 
 
+
+def select_program(programs, start, seconds, offset, live, live_end, now):
+    """Choose a slot without I/O; bounded live output and natural end are distinct."""
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    if start == 'auto':
+        require(live or live_end, 'automatic slot selection requires live or live-end')
+        on_air = []
+        for index, program in enumerate(programs):
+            begins = datetime.datetime.fromisoformat(program['starts_at'])
+            ends = datetime.datetime.fromisoformat(program['ends_at'])
+            remaining = (ends-now).total_seconds()
+            if begins <= now and ((30 < remaining <= seconds) if live_end else remaining > seconds + 30):
+                on_air.append(index)
+        require(bool(on_air), 'no on-air slot matches the requested verification window')
+        index = on_air[0]
+        selected = datetime.datetime.fromisoformat(programs[index]['starts_at']).astimezone(jst)
+    else:
+        selected = datetime.datetime.strptime(start, '%Y%m%d%H%M%S').replace(tzinfo=jst)
+        index = next((i for i, program in enumerate(programs)
+                      if datetime.datetime.fromisoformat(program['starts_at']) == selected), None)
+        require(index is not None, 'selected slot absent from acquired schedule')
+    ends_at = datetime.datetime.fromisoformat(programs[index]['ends_at'])
+    if live or live_end:
+        remaining = (ends_at-now).total_seconds()
+        require(selected <= now, 'live slot has not started')
+        if live_end:
+            require(30 < remaining <= seconds, 'live end must be 30..seconds away')
+        else:
+            require(remaining > seconds + 30, 'bounded live needs thirty seconds of setup margin')
+    else:
+        length = (ends_at-selected).total_seconds()
+        require(length > offset + seconds + 10,
+                'selected slot must exceed offset plus verification duration by ten seconds')
+    return selected, index, ends_at
+
+
 def verify(args, directory):
     os.chmod(directory, 0o700)
     binary = Path(directory) / 'radiko-client'
@@ -387,27 +450,13 @@ def verify(args, directory):
                              capture_output=True, timeout=90)
     require(listing.returncode == 0, 'public program acquisition failed')
     programs = sorted(json.loads(listing.stdout)['programs'], key=lambda p: p['starts_at'])
-    if args.start == 'auto':
-        require(args.live_end, 'automatic slot selection is only supported for live end verification')
-        now = datetime.datetime.now(datetime.timezone.utc)
-        on_air = [p for p in programs if datetime.datetime.fromisoformat(p['starts_at']) <= now
-                  and 30 < (datetime.datetime.fromisoformat(p['ends_at'])-now).total_seconds() <= args.seconds]
-        require(bool(on_air), 'no on-air slot ends within the requested verification window')
-        args.start = datetime.datetime.fromisoformat(on_air[0]['starts_at']).strftime('%Y%m%d%H%M%S')
-    selected = datetime.datetime.strptime(args.start, '%Y%m%d%H%M%S').replace(
-        tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
-    index = next((i for i, p in enumerate(programs)
-                  if datetime.datetime.fromisoformat(p['starts_at']) == selected), None)
-    require(index is not None, 'selected slot absent from acquired schedule')
-    length = (datetime.datetime.fromisoformat(programs[index]['ends_at']) - selected).total_seconds()
-    ends_at = datetime.datetime.fromisoformat(programs[index]['ends_at'])
-    expected_mode = 'Live' if args.live_end else 'TimeFree'
-    if args.live_end:
-        remaining = (ends_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-        require(selected <= datetime.datetime.now(datetime.timezone.utc), 'live slot has not started')
-        require(30 < remaining <= args.seconds, 'live end must be 30..seconds away')
-    else:
-        require(length > args.offset + args.seconds + 10, 'selected slot must exceed offset plus verification duration by ten seconds')
+    live_mode = args.live or args.live_end
+    selected, index, ends_at = select_program(programs, args.start, args.seconds, args.offset,
+                                              args.live, args.live_end,
+                                              datetime.datetime.now(datetime.timezone.utc))
+    args.start = selected.strftime('%Y%m%d%H%M%S')
+    expected_mode = 'Live' if live_mode else 'TimeFree'
+    verification_mode = 'live_end' if args.live_end else ('live' if args.live else 'timefree')
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', Terminal.rows, Terminal.columns, 0, 0))
     before = termios.tcgetattr(slave)
@@ -446,7 +495,7 @@ def verify(args, directory):
              check='completed TUI frame did not match requested PTY dimensions')
         os.write(master, b'-----')
         wait(lambda t: '音量0%' in t)
-        os.write(master, b'j' * index + (b'l' if args.live_end else b'\r'))
+        os.write(master, b'j' * index + (b'l' if live_mode else b'\r'))
         wait(lambda t: '今回の出力' in t and target_matches(t, args.station, selected, ends_at, expected_mode))
         sleep_result = sleep_check(terminal, proc, master, args.station, selected, ends_at, wait) \
             if args.sleep_check else None
@@ -517,18 +566,15 @@ def verify(args, directory):
         began = changed = operated = time.monotonic()
         filtered = False
         report(phase='playing', binary_sha256=digest, station=args.station, start=args.start,
-               ends_at=ends_at.isoformat(), offset_seconds=args.offset, mode='live_end' if args.live_end else 'timefree', muted=True)
+               ends_at=ends_at.isoformat(), offset_seconds=args.offset, mode=verification_mode, muted=True)
         end_delta = None
         while True:
             terminal.pump(1)
             text = terminal.screen()
             require(proc.poll() is None, 'TUI exited early (code=%s)' % proc.returncode)
-            failure = failure_diagnostics(text)
-            if failure['notice_visible']:
-                report(phase='playback_failure', output_seconds=last_output,
-                       underrun_frames=number('\n'.join(text.splitlines()[-8:]), r'不足\s+(\d+)フレーム'),
-                       pipeline_last_notification=pipeline_diagnostics(text),
-                       **failure)
+            failure = failure_observation(text, last_output)
+            if failure is not None:
+                report(phase='playback_failure', **failure)
                 raise RuntimeError('playback failed')
             if args.live_end and '番組終了' in text and '再生中: なし' in text:
                 end_delta = (datetime.datetime.now(datetime.timezone.utc) - ends_at).total_seconds()
@@ -629,7 +675,7 @@ def verify(args, directory):
         final_output = number(final, r'今回の出力\s+([0-9.]+)秒')
         require(final_output is not None and final_output >= last_output, 'final output counter absent or reset')
         last_output = final_output
-        report(phase='stopped', output_seconds=last_output,
+        report(phase='stopped', mode=verification_mode, output_seconds=last_output,
                final_underrun_frames=int(underrun), live_end_delta_seconds=end_delta)
         restarted = restart_check(terminal, master, wait, args, selected, ends_at, index, filtered) \
             if args.restart_check else None
@@ -637,7 +683,7 @@ def verify(args, directory):
         wait_exit(proc, terminal)
         require(proc.returncode == 0, 'TUI failed on exit')
         require(termios.tcgetattr(slave) == before and terminal.restored, 'terminal restoration failed')
-        report(phase='complete', output_seconds=last_output, operation_cycles=cycles,
+        report(phase='complete', mode=verification_mode, output_seconds=last_output, operation_cycles=cycles,
                final_underrun_frames=int(underrun), confirmed_searches=cycles//8,
                chapter_scroll_checks=chapter_scroll_checks,
                terminal_restored=True, exit_code=proc.returncode, binary_sha256=digest,
@@ -679,7 +725,7 @@ def main():
     parser.add_argument('--session-file', type=Path, required=True)
     parser.add_argument('--station', default='TBS')
     parser.add_argument('--date', required=True, help='broadcast day YYYYMMDD, or auto for the current JST broadcast day')
-    parser.add_argument('--start', required=True, help='slot start YYYYMMDDHHmmss (JST), or auto with --live-end')
+    parser.add_argument('--start', required=True, help='slot start YYYYMMDDHHmmss (JST), or auto with --live / --live-end')
     parser.add_argument('--seconds', type=int, default=1800)
     parser.add_argument('--offset', type=int, default=0, help='initial time-free position in integer seconds')
     parser.add_argument('--interval', type=int, default=45)
@@ -691,23 +737,29 @@ def main():
                         help='after the measured stop, replay the selected time-free slot for five seconds and stop again')
     parser.add_argument('--pause-seconds', type=int, default=0,
                         help='pause time-free playback for 1..86400 seconds, check position and resume before output verification')
-    parser.add_argument('--live-end', action='store_true', help='play selected on-air slot until its natural end')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--live', action='store_true', help='stop live output after the requested seconds; no natural-end claim')
+    modes.add_argument('--live-end', action='store_true', help='play selected on-air slot until its natural end')
     args = parser.parse_args()
     if not 1 <= args.seconds <= 86400 or not 1 <= args.interval <= 300:
         parser.error('seconds must be 1..86400 and interval 1..300')
-    if not 0 <= args.pause_seconds <= 86400 or (args.pause_seconds and args.live_end):
-        parser.error('pause-seconds must be 0..86400 and cannot be combined with live-end')
-    if not 0 <= args.offset <= 86400 or (args.offset and args.live_end):
+    live_mode = args.live or args.live_end
+    if args.start == 'auto' and not live_mode:
+        parser.error('automatic slot selection requires live or live-end')
+    if not 0 <= args.pause_seconds <= 86400 or (args.pause_seconds and live_mode):
+        parser.error('pause-seconds must be 0..86400 and cannot be combined with live or live-end')
+    if not 0 <= args.offset <= 86400 or (args.offset and live_mode):
         parser.error('offset must be 0..86400 and is only available for time-free')
-    if args.device_check and (args.live_end or args.pause_seconds):
-        parser.error('device-check cannot be combined with live-end or pause-seconds')
-    if args.sleep_check and (args.live_end or args.device_check or args.pause_seconds):
-        parser.error('sleep-check cannot be combined with live-end, device-check or pause-seconds')
-    if args.restart_check and args.live_end:
+    if args.device_check and (live_mode or args.pause_seconds):
+        parser.error('device-check cannot be combined with live, live-end or pause-seconds')
+    if args.sleep_check and (live_mode or args.device_check or args.pause_seconds):
+        parser.error('sleep-check cannot be combined with live, live-end, device-check or pause-seconds')
+    if args.restart_check and live_mode:
         parser.error('restart-check is only available for time-free')
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGHUP, interrupt)
     try:
         with tempfile.TemporaryDirectory(prefix='radiko-tui-verification-') as directory:
             verify(args, directory)

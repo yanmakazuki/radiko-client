@@ -2,6 +2,38 @@
 
 現行の実装・実機確認範囲は[現在の検証範囲](validation.md)を参照する。日付付きの節は導入経緯も含む。検証結果を全局・全形式の保証へ広げず、制約は同資料と[実装状況](implementation.md)で確認する。
 
+## PCM配送の観測所有権（2026年10月22日）
+
+Event::PcmはQueuedPcmで所有し、同じ世代のTrackerに個数・Durationのチャージを持つ。配送待ちへ入れる前に加算し、into_pcmで主制御へ渡す時・取消による破棄・受信側切断時にQueueCharge::dropで減算する。元のデコードPCMを包むだけでコピーや先読み枠を増やさない。TrackerのMutexは段階・数値更新だけへ使用し、I/O中や音声コールバックで取得しない。計測ロックの失敗は音声のエラーへ変換しない。
+
+Trackerは取得中の開始／最少待機PCM時間を数値だけで追い、最長取得が更新された時だけacquisition_max_pcm_start／acquisition_max_pcm_minへ組で保存する。次の短い取得ではその組を維持する。
+
+Snapshotへwaiting_pcm_segments／waiting_pcm_mediaを固定サイズで追加し、従来の処理診断の末尾へ出す。操作一覧は処理・通信の両行を実幅で折り返し、終了時は直近未集計の表示を維持する。検証JSONは既知の末尾数値から任意のwaiting_pcm_segments／waiting_pcm_media_msを読む。古い固定バイナリには値を捏造せず、URIや本文は記録しない。待機数はキュー容量2＋配送待ち1で最大3、主制御の現在PCMと機器リングを含まない。
+
+## 既定出力の読み取り診断（2026年10月22日）
+
+player::output::inspect_default_outputはCPALのdefault_output_deviceとsupported_output_configsだけを読み、ストリームを作成しない。名前は制御文字を除去し256文字へ制限し、指定レートと選択可能なチャンネル数を所有値で返す。compatible_configを実際のOutput::open_with_stopと共用し、f32・1/2ch・レート範囲を維持する。CLIは不正な引数・8000〜192000Hz外のレートを機器への問い合わせ前に拒否し、セッション保存先を開かない。任意機器の選択・OS出力先変更・既存再生の機器追跡は追加しない。
+
+## 応答番号の計測境界（2026年10月22日）
+
+RequestMeasurementsはresponse_status: Option<u16>を固定サイズで所有する。Headersへ入るとNoneへ初期化し、get_onceがreqwest::StatusCodeを得た時点でSomeへ更新する。Body・RetryWait・Idleへの移動ではその試行の値を残し、次のHeadersで消す。HTTP認証のrequest_onceには追加しない。操作一覧と数値JSONは従来形式を許容し、新しいHTTP未取得はnull、受信済みは3桁の整数だけを渡す。箱入りsourceの404／応答前タイムアウトも、出力未作成のエラー出口から元の原因と一緒に観測できる。
+
+## ライブ手動検証の枠選択（2026年10月22日）
+
+select_programは番組一覧・明示開始時刻またはauto・検証時間・モード・固定nowだけを受ける純粋な選択関数とする。JSTの日付をまたぐ枠も絶対日時で照合し、放送前・終了済み・残り時間不足を拒否する。verifyはliveまたはlive_endの場合だけlキーで再生し、指定秒数到達では通常停止、live_endのみ終了時刻の許容差を判定する。引数の不正な組み合わせとtimefreeのautoは一時セッションの読込・番組表取得より前に拒否する。
+
+## 冒頭とシークのHLS要求長（2026年10月22日）
+
+playlist_urlでTimeFreeのみl=60、Liveはl=15を一度だけ付加する。prepare_withで非ゼロ位置だけlを置換していた処理を除き、seekの追加だけを残す。変更前はTBS 20261006120000の冒頭応答が3セグメント・15.105秒、変更後は12セグメント・60.036秒で、先頭の純Rust AAC/SBRデコードも成功した。HlsStreamの1MiB／4096項目上限と通し番号管理、PCMキュー各4MiB×2・機器リング2秒は維持する。要求長と実際の音声先読みの量を区別する。
+
+## reqwestエラーの数値分類（2026年10月22日）
+
+Http::network_errorは採用中reqwest 0.12.28のis_timeout／is_connectを確認し、任意のRequestMeasurementsへ飽和加算して元エラーを破棄する。応答待ちと本文受信の共通経路で計測し、計測未設定なら従来のProbeError::Networkへの変換だけを行う。固定サイズの3カウンターだけを増やし、要求履歴・URL・本文・ヘッダーは持たない。HTTP状態／取消は別経路であり加算しない。新しい再生ワーカーで0に戻す。操作一覧は通信診断の折り返し行数をRatatuiのline_countで測り、再生タイトル1行・閉じる案内2行とは別領域へ描画する。
+
+## エラー出口の診断観測（2026年10月22日）
+
+play_loopはループ結果を受け取り、Errかつ現在のWorkerがある場合だけ、所有中の出力・WorkerからPlaybackSnapshotを一度取得し、現在の出力世代を取消してから既存のprogress通知へ渡す。通知先の処理待ちでエラー世代の音声を継続させない。終了処理前の観測であり、公開APIのエラー型・有界メールボックス・終了後の未集計表示は維持する。出力未作成ならoutput=Noneとし、旧世代や準備先のカウンターを使わない。アイドルの準備失敗と正常終了には追加通知しない。
+
 ## 再生中HTTPの段階別診断（2026年10月21日）
 
 PreparedStreamを再生ワーカーへ渡す時点で、そのHLS用Httpだけに有限のRequestMeasurementsを作る。GETの応答待ち・本文受信・再試行待ち・待機を分け、現在段階の実時間、応答待ち／本文受信の最大時間、要求開始数と再試行待ち開始数を保持する。応答待ちはreqwestのsend全体であり、名前解決・接続・TLS・送信・応答ヘッダーのどれが遅いかまでは分離しない。試行数は送信完了やサーバー到達の証明ではない。再試行待ち数は取消で次を送らなかった場合も含む。各GETの終了・失敗・取消では待機へ戻す。
@@ -97,7 +129,7 @@ AdtsDecoder::decode_segment_pcm_controlledは所有ワーカーの世代取消�
 
 domain::ListeningAvailabilityはUnknown／Unavailable(reason)／CurrentOutputを区別し、app::playback::availabilityが取得や永続保存なしで算出する。放送前とライブ終了を先に判定し、現在のPlaybackSnapshotの局ID・開始終了・モード・正の出力フレームが一致する場合だけCurrentOutputとする。契約フラグや放送終了を配信許可へ変換せず、再生要求では従来の認証・配信条件確認を必ず行う。
 
-scripts/verify_tui_playback.pyは明示実行するmacOS向け手動検証である。0700の一時領域へ実行ファイルを独立コピーしSHA-256を報告、0600でセッションを一時複製する。番組一覧は毎回取得してメモリだけで選択し、PTYの有界な画面投影から数値診断を読み取る。UTF-8とCSIを分割受信できる増分処理を用い、端末内容をログへ出さない。検索0件時はcで画面が開いたことを確認してからEscを送る。SIGINT／SIGTERMでも子を終了して一時領域を削除する。
+scripts/verify_tui_playback.pyは明示実行するmacOS向け手動検証である。0700の一時領域へ実行ファイルを独立コピーしSHA-256を報告、0600でセッションを一時複製する。番組一覧は毎回取得してメモリだけで選択し、PTYの有界な画面投影から数値診断を読み取る。UTF-8とCSIを分割受信できる増分処理を用い、端末内容をログへ出さない。検索0件時はcで画面が開いたことを確認してからEscを送る。SIGINT／SIGTERM／SIGHUPでも子を終了して一時領域を削除する。
 
 ## 原点一致のEventBindingとジャンプ（2026年10月18日）
 
@@ -473,7 +505,7 @@ JSONは従来のprograms／schedules構造に、filters・source_program_count�
 
 `src/tui.rs`はRatatui 0.29.0・Crossterm 0.28.1の閲覧画面を持ち、Tokioのcurrent-thread実行環境で50msごとに通知と最大32件の入力を処理する。描画は状態の参照だけで通信・デコードを行わない。表示一致インデックスはバッチ受信／完了時に計算し、描画ごとの再フィルターを避ける。説明のプレビューと入力長は制限する。条件保存は画面終了後に行い、raw mode中へ保存エラーを出さない。
 
-端末復元ガードを初期化前に作り、通常終了・初期化失敗・エラー時にrestoreする。Ratatuiの採用版のpanic hookも復元を行う。Ctrl+CキーとSIGINTを終了要求へ変換する。終了時は取得を取り消して進捗チャネルを閉じ、runtimeの待機を200msに制限し、実行中HTTPの完了待ちを端末復元の条件にしない。画面からの再生と独立した認証・チャプター世代は接続済み。SIGKILLなどの強制終了での端末復元や受理済み更新の完了は保証しない。
+端末復元ガードを初期化前に作り、通常終了・初期化失敗・エラー時にrestoreする。Ratatuiの採用版のpanic hookも復元を行う。Ctrl+CキーとSIGINT／SIGTERM／SIGHUPを終了要求へ変換する。ctrlcのtermination機能を有効にし、登録済みハンドラーを共用する。終了時は取得を取り消して進捗チャネルを閉じ、runtimeの待機を200msに制限し、実行中HTTPの完了待ちを端末復元の条件にしない。画面からの再生と独立した認証・チャプター世代は接続済み。SIGKILLなどの強制終了での端末復元や受理済み更新の完了は保証しない。
 
 
 ## TUIの再生サービス（2026年10月17日）
