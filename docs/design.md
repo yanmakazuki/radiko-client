@@ -1,5 +1,15 @@
 # Rust製radiko TUIクライアントの設計
 
+## HLS初期化情報とfragment時刻の照合（2026年10月23日）
+
+連続再生はRangeなしのEXT-X-MAPを受け取り、初期化情報を最大1MiBで取得して有界fragmented AACデコーダーへ渡す。同一URIは再取得せず、URI変更時には新規取得する。署名更新等で同じ内容なら復号状態を維持し、内容変更・ADTSとの切替は明示不連続なしでは拒否する。不連続ではデコーダーと時刻照合を新規作成する。暗号化・初期化情報／音声のバイト範囲指定は引き続き拒否する。
+
+EXT-X-MAPはそのタグ以後の各セグメントへ、次のMAPまで適用する。fragmentの復号PCM期間とEXTINF、および観測されたPROGRAM-DATE-TIME差とtfdt差は2ms以内の一致を要求する。単一のtfdtをJST時刻へ直接変換しない。検索・認証・枠の権限確認・既存ADTSの復号・PCM容量2と2秒出力リングは維持する。
+
+## 単一AACトラックのfragmented MP4復号（2026年10月23日）
+
+FragmentedAacDecoderの明示APIは初期化情報を最大1MiB、media fragmentを最大8MiB、512パケット、PCMを最大4MiBに制限する。単一AACトラック・単一traf/trun/mdat・movie-fragment相対データ位置・編集リストなしに限る。tfdtの32/64bit開始時刻とtrunの期間を直接読み、次fragmentの開始・mfhd番号・実PCM期間を照合する。欠落・重複・未対応構成・取消・失敗では部分PCMとデコーダー／時刻状態を破棄する。tfdtはメディアの時刻であり、JST放送時刻やHLSのPROGRAM-DATE-TIMEとの対応は別途必要とする。HLSの初期化情報付き連続再生へ接続するが、実際の非ADTS配信での確認とは区別する。
+
 ## 隣接する完結コンテナの復号状態（2026年10月23日）
 
 ContainerAacDecoderは隣接する完結コンテナのASCが同一である間、AACの重なり・SBR状態を保持する。ASC変更はFormatChangedで拒否して状態を破棄し、明示的な不連続は新規インスタンスで開始する。取消・解析失敗・時間不一致・上限超過でも状態を破棄する。コンテナ単位の相対時刻検証であり、HLS絶対時刻との対応を保証しない。

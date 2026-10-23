@@ -193,12 +193,14 @@ def failure_diagnostics(text):
         ('aac_header', 'ADTSヘッダーが不正'),
         ('aac_truncated', 'ADTSフレームが途中で切れ'),
         ('aac_format_changed', 'AACの構成が変わりました'),
+        ('aac_container', 'AACコンテナ'),
         ('aac_decode', 'デコード:'),
         ('source_other', '配信取得:'),
     ]
     kind = next((kind for kind, phrase in categories if phrase in notice), 'other')
     status = re.search(r'HTTP (\d{3})', notice)
-    stages = [('segment', 'HLS音声取得:'), ('playlist', 'HLS一覧更新:')]
+    stages = [('segment', 'HLS音声取得:'), ('playlist', 'HLS一覧更新:'),
+              ('initialization', 'HLS初期化情報取得:')]
     stage = next((stage for stage, marker in stages if marker in notice), None)
     return dict(notice_visible=True, error_kind=kind,
                 http_status=int(status[1]) if status else None, source_stage=stage)

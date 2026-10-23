@@ -445,7 +445,8 @@ else:
             self.assertEqual(number(prefix + '今回の出力 12.3秒 / 不足 0フレーム', output), 12.3)
 
     def test_runtime_source_stage_is_allowlisted_and_never_inferred_from_program_text(self):
-        for stage, label in [('segment', 'HLS音声取得'), ('playlist', 'HLS一覧更新')]:
+        for stage, label in [('segment', 'HLS音声取得'), ('playlist', 'HLS一覧更新'),
+                             ('initialization', 'HLS初期化情報取得')]:
             notice = '再生停止: 配信取得: ' + label + ': 対象の番組または配信が見つかりません'
             result = failure_diagnostics(notice)
             self.assertEqual(result['source_stage'], stage)
@@ -453,6 +454,8 @@ else:
             self.assertIsNone(result['http_status'])
             self.assertIsNone(failure_diagnostics(notice + '\n' + '\n'.join(['body'] * 9))['source_stage'])
         self.assertIsNone(failure_diagnostics('再生停止: unknown-secret-url')['source_stage'])
+        self.assertEqual(failure_diagnostics('再生停止: デコード: AACコンテナの時刻またはデータ構造が不正です')['error_kind'],
+                         'aac_container')
 
     def test_every_utf8_and_csi_split_preserves_japanese_and_restoration(self):
         content = '\x1b[2J\x1b[2;3H再生位置\x1b[?1049l'.encode()

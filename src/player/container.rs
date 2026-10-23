@@ -69,7 +69,7 @@ fn decode_inner(
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|_| AacError::UnsupportedTransport)?
+        .map_err(|_| AacError::UnsupportedContainer)?
         .format;
     if cancelled() {
         return Err(AacError::Cancelled);
@@ -83,13 +83,13 @@ fn decode_inner(
         .codec_params
         .n_frames
         .filter(|&n| n > 0)
-        .ok_or(AacError::InvalidMetadata)?;
+        .ok_or(AacError::InvalidContainer)?;
     let time_base = track
         .codec_params
         .time_base
-        .ok_or(AacError::InvalidMetadata)?;
+        .ok_or(AacError::InvalidContainer)?;
     if time_base.numer == 0 || time_base.denom == 0 {
-        return Err(AacError::InvalidMetadata);
+        return Err(AacError::InvalidContainer);
     }
     let asc = track
         .codec_params
@@ -116,7 +116,7 @@ fn decode_inner(
             Ok(packet) => packet,
             Err(Error::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
                 if end != duration {
-                    return Err(AacError::TruncatedFrame);
+                    return Err(AacError::InvalidContainer);
                 }
                 let refs: Vec<_> = packets.iter().map(|data| data.as_ref()).collect();
                 let pcm = decoder.decode_packets_pcm_controlled(
@@ -130,7 +130,7 @@ fn decode_inner(
                         * u128::from(time_base.numer)
                         * u128::from(pcm.summary.sample_rate)
                 {
-                    return Err(AacError::InvalidMetadata);
+                    return Err(AacError::InvalidContainer);
                 }
                 if cancelled() {
                     return Err(AacError::Cancelled);
@@ -146,13 +146,13 @@ fn decode_inner(
             return Err(AacError::TooManyPackets);
         }
         if packet.ts() != end || packet.dur() == 0 {
-            return Err(AacError::InvalidMetadata);
+            return Err(AacError::InvalidContainer);
         }
         end = end
             .checked_add(packet.dur())
-            .ok_or(AacError::InvalidMetadata)?;
+            .ok_or(AacError::InvalidContainer)?;
         if end > duration {
-            return Err(AacError::InvalidMetadata);
+            return Err(AacError::InvalidContainer);
         }
         total_bytes = total_bytes
             .checked_add(packet.data.len())
@@ -278,7 +278,7 @@ mod tests {
         init[mdhd + 20..mdhd + 24].copy_from_slice(&0u32.to_be_bytes());
         assert_eq!(
             decode_aac_pcm_controlled([init, media].concat(), None, || false).unwrap_err(),
-            AacError::InvalidMetadata
+            AacError::InvalidContainer
         );
     }
 
@@ -341,7 +341,7 @@ mod tests {
         bytes[mdhd + 16..mdhd + 20].copy_from_slice(&48000u32.to_be_bytes());
         assert_eq!(
             decode_aac_pcm_controlled(bytes, None, || false).unwrap_err(),
-            AacError::InvalidMetadata
+            AacError::InvalidContainer
         );
         let (init, media) = fixtures::mp4_aac(&[0x13, 0x08]);
         let mut bytes = [init, media].concat();

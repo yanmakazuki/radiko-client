@@ -1,5 +1,15 @@
 # アーキテクチャ設計
 
+## HLSのMAPと復号方式の所有（2026年10月23日）
+
+radiko::stream::playback::HlsStreamは現在一覧の対象位置までの最後のMAPを求め、URIとArc<[u8]>のキャッシュを一つだけ保持する。取得は音声と同じく資格情報なし・既存Httpの取消／サイズ／接続先制限を使い、上限1MiB、失敗段階は固定のHLS初期化情報取得とする。Segmentは共有初期化情報とEXTINF期間を所有し、PCMキューへは保持しない。URI変更の取得中には旧ワーカー側の共有初期化情報と新規分が各最大1MiB存在し得る。
+
+player::playbackのSegmentDecoderはADTSとfragmented AACを分けて保持する。後者は初期化情報の内容を照合し、同じ内容の新しいArcへ置換して余分な再比較を避ける。初期化情報変更や方式切替ではFormatChanged、不連続では方式を含めて再生成する。復号後の期間・tfdtと番組時刻差を2msで照合し、シーク時は従来のPROGRAM-DATE-TIMEによるtrim_toを使う。初期化情報・パーサー・復号はワーカー内で完結し、コールバックには渡さない。コンテナの不正時刻・範囲はInvalidContainer、未対応構成はUnsupportedContainerとし、ID3・ADTS transportの失敗と区別する。手動検証にはinitializationとaac_containerの固定分類だけを渡す。
+
+## fragmentの時刻とパケットの直接検証（2026年10月23日）
+
+player::fragmentedは初期化情報のASCだけをSymphoniaから取り出し、mediaのパケット位置・長さ・tfdt時刻は自前の有界ボックス読取で検証する。初期化は空のサンプルテーブルと一つのAAC記述・一つのtrexを要求し、外部データ参照・保護記述・編集を拒否する。tfhd/trexのサンプル既定値をtrun明示値で上書きし、データ範囲とmdat全体の一致、正のサンプル長・期間、PCM期間との整数比一致を確認してRawAacDecoderの出力を返す。初期化変更・明示不連続では新規インスタンスを用いる。参照した構造条件は[W3C ISO BMFF Byte Stream Format](https://www.w3.org/TR/mse-byte-stream-format-isobmff/)によるが、この限定APIをMSE全体への準拠とはしない。
+
 ## コンテナ間のAAC状態所有（2026年10月23日）
 
 player::container::ContainerAacDecoderがASCの有界コピーとRawAacDecoderを所有する。decode_pcm_controlledはコンテナ解析をcatch_unwind境界で行い、ASC一致時だけ既存デコーダーを再利用する。解析・復号・最終時刻検査・取消のどの失敗でもASCとデコーダーを消去する。単発decode_aac_pcm_controlledは新規インスタンスへ委譲する。

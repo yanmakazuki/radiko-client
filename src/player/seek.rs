@@ -392,6 +392,8 @@ mod tests {
         fn poll_segment(&mut self) -> Result<Next, ProbeError> {
             Ok(match self.bytes.take() {
                 Some(bytes) => Next::Segment(Segment {
+                    initialization: None,
+                    duration: None,
                     bytes,
                     codec: None,
                     discontinuity: false,

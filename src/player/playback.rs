@@ -2,11 +2,12 @@
 use super::{
     aac::{AacError, AdtsDecoder, DecodedPcm},
     diagnostics::{Stage, Tracker},
+    fragmented::FragmentedAacDecoder,
     output::{ContinuousOutput, OutputError, OutputSummary, StopToken},
 };
 use crate::radiko::stream::{
     ProbeError, ProbeMode,
-    playback::{Next, SegmentSource, StreamInfo},
+    playback::{Next, Segment, SegmentSource, StreamInfo},
 };
 use chrono::Utc;
 use std::{
@@ -212,6 +213,97 @@ fn send(tx: &mpsc::SyncSender<Event>, mut event: Event, stop: &StopToken) -> boo
 // One extra decoded segment absorbs acquisition jitter without enlarging the device ring.
 const PCM_QUEUE_CAPACITY: usize = 2;
 
+enum SegmentDecoder {
+    Adts(Box<AdtsDecoder>),
+    Fragmented {
+        initialization: std::sync::Arc<[u8]>,
+        decoder: Box<FragmentedAacDecoder>,
+        stamp: Option<(u64, chrono::DateTime<chrono::FixedOffset>)>,
+    },
+}
+
+fn decode_segment_pcm(
+    state: &mut Option<SegmentDecoder>,
+    segment: &Segment,
+    stop: &StopToken,
+) -> Result<DecodedPcm, AacError> {
+    if stop.is_cancelled() {
+        return Err(AacError::Cancelled);
+    }
+    if segment.discontinuity {
+        *state = None;
+    }
+    if state.is_none() {
+        *state = Some(match &segment.initialization {
+            Some(init) => {
+                if init.len() > 1024 * 1024 {
+                    return Err(AacError::TooLarge);
+                }
+                SegmentDecoder::Fragmented {
+                    decoder: Box::new(FragmentedAacDecoder::new(init.to_vec())?),
+                    initialization: init.clone(),
+                    stamp: None,
+                }
+            }
+            None => SegmentDecoder::Adts(Box::default()),
+        });
+    }
+    match (
+        state.as_mut().ok_or(AacError::DecodeFailed)?,
+        &segment.initialization,
+    ) {
+        (SegmentDecoder::Adts(decoder), None) => {
+            decoder.decode_segment_pcm_controlled(&segment.bytes, segment.codec.as_deref(), || {
+                stop.is_cancelled()
+            })
+        }
+        (
+            SegmentDecoder::Fragmented {
+                initialization,
+                decoder,
+                stamp,
+            },
+            Some(init),
+        ) => {
+            if !std::sync::Arc::ptr_eq(initialization, init)
+                && initialization.as_ref() != init.as_ref()
+            {
+                return Err(AacError::FormatChanged);
+            }
+            *initialization = init.clone();
+            let result =
+                decoder.decode_pcm_controlled(&segment.bytes, segment.codec.as_deref(), || {
+                    stop.is_cancelled()
+                })?;
+            let expected = segment.duration.ok_or(AacError::InvalidContainer)?;
+            if result.pcm.summary.media_duration.abs_diff(expected) > Duration::from_millis(2) {
+                return Err(AacError::InvalidContainer);
+            }
+            if let Some(current) = segment.starts_at {
+                if let Some((time, previous)) = *stamp {
+                    let ticks = result
+                        .decode_time
+                        .checked_sub(time)
+                        .ok_or(AacError::InvalidContainer)?;
+                    let media =
+                        Duration::try_from_secs_f64(ticks as f64 / f64::from(result.timescale))
+                            .map_err(|_| AacError::InvalidContainer)?;
+                    let wall = current
+                        .signed_duration_since(previous)
+                        .to_std()
+                        .map_err(|_| AacError::InvalidContainer)?;
+                    if media.abs_diff(wall) > Duration::from_millis(2) {
+                        return Err(AacError::InvalidContainer);
+                    }
+                }
+                *stamp = Some((result.decode_time, current));
+            }
+            Ok(result.pcm)
+        }
+        _ => Err(AacError::FormatChanged),
+    }
+}
+
 pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker, PcmReceiver) {
     let (tx, rx) = mpsc::sync_channel(PCM_QUEUE_CAPACITY);
     let http_diagnostics = source.enable_http_diagnostics();
@@ -226,7 +318,7 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                 tracker.enter(stage, Instant::now());
             }
         };
-        let mut decoder = AdtsDecoder::new();
+        let mut decoder = None;
         let info = source.info().clone();
         let target = chrono::Duration::from_std(info.position)
             .ok()
@@ -267,15 +359,8 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                     if control.is_cancelled() {
                         break;
                     }
-                    if segment.discontinuity {
-                        decoder = AdtsDecoder::new();
-                    }
                     enter(Stage::Decode);
-                    let decoded = decoder.decode_segment_pcm_controlled(
-                        &segment.bytes,
-                        segment.codec.as_deref(),
-                        || control.is_cancelled(),
-                    );
+                    let decoded = decode_segment_pcm(&mut decoder, &segment, &control);
                     enter(Stage::Backpressure);
                     match decoded {
                         Ok(mut pcm) => {
@@ -1355,6 +1440,273 @@ mod tests {
             position: Duration::ZERO,
         }
     }
+    fn mapped_segment(raw: &[u8], time: u64, sequence: u32) -> Segment {
+        let (init, bytes) = crate::player::fixtures::fragmented_access_units(
+            &[0x13, 0x08],
+            &[raw; 3],
+            24000,
+            1,
+            time,
+            sequence,
+        );
+        Segment {
+            bytes,
+            initialization: Some(init.into()),
+            duration: Some(Duration::from_millis(128)),
+            codec: Some("mp4a.40.2".into()),
+            discontinuity: false,
+            starts_at: None,
+        }
+    }
+
+    #[test]
+    fn mapped_fragment_worker_delivers_continuous_pcm_without_opening_an_output_device() {
+        let (_, media) = crate::player::fixtures::mp4_aac(&[0x13, 0x08]);
+        let raw = &media[8..];
+        let source_info = info(60_000);
+        let mut first = mapped_segment(raw, 1000, 1);
+        let mut second = mapped_segment(raw, 4072, 2);
+        first.starts_at = Some(source_info.starts_at);
+        second.starts_at = Some(source_info.starts_at + chrono::Duration::milliseconds(128));
+        let (mut worker, receiver) = worker(
+            Source {
+                info: source_info,
+                events: [
+                    Ok(Next::Segment(first)),
+                    Ok(Next::Segment(second)),
+                    Ok(Next::End),
+                ]
+                .into(),
+            },
+            StopToken::default(),
+        );
+        let mut reference = crate::player::aac::RawAacDecoder::new(&[0x13, 0x08]).unwrap();
+        for _ in 0..2 {
+            let Event::Pcm(pcm) = receiver.recv_timeout(Duration::from_secs(2)).unwrap() else {
+                panic!()
+            };
+            assert_eq!(
+                pcm.into_pcm().samples,
+                reference
+                    .decode_packets_pcm(&[raw; 3], None)
+                    .unwrap()
+                    .samples
+            );
+        }
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::End
+        ));
+        worker.handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn mapped_fragments_reach_the_program_end_through_the_output_loop() {
+        let (_, media) = crate::player::fixtures::mp4_aac(&[0x13, 0x08]);
+        let raw = &media[8..];
+        let source = Source {
+            info: info(384),
+            events: (0..3)
+                .map(|i| {
+                    Ok(Next::Segment(mapped_segment(
+                        raw,
+                        1000 + u64::from(i) * 3072,
+                        i + 1,
+                    )))
+                })
+                .collect(),
+        };
+        let report = play_with(source, None, StopToken::default(), |_| {}, sink).unwrap();
+        assert_eq!(report.reason, EndReason::ProgramEnd);
+        assert_eq!(report.output.unwrap().frames, 9216);
+    }
+
+    #[test]
+    fn mapped_seek_uses_the_broadcast_anchor_and_not_the_large_media_decode_time() {
+        let (_, media) = crate::player::fixtures::mp4_aac(&[0x13, 0x08]);
+        let raw = &media[8..];
+        let mut source_info = info(384);
+        source_info.position = Duration::from_millis(64);
+        let start = source_info.starts_at;
+        let source = Source {
+            info: source_info.clone(),
+            events: (0..3)
+                .map(|i| {
+                    let mut segment =
+                        mapped_segment(raw, (1u64 << 40) + u64::from(i) * 3072, i + 1);
+                    segment.starts_at =
+                        Some(start + chrono::Duration::milliseconds(i64::from(i) * 128));
+                    Ok(Next::Segment(segment))
+                })
+                .collect(),
+        };
+        let report = play_with(source, None, StopToken::default(), |_| {}, sink).unwrap();
+        assert_eq!(report.reason, EndReason::ProgramEnd);
+        assert_eq!(report.output.unwrap().frames, 7680);
+        // A tfdt alone never supplies the missing wall-clock broadcast anchor.
+        let source = Source {
+            info: source_info,
+            events: [Ok(Next::Segment(mapped_segment(raw, 1u64 << 40, 1)))].into(),
+        };
+        let result = play_with(
+            source,
+            None,
+            StopToken::default(),
+            |_| {},
+            |_, _, _, _| -> Result<Sink, OutputError> {
+                panic!("an unbound seek must fail before opening output")
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PlaybackError::Source(ProbeError::InvalidPlaylist))
+        ));
+    }
+
+    #[test]
+    #[ignore = "explicit muted output, no network/account; five seconds, RADIKO_FRAGMENT_SECONDS=1..1800"]
+    fn native_muted_fragmented_aac_reaches_the_explicit_output_limit() {
+        struct Fragments {
+            info: StreamInfo,
+            raw: Vec<u8>,
+            sequence: u32,
+        }
+        impl SegmentSource for Fragments {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                self.sequence += 1;
+                let (init, bytes) = crate::player::fixtures::fragmented_access_units(
+                    &[0x11, 0x88],
+                    &vec![self.raw.as_slice(); 100],
+                    48000,
+                    1,
+                    (1u64 << 40) + u64::from(self.sequence - 1) * 102400,
+                    self.sequence,
+                );
+                Ok(Next::Segment(Segment {
+                    bytes,
+                    initialization: Some(init.into()),
+                    duration: Some(Duration::from_secs_f64(102400.0 / 48000.0)),
+                    codec: Some("mp4a.40.2".into()),
+                    discontinuity: false,
+                    starts_at: None,
+                }))
+            }
+        }
+        let seconds = match std::env::var("RADIKO_FRAGMENT_SECONDS") {
+            Ok(value) => value
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (1..=1800).contains(n))
+                .expect("RADIKO_FRAGMENT_SECONDS must be 1..1800"),
+            Err(std::env::VarError::NotPresent) => 5,
+            Err(_) => panic!("RADIKO_FRAGMENT_SECONDS must be numeric"),
+        };
+        let adts = packet(48000);
+        let source = Fragments {
+            info: info((i64::from(seconds) + 60) * 1000),
+            raw: adts[7..].to_vec(),
+            sequence: 0,
+        };
+        let stop = StopToken::default();
+        let (_sender, receiver) = mpsc::channel();
+        let mut control = super::super::seek::Controller::new(receiver, stop.clone(), |_| {
+            panic!("no preparation requested")
+        });
+        control.volume = 0;
+        control.notification_interval = Duration::from_secs(30);
+        let began = Instant::now();
+        let deadline_stop = stop.clone();
+        let watchdog = thread::spawn(move || {
+            while !deadline_stop.is_cancelled()
+                && began.elapsed() < Duration::from_secs(u64::from(seconds) + 30)
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            deadline_stop.cancel();
+        });
+        let result = play_controlled(source, Some(seconds), stop, &mut control, |snapshot| {
+            if let Some(output) = snapshot.output {
+                println!(
+                    "synthetic_fragmented_progress frames={} underrun_frames={}",
+                    output.frames, output.underrun_frames
+                );
+            }
+        });
+        watchdog.join().unwrap();
+        let report = result.unwrap();
+        let output = report.output.unwrap();
+        println!(
+            "synthetic_fragmented_muted seconds={seconds} frames={} rate={} channels={} underrun_frames={} wall_ms={}",
+            output.frames,
+            output.sample_rate,
+            output.channels,
+            output.underrun_frames,
+            began.elapsed().as_millis()
+        );
+        assert_eq!(report.reason, EndReason::Limit);
+        assert_eq!(output.frames, u64::from(seconds) * 48000);
+        assert_eq!(output.underrun_frames, 0);
+    }
+
+    #[test]
+    fn mapped_fragments_reject_changed_initialization_and_wrong_hls_timing_until_discontinuity() {
+        let (_, media) = crate::player::fixtures::mp4_aac(&[0x13, 0x08]);
+        let raw = &media[8..];
+        let stop = StopToken::default();
+        let mut first = mapped_segment(raw, 1000, 1);
+        first.starts_at = Some(info(60_000).starts_at);
+        for wrong_stamp in [false, true] {
+            let mut state = None;
+            decode_segment_pcm(&mut state, &first, &stop).unwrap();
+            let mut next = mapped_segment(raw, 4072, 2);
+            if wrong_stamp {
+                next.starts_at = first
+                    .starts_at
+                    .map(|time| time + chrono::Duration::seconds(2));
+            } else {
+                next.duration = Some(Duration::from_secs(2));
+            }
+            assert_eq!(
+                decode_segment_pcm(&mut state, &next, &stop).unwrap_err(),
+                AacError::InvalidContainer
+            );
+        }
+        let mut state = None;
+        let baseline = decode_segment_pcm(&mut state, &first, &stop).unwrap();
+        let mut changed = mapped_segment(raw, 4072, 2);
+        let mut init = changed.initialization.as_ref().unwrap().to_vec();
+        let mvhd = init.windows(4).position(|w| w == b"mvhd").unwrap();
+        init[mvhd + 8..mvhd + 12].copy_from_slice(&1u32.to_be_bytes());
+        changed.initialization = Some(init.into());
+        assert_eq!(
+            decode_segment_pcm(&mut state, &changed, &stop).unwrap_err(),
+            AacError::FormatChanged
+        );
+        changed.discontinuity = true;
+        assert_eq!(
+            decode_segment_pcm(&mut state, &changed, &stop)
+                .unwrap()
+                .samples,
+            baseline.samples
+        );
+        let mut adts = Segment {
+            bytes: packet(24000),
+            initialization: None,
+            duration: None,
+            codec: None,
+            discontinuity: false,
+            starts_at: None,
+        };
+        assert_eq!(
+            decode_segment_pcm(&mut state, &adts, &stop).unwrap_err(),
+            AacError::FormatChanged
+        );
+        adts.discontinuity = true;
+        assert!(decode_segment_pcm(&mut state, &adts, &stop).is_ok());
+    }
     fn packet(rate: u32) -> Vec<u8> {
         use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, write_adts_header};
         let mut encoder = AacEncoder::new(AacEncoderConfig::default());
@@ -1374,6 +1726,8 @@ mod tests {
     }
     fn event(bytes: Vec<u8>, discontinuity: bool) -> Result<Next, ProbeError> {
         Ok(Next::Segment(Segment {
+            initialization: None,
+            duration: None,
             bytes,
             codec: Some("mp4a.40.2".into()),
             discontinuity,
@@ -1615,6 +1969,8 @@ mod tests {
             fn poll_segment(&mut self) -> Result<Next, ProbeError> {
                 Ok(match self.bytes.take() {
                     Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
                         bytes,
                         codec: None,
                         discontinuity: false,
@@ -1820,6 +2176,8 @@ mod tests {
             fn poll_segment(&mut self) -> Result<Next, ProbeError> {
                 Ok(match self.bytes.take() {
                     Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
                         bytes,
                         codec: None,
                         discontinuity: false,
@@ -1909,6 +2267,8 @@ mod tests {
             fn poll_segment(&mut self) -> Result<Next, ProbeError> {
                 Ok(match self.bytes.take() {
                     Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
                         bytes,
                         codec: None,
                         discontinuity: false,

@@ -18,7 +18,7 @@ pub(super) fn validate(bytes: &[u8]) -> Result<(), AacError> {
             .windows(4)
             .position(|window| window == b"ftyp")
         {
-            let start = marker.checked_sub(4).ok_or(AacError::InvalidMetadata)?;
+            let start = marker.checked_sub(4).ok_or(AacError::InvalidContainer)?;
             return walk(&bytes[start..], 0, &mut 0, &mut 0);
         }
         return Ok(());
@@ -29,9 +29,9 @@ pub(super) fn validate(bytes: &[u8]) -> Result<(), AacError> {
 fn word(bytes: &[u8], offset: usize) -> Result<u32, AacError> {
     let value = bytes
         .get(offset..offset + 4)
-        .ok_or(AacError::InvalidMetadata)?;
+        .ok_or(AacError::InvalidContainer)?;
     Ok(u32::from_be_bytes(
-        value.try_into().map_err(|_| AacError::InvalidMetadata)?,
+        value.try_into().map_err(|_| AacError::InvalidContainer)?,
     ))
 }
 
@@ -42,7 +42,7 @@ fn walk(
     samples: &mut u32,
 ) -> Result<(), AacError> {
     if depth > 16 {
-        return Err(AacError::InvalidMetadata);
+        return Err(AacError::InvalidContainer);
     }
     while !bytes.is_empty() {
         *boxes += 1;
@@ -50,19 +50,19 @@ fn walk(
             return Err(AacError::TooManyPackets);
         }
         let size = word(bytes, 0)?;
-        let kind = bytes.get(4..8).ok_or(AacError::InvalidMetadata)?;
+        let kind = bytes.get(4..8).ok_or(AacError::InvalidContainer)?;
         let (size, header) = match size {
             0 => (bytes.len(), 8),
             1 => {
-                let value = bytes.get(8..16).ok_or(AacError::InvalidMetadata)?;
+                let value = bytes.get(8..16).ok_or(AacError::InvalidContainer)?;
                 let size =
-                    u64::from_be_bytes(value.try_into().map_err(|_| AacError::InvalidMetadata)?);
+                    u64::from_be_bytes(value.try_into().map_err(|_| AacError::InvalidContainer)?);
                 (usize::try_from(size).map_err(|_| AacError::TooLarge)?, 16)
             }
             n => (n as usize, 8),
         };
         if size < header || size > bytes.len() {
-            return Err(AacError::InvalidMetadata);
+            return Err(AacError::InvalidContainer);
         }
         let payload = &bytes[header..size];
         match kind {
@@ -136,7 +136,7 @@ mod tests {
         for _ in 0..18 {
             bytes = atom(b"moov", &bytes);
         }
-        assert_eq!(validate(&bytes), Err(AacError::InvalidMetadata));
+        assert_eq!(validate(&bytes), Err(AacError::InvalidContainer));
         let table = atom(
             b"stts",
             &[0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 255, 0, 0, 4, 0],
@@ -151,7 +151,7 @@ mod tests {
         }
         assert_eq!(
             validate(&atom(b"moov", &[0; 4])),
-            Err(AacError::InvalidMetadata)
+            Err(AacError::InvalidContainer)
         );
         let many = atom(b"moov", &atom(b"free", &[]).repeat(MAX_BOXES));
         assert_eq!(validate(&many), Err(AacError::TooManyPackets));

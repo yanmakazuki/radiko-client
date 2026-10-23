@@ -222,7 +222,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "設定情報付きAACの先頭パケットを純Rustでデコード成功: {}Hz / {}ch / {}フレーム / SBR検出: {}",
                     summary.sample_rate, summary.channels, summary.frames, summary.sbr_detected
                 );
-                println!("非ADTSの音声出力・連続再生は未接続です。PSの明示シグナルは未確認です");
+                println!(
+                    "先頭パケットの検証結果です。非ADTSの実配信・PSの明示シグナルは未確認です"
+                );
             }
             DecodeProbe::AacFailed(error) => println!("サンプル取得済み。AAC検証失敗: {error}"),
             DecodeProbe::Decoded {

@@ -14,6 +14,8 @@ pub struct StreamInfo {
 }
 pub struct Segment {
     pub bytes: Vec<u8>,
+    pub initialization: Option<std::sync::Arc<[u8]>>,
+    pub duration: Option<Wait>,
     pub codec: Option<String>,
     pub discontinuity: bool,
     pub starts_at: Option<DateTime<FixedOffset>>,
@@ -246,8 +248,13 @@ fn validate_media(media: &m3u8_rs::MediaPlaylist) -> Result<(), ProbeError> {
         || media.target_duration > 60
         || media.i_frames_only
         || media.segments.iter().any(|s| {
-            s.map.is_some()
+            s.map
+                .as_ref()
+                .is_some_and(|map| map.byte_range.is_some() || map.uri.is_empty())
                 || s.byte_range.is_some()
+                || !s.duration.is_finite()
+                || s.duration <= 0.0
+                || s.duration > 120.0
                 || s.key.as_ref().is_some_and(|k| k.method != KeyMethod::None)
         })
     {
@@ -269,6 +276,7 @@ struct HlsStream<F> {
     next: u64,
     discontinuity: Option<u64>,
     reload_at: Instant,
+    initialization: Option<(Url, std::sync::Arc<[u8]>)>,
 }
 impl<F: Fetch> HlsStream<F> {
     fn new(
@@ -289,6 +297,7 @@ impl<F: Fetch> HlsStream<F> {
             discontinuity: None,
             reload_at: Instant::now(),
             media,
+            initialization: None,
         })
     }
     fn poll(&mut self, now: Instant) -> Result<Next, ProbeError> {
@@ -298,6 +307,31 @@ impl<F: Fetch> HlsStream<F> {
         let index = usize::try_from(self.next - self.media.media_sequence)
             .map_err(|_| ProbeError::InvalidPlaylist)?;
         if let Some(segment) = self.media.segments.get(index) {
+            let initialization = if let Some(map) = self.media.segments[..=index]
+                .iter()
+                .rev()
+                .find_map(|item| item.map.as_ref())
+            {
+                let url = self.url.join(&map.uri).map_err(|_| ProbeError::UnsafeUrl)?;
+                if self
+                    .initialization
+                    .as_ref()
+                    .is_none_or(|(current, _)| current != &url)
+                {
+                    let reply = self
+                        .http
+                        .get(url.clone(), HeaderMap::new(), TEXT_LIMIT, None, true)
+                        .map_err(|error| error.at("HLS初期化情報取得"))?;
+                    if reply.bytes.is_empty() {
+                        return Err(ProbeError::InvalidPlaylist);
+                    }
+                    self.initialization = Some((url, reply.bytes.into()));
+                }
+                self.initialization.as_ref().map(|(_, bytes)| bytes.clone())
+            } else {
+                self.initialization = None;
+                None
+            };
             let discontinuity = self.media.segments[..=index]
                 .iter()
                 .filter(|s| s.discontinuity)
@@ -329,6 +363,11 @@ impl<F: Fetch> HlsStream<F> {
                 .ok_or(ProbeError::InvalidPlaylist)?;
             return Ok(Next::Segment(Segment {
                 bytes,
+                initialization,
+                duration: Some(
+                    Wait::try_from_secs_f64(f64::from(segment.duration))
+                        .map_err(|_| ProbeError::InvalidPlaylist)?,
+                ),
                 codec: self.codec.clone(),
                 discontinuity: reset,
                 starts_at: segment_time(&self.media, index),
@@ -470,7 +509,8 @@ mod tests {
                     .expect("only one request is allowed"))
             }
         }
-        for reload in [false, true] {
+        for target in ["segment", "playlist", "initialization"] {
+            let reload = target == "playlist";
             for cause in [
                 ProbeError::NotFound,
                 ProbeError::Network,
@@ -480,6 +520,15 @@ mod tests {
                 ProbeError::Cancelled,
             ] {
                 let original = cause.to_string();
+                let mut initial =
+                    String::from_utf8(media(0, 1, false, "synthetic-secret", false)).unwrap();
+                if target == "initialization" {
+                    initial = initial.replacen(
+                        "#EXTINF",
+                        "#EXT-X-MAP:URI=\"init.mp4?signature=synthetic-secret\"\n#EXTINF",
+                        1,
+                    );
+                }
                 let mut source = HlsStream::new(
                     FailingFetch {
                         error: RefCell::new(Some(cause)),
@@ -488,7 +537,7 @@ mod tests {
                     Url::parse("https://radiko.jp/secret/media.m3u8?signature=synthetic-secret")
                         .unwrap(),
                     HeaderMap::new(),
-                    parsed(&media(0, 1, false, "synthetic-secret", false)),
+                    parsed(initial.as_bytes()),
                     None,
                 )
                 .unwrap();
@@ -498,10 +547,10 @@ mod tests {
                 };
                 assert_eq!(
                     stage,
-                    if reload {
-                        "HLS一覧更新"
-                    } else {
-                        "HLS音声取得"
+                    match target {
+                        "playlist" => "HLS一覧更新",
+                        "initialization" => "HLS初期化情報取得",
+                        _ => "HLS音声取得",
                     }
                 );
                 assert_eq!(error.to_string(), original);
@@ -577,6 +626,53 @@ mod tests {
         assert!(source.http.steps.borrow().is_empty());
     }
     #[test]
+    fn initialization_is_bounded_shared_and_reacquired_only_when_its_uri_changes() {
+        let mapped = |first, count, end, name| {
+            String::from_utf8(media(first, count, end, "a", false))
+                .unwrap()
+                .replacen("#EXTINF", &format!("#EXT-X-MAP:URI=\"{name}\"\n#EXTINF"), 1)
+                .into_bytes()
+        };
+        let mut source = reader(
+            &mapped(0, 2, false, "init.mp4?sig=a"),
+            vec![
+                ("/audio/init.mp4", vec![8]),
+                ("/audio/s0.aac", vec![0]),
+                ("/audio/s1.aac", vec![1]),
+                ("/audio/media.m3u8", mapped(1, 2, true, "init.mp4?sig=b")),
+                ("/audio/init.mp4", vec![8]),
+                ("/audio/s2.aac", vec![2]),
+            ],
+        );
+        let Next::Segment(first) = source.poll(Instant::now()).unwrap() else {
+            panic!()
+        };
+        let Next::Segment(second) = source.poll(Instant::now()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(first.duration, Some(Wait::from_secs(5)));
+        assert!(std::sync::Arc::ptr_eq(
+            first.initialization.as_ref().unwrap(),
+            second.initialization.as_ref().unwrap()
+        ));
+        let Next::Segment(third) = source.poll(Instant::now()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(first.initialization, third.initialization);
+        assert!(!third.discontinuity);
+        assert!(matches!(source.poll(Instant::now()).unwrap(), Next::End));
+        assert!(source.http.steps.borrow().is_empty());
+    }
+
+    #[test]
+    fn invalid_segment_durations_are_rejected_before_fetching_initialization() {
+        for duration in [f32::NAN, f32::INFINITY, 0.0, -1.0, 121.0] {
+            let mut media = parsed(&media(0, 1, true, "a", false));
+            media.segments[0].duration = duration;
+            assert!(validate_media(&media).is_err());
+        }
+    }
+    #[test]
     fn missing_or_rewound_sequence_stops_instead_of_skipping_or_replaying_segments() {
         for first in [9, 12] {
             let mut source = reader(
@@ -595,10 +691,10 @@ mod tests {
         }
     }
     #[test]
-    fn unsupported_encryption_maps_and_ranges_are_rejected_before_segment_requests() {
+    fn unsupported_encryption_and_ranges_are_rejected_before_segment_requests() {
         for tag in [
             "#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n",
-            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"10@0\"\n",
             "#EXT-X-BYTERANGE:10@0\n",
         ] {
             let text = format!("#EXTM3U\n#EXT-X-TARGETDURATION:5\n{tag}#EXTINF:5,\ns0.aac\n");

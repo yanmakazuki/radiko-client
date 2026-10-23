@@ -4,6 +4,7 @@ pub mod container;
 pub mod diagnostics;
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub mod fragmented;
 mod mp4_limits;
 pub mod output;
 pub mod playback;
@@ -201,7 +202,7 @@ mod tests {
             );
             assert_eq!(
                 container::decode_aac_pcm_controlled(bytes, None, || false).unwrap_err(),
-                aac::AacError::InvalidMetadata
+                aac::AacError::InvalidContainer
             );
         }
     }

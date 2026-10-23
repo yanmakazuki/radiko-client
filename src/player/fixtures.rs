@@ -136,7 +136,18 @@ pub(crate) fn mp4_access_units(
 }
 
 pub(crate) fn fragmented_aac(asc: &[u8], packets: &[&[u8]], timestamp: u64) -> (Vec<u8>, Vec<u8>) {
-    let (mut init, _) = mp4_access_units(asc, &[], 24000, 1);
+    fragmented_access_units(asc, packets, 24000, 1, timestamp, 1)
+}
+
+pub(crate) fn fragmented_access_units(
+    asc: &[u8],
+    packets: &[&[u8]],
+    core_rate: u32,
+    channels: u16,
+    timestamp: u64,
+    sequence: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    let (mut init, _) = mp4_access_units(asc, &[], core_rate, channels);
     let moov = init.windows(4).position(|w| w == b"moov").unwrap() - 4;
     let mvex = atom(b"mvex", atom(b"trex", words(&[0, 1, 1, 1024, 0, 0])));
     let size = (init.len() - moov + mvex.len()) as u32;
@@ -146,14 +157,18 @@ pub(crate) fn fragmented_aac(asc: &[u8], packets: &[&[u8]], timestamp: u64) -> (
         atom(
             b"moof",
             [
-                atom(b"mfhd", words(&[0, 1])),
+                atom(b"mfhd", words(&[0, sequence])),
                 atom(
                     b"traf",
                     [
                         atom(b"tfhd", words(&[0x20000, 1])),
                         atom(
                             b"tfdt",
-                            [words(&[0x1000000]), timestamp.to_be_bytes().to_vec()].concat(),
+                            if let Ok(time) = u32::try_from(timestamp) {
+                                words(&[0, time])
+                            } else {
+                                [words(&[0x1000000]), timestamp.to_be_bytes().to_vec()].concat()
+                            },
                         ),
                         atom(
                             b"trun",
