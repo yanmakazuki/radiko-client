@@ -1,6 +1,10 @@
 //! メモリ内でのデコード検証と容量制限付き音声出力。録音ファイルは保存しない。
 pub mod aac;
+pub mod container;
 pub mod diagnostics;
+#[cfg(test)]
+pub(crate) mod fixtures;
+mod mp4_limits;
 pub mod output;
 pub mod playback;
 pub mod seek;
@@ -26,6 +30,7 @@ pub enum DecodeProbe {
     UnsupportedCodec,
     UnsupportedDeclaredCodec,
     AacDecoded(aac::AacSummary),
+    RawAacDecoded(aac::AacSummary),
     AacFailed(aac::AacError),
     DecodeFailed,
     NoAudio,
@@ -43,16 +48,7 @@ pub fn probe_declared_sample(bytes: Vec<u8>, declared_codec: Option<&str>) -> De
             Err(error) => DecodeProbe::AacFailed(error),
         };
     }
-    if declared_codec.is_some_and(|codecs| {
-        codecs
-            .split(',')
-            .any(|codec| matches!(codec.trim(), "mp4a.40.5" | "mp4a.40.29"))
-    }) {
-        // HE-AAC outside ADTS is not wired to the new decoder yet.
-        // Keep the Symphonia fallback from reporting AAC core-only success.
-        return DecodeProbe::UnsupportedDeclaredCodec;
-    }
-    probe_symphonia(bytes)
+    probe_symphonia(bytes, declared_codec)
 }
 
 pub fn probe_sample(bytes: Vec<u8>) -> DecodeProbe {
@@ -88,11 +84,36 @@ pub(crate) fn audio_offset(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-fn probe_symphonia(mut bytes: Vec<u8>) -> DecodeProbe {
+fn probe_symphonia(bytes: Vec<u8>, declared_codec: Option<&str>) -> DecodeProbe {
+    // The pinned container parser can panic on a missing ES descriptor. Keep this
+    // third-party parsing boundary from unwinding through the probe caller.
+    std::panic::catch_unwind(|| probe_symphonia_inner(bytes, declared_codec))
+        .unwrap_or(DecodeProbe::DecodeFailed)
+}
+
+fn probe_symphonia_inner(mut bytes: Vec<u8>, declared_codec: Option<&str>) -> DecodeProbe {
+    let declared_he = declared_codec.is_some_and(|codecs| {
+        codecs
+            .split(',')
+            .any(|codec| matches!(codec.trim(), "mp4a.40.5" | "mp4a.40.29"))
+    });
+    let unsupported = || {
+        if declared_he {
+            DecodeProbe::UnsupportedDeclaredCodec
+        } else {
+            DecodeProbe::UnsupportedFormat
+        }
+    };
+    if bytes.len() > aac::MAX_SEGMENT_BYTES + 1024 * 1024 {
+        return DecodeProbe::AacFailed(aac::AacError::TooLarge);
+    }
     let Some(offset) = audio_offset(&bytes) else {
-        return DecodeProbe::UnsupportedFormat;
+        return unsupported();
     };
     bytes.drain(..offset);
+    if let Err(error) = mp4_limits::validate(&bytes) {
+        return DecodeProbe::AacFailed(error);
+    }
     let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
     let Ok(probed) = symphonia::default::get_probe().format(
         &Hint::new(),
@@ -100,13 +121,38 @@ fn probe_symphonia(mut bytes: Vec<u8>) -> DecodeProbe {
         &FormatOptions::default(),
         &MetadataOptions::default(),
     ) else {
-        return DecodeProbe::UnsupportedFormat;
+        return unsupported();
     };
     let mut format = probed.format;
     let Some(track) = format.default_track() else {
         return DecodeProbe::NoAudio;
     };
     let id = track.id;
+    if track.codec_params.codec == CODEC_TYPE_AAC {
+        let Some(asc) = track.codec_params.extra_data.as_deref() else {
+            return DecodeProbe::UnsupportedCodec;
+        };
+        let mut decoder = match aac::RawAacDecoder::new(asc) {
+            Ok(decoder) => decoder,
+            Err(error) => return DecodeProbe::AacFailed(error),
+        };
+        for _ in 0..512 {
+            let Ok(packet) = format.next_packet() else {
+                return DecodeProbe::NoAudio;
+            };
+            if packet.track_id() != id {
+                continue;
+            }
+            return match decoder.decode_packets(&[packet.data.as_ref()], declared_codec) {
+                Ok(summary) => DecodeProbe::RawAacDecoded(summary),
+                Err(error) => DecodeProbe::AacFailed(error),
+            };
+        }
+        return DecodeProbe::NoAudio;
+    }
+    if declared_he {
+        return DecodeProbe::UnsupportedDeclaredCodec;
+    }
     let codec = match track.codec_params.codec {
         CODEC_TYPE_AAC => "AAC",
         CODEC_TYPE_PCM_S16LE => "PCM S16LE",
@@ -143,6 +189,90 @@ fn probe_symphonia(mut bytes: Vec<u8>) -> DecodeProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_fragmented_mp4_is_a_first_packet_probe_only() {
+        let (_, media) = fixtures::mp4_aac(&[0x13, 0x08]);
+        for timestamp in [0, 24000 * 1000] {
+            let (init, fragment) =
+                fixtures::fragmented_aac(&[0x13, 0x08], &[&media[8..]; 3], timestamp);
+            let bytes = [init, fragment].concat();
+            assert!(
+                matches!(probe_sample(bytes.clone()), DecodeProbe::RawAacDecoded(summary) if summary.frames == 1024)
+            );
+            assert_eq!(
+                container::decode_aac_pcm_controlled(bytes, None, || false).unwrap_err(),
+                aac::AacError::InvalidMetadata
+            );
+        }
+    }
+    #[test]
+    fn generated_mp4_aac_uses_asc_and_does_not_report_he_aac_core_as_success() {
+        let (init, media) = fixtures::mp4_aac(&[0x13, 0x08]);
+        let bytes = [init, media].concat();
+        let DecodeProbe::RawAacDecoded(summary) =
+            probe_declared_sample(bytes.clone(), Some("mp4a.40.2"))
+        else {
+            panic!(
+                "generated MP4 was not decoded: {:?}",
+                probe_sample(bytes.clone())
+            );
+        };
+        assert_eq!(
+            (
+                summary.sample_rate,
+                summary.channels,
+                summary.frames,
+                summary.packets
+            ),
+            (24000, 1, 1024, 1)
+        );
+        assert!(!summary.sbr_detected);
+        for declaration in ["mp4a.40.5", "mp4a.40.29"] {
+            assert_eq!(
+                probe_declared_sample(bytes.clone(), Some(declaration)),
+                DecodeProbe::AacFailed(aac::AacError::DeclaredSbrMissing)
+            );
+        }
+    }
+    #[test]
+    fn incomplete_mp4_samples_and_oversized_input_never_report_decoded_audio() {
+        let (init, media) = fixtures::mp4_aac(&[0x13, 0x08]);
+        let init_len = init.len();
+        let bytes = [init, media].concat();
+        for end in [
+            0,
+            8,
+            init_len - 1,
+            init_len,
+            bytes.len() - 2,
+            bytes.len() - 1,
+        ] {
+            assert!(!matches!(
+                probe_sample(bytes[..end].to_vec()),
+                DecodeProbe::RawAacDecoded(_) | DecodeProbe::Decoded { .. }
+            ));
+        }
+        assert_eq!(
+            probe_sample(vec![0; aac::MAX_SEGMENT_BYTES + 1024 * 1024 + 1]),
+            DecodeProbe::AacFailed(aac::AacError::TooLarge)
+        );
+        let (init, media) = fixtures::mp4_aac(&[0x13, 0x0c]); // Unsupported 960-frame ASC.
+        assert_eq!(
+            probe_sample([init, media].concat()),
+            DecodeProbe::AacFailed(aac::AacError::InvalidConfig)
+        );
+    }
+    #[test]
+    fn malformed_mp4_descriptors_are_reported_without_unwinding() {
+        let (init, media) = fixtures::mp4_aac(&[0x13, 0x08]);
+        let mut bytes = [init, media].concat();
+        let esds = bytes.windows(4).position(|kind| kind == b"esds").unwrap();
+        bytes[esds + 8] = 0; // Replace the required ES descriptor with an unknown descriptor.
+        assert_eq!(
+            probe_declared_sample(bytes, Some("mp4a.40.5")),
+            DecodeProbe::DecodeFailed
+        );
+    }
     #[test]
     fn declared_he_aac_never_reports_core_only_decoding_as_full_success() {
         for codec in ["mp4a.40.5", "mp4a.40.29", "avc1.42, mp4a.40.5"] {

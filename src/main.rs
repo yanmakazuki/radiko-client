@@ -217,6 +217,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!("PSの明示シグナルと聴感品質は未確認です");
             }
+            DecodeProbe::RawAacDecoded(summary) => {
+                println!(
+                    "設定情報付きAACの先頭パケットを純Rustでデコード成功: {}Hz / {}ch / {}フレーム / SBR検出: {}",
+                    summary.sample_rate, summary.channels, summary.frames, summary.sbr_detected
+                );
+                println!("非ADTSの音声出力・連続再生は未接続です。PSの明示シグナルは未確認です");
+            }
             DecodeProbe::AacFailed(error) => println!("サンプル取得済み。AAC検証失敗: {error}"),
             DecodeProbe::Decoded {
                 codec,
@@ -230,7 +237,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("サンプル取得済み。採用中のSymphoniaでコンテナを解析できません")
             }
             DecodeProbe::UnsupportedDeclaredCodec => println!(
-                "HE-AAC宣言の非ADTSサンプルは未対応です（SymphoniaでのAACコアだけの成功とは扱いません）"
+                "HE-AAC宣言に対応するコンテナまたは設定情報を確認できません（AACコアだけの成功とは扱いません）"
             ),
             DecodeProbe::UnsupportedCodec => {
                 println!("サンプル取得済み。採用中のSymphoniaでコーデックが未対応です")

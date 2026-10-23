@@ -76,9 +76,23 @@ pub(super) struct QueuedPcm {
 struct QueueCharge {
     measurements: std::sync::Arc<std::sync::Mutex<Tracker>>,
     media: Duration,
+    active: bool,
+}
+impl QueueCharge {
+    fn received(&mut self, tracker: Option<&mut Tracker>) {
+        if self.active {
+            if let Some(tracker) = tracker {
+                tracker.received(self.media);
+            }
+            self.active = false;
+        }
+    }
 }
 impl Drop for QueueCharge {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         if let Ok(mut tracker) = self.measurements.lock() {
             tracker.received(self.media);
         }
@@ -95,6 +109,7 @@ impl QueuedPcm {
             charge: QueueCharge {
                 measurements,
                 media,
+                active: true,
             },
         }
     }
@@ -102,6 +117,53 @@ impl QueuedPcm {
         let Self { pcm, charge } = self;
         drop(charge);
         pcm
+    }
+}
+
+/// Receive and release accounting under one lock, before the producer can charge another PCM.
+pub(super) struct PcmReceiver {
+    receiver: Receiver<Event>,
+    measurements: Option<std::sync::Arc<std::sync::Mutex<Tracker>>>,
+}
+impl PcmReceiver {
+    fn disconnected() -> Self {
+        let (_sender, receiver) = mpsc::channel();
+        Self {
+            receiver,
+            measurements: None,
+        }
+    }
+    pub(super) fn try_recv(&self) -> Result<Event, TryRecvError> {
+        let mut tracker = self
+            .measurements
+            .as_ref()
+            .and_then(|value| value.lock().ok());
+        let mut event = self.receiver.try_recv()?;
+        if let Event::Pcm(pcm) = &mut event {
+            pcm.charge.received(tracker.as_deref_mut());
+        }
+        Ok(event)
+    }
+    pub(super) fn recv_timeout(&self, timeout: Duration) -> Result<Event, mpsc::RecvTimeoutError> {
+        let began = Instant::now();
+        loop {
+            match self.try_recv() {
+                Ok(event) => return Ok(event),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(mpsc::RecvTimeoutError::Disconnected);
+                }
+                Err(TryRecvError::Empty) => (),
+            }
+            let remaining = timeout.saturating_sub(began.elapsed());
+            if remaining.is_zero() {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+    #[cfg(test)]
+    fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
+        std::iter::from_fn(move || self.try_recv().ok())
     }
 }
 
@@ -150,7 +212,7 @@ fn send(tx: &mpsc::SyncSender<Event>, mut event: Event, stop: &StopToken) -> boo
 // One extra decoded segment absorbs acquisition jitter without enlarging the device ring.
 const PCM_QUEUE_CAPACITY: usize = 2;
 
-pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker, Receiver<Event>) {
+pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker, PcmReceiver) {
     let (tx, rx) = mpsc::sync_channel(PCM_QUEUE_CAPACITY);
     let http_diagnostics = source.enable_http_diagnostics();
     let control = stop.clone();
@@ -246,6 +308,10 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
         }
         enter(Stage::Finished);
     });
+    let rx = PcmReceiver {
+        receiver: rx,
+        measurements: Some(diagnostics.clone()),
+    };
     (
         Worker {
             stop,
@@ -260,7 +326,7 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
 pub(super) struct Ready {
     pub info: StreamInfo,
     pub worker: Worker,
-    pub rx: Receiver<Event>,
+    pub rx: PcmReceiver,
     pub pcm: DecodedPcm,
     pub segments: u64,
 }
@@ -513,7 +579,7 @@ fn play_loop<S: AudioSink>(
             let (worker, rx) = worker(source, local.clone());
             (info, Some(worker), rx)
         }
-        Initial::Idle(info) => (info, None, mpsc::channel().1),
+        Initial::Idle(info) => (info, None, PcmReceiver::disconnected()),
     };
     let mut current = None;
     let mut cursor = 0;
@@ -851,6 +917,8 @@ mod tests {
             control.volume = 0; // Applied before the first enqueue starts the real stream.
             control.notification_interval = Duration::from_millis(250);
             let mut acquisition = Duration::ZERO;
+            let mut acquisition_pcm_start = Duration::ZERO;
+            let mut acquisition_pcm_min = Duration::ZERO;
             let mut segment_media = Duration::ZERO;
             let mut gate_frames = 0;
             let mut gap_waiting_min = u32::MAX;
@@ -893,7 +961,11 @@ mod tests {
                             gap_waiting_min = gap_waiting_min.min(pipeline.waiting_pcm_segments);
                             gap_waiting_max = gap_waiting_max.max(pipeline.waiting_pcm_segments);
                         }
-                        acquisition = acquisition.max(pipeline.acquisition_max);
+                        if pipeline.acquisition_max > acquisition {
+                            acquisition = pipeline.acquisition_max;
+                            acquisition_pcm_start = pipeline.acquisition_max_pcm_start;
+                            acquisition_pcm_min = pipeline.acquisition_max_pcm_min;
+                        }
                         segment_media = segment_media.max(pipeline.media_last);
                     }
                 },
@@ -901,10 +973,12 @@ mod tests {
             .unwrap();
             let output = report.output.unwrap();
             println!(
-                "synthetic_muted gap_after={gap_after} gate_frames={gate_frames} gap_waiting_min={gap_waiting_min} gap_waiting_max={gap_waiting_max} output_frames={} underrun_frames={} acquisition_max_ms={} segment_media_ms={} wall_ms={}",
+                "synthetic_muted gap_after={gap_after} gate_frames={gate_frames} gap_waiting_min={gap_waiting_min} gap_waiting_max={gap_waiting_max} output_frames={} underrun_frames={} acquisition_max_ms={} acquisition_pcm_start_ms={} acquisition_pcm_min_ms={} segment_media_ms={} wall_ms={}",
                 output.frames,
                 output.underrun_frames,
                 acquisition.as_millis(),
+                acquisition_pcm_start.as_millis(),
+                acquisition_pcm_min.as_millis(),
                 segment_media.as_millis(),
                 began.elapsed().as_millis()
             );
@@ -913,12 +987,15 @@ mod tests {
             assert!(acquisition >= Duration::from_secs(11));
             assert_eq!(segment_media, Duration::from_millis(5120));
             assert_ne!(gap_waiting_min, u32::MAX);
+            assert_eq!(acquisition_pcm_min, Duration::ZERO);
             if gap_after == 1 {
                 assert!(output.underrun_frames > 0);
                 assert_eq!(gap_waiting_max, 0);
+                assert_eq!(acquisition_pcm_start, Duration::ZERO);
             } else {
                 assert_eq!(output.underrun_frames, 0);
                 assert!(gap_waiting_max > 0);
+                assert!(acquisition_pcm_start > Duration::ZERO);
             }
         }
     }
@@ -997,6 +1074,115 @@ mod tests {
             worker.diagnostics().unwrap().waiting_pcm_media,
             Duration::ZERO
         );
+    }
+    #[test]
+    fn received_pcm_is_not_counted_while_the_consumer_is_paused() {
+        let bytes = packet(24_000).repeat(50);
+        let stop = StopToken::default();
+        let (mut worker, receiver) = worker(
+            Source {
+                info: info(60_000),
+                events: (0..4).map(|_| event(bytes.clone(), false)).collect(),
+            },
+            stop.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.diagnostics().unwrap().waiting_pcm_segments != 3 {
+            assert!(Instant::now() < deadline, "prefetch never filled");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let Event::Pcm(first) = receiver.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("expected PCM");
+        };
+        // Keep the returned value alive without converting it to the consumer's current PCM.
+        while worker.diagnostics().unwrap().decoded_segments != 4 {
+            assert!(Instant::now() < deadline, "next PCM was not decoded");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = worker.diagnostics().unwrap();
+        assert!(snapshot.waiting_pcm_segments <= 3);
+        stop.cancel();
+        worker.handle.take().unwrap().join().unwrap();
+        let snapshot = worker.diagnostics().unwrap();
+        assert_eq!(snapshot.waiting_pcm_segments, 2);
+        assert_eq!(
+            snapshot.waiting_pcm_media,
+            first.pcm.summary.media_duration.saturating_mul(2)
+        );
+        drop(first);
+        assert_eq!(worker.diagnostics().unwrap().waiting_pcm_segments, 2);
+        drop(receiver);
+        assert_eq!(worker.diagnostics().unwrap().waiting_pcm_segments, 0);
+    }
+    #[test]
+    fn acquisition_pair_tracks_receipts_while_the_source_is_blocked() {
+        struct Gated {
+            source: Source,
+            entered: mpsc::Sender<()>,
+            release: Receiver<()>,
+        }
+        impl SegmentSource for Gated {
+            fn info(&self) -> &StreamInfo {
+                self.source.info()
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                if self.source.events.is_empty() {
+                    self.entered.send(()).unwrap();
+                    self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                    return Ok(Next::End);
+                }
+                self.source.poll_segment()
+            }
+        }
+        let (entered, observed) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let bytes = packet(24_000).repeat(50);
+        let (mut worker, receiver) = worker(
+            Gated {
+                source: Source {
+                    info: info(60_000),
+                    events: (0..3).map(|_| event(bytes.clone(), false)).collect(),
+                },
+                entered,
+                release: gate,
+            },
+            StopToken::default(),
+        );
+        // Receiving the first PCM allows the third send to complete and acquisition to start.
+        let Event::Pcm(first) = receiver.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("expected PCM");
+        };
+        let media = first.into_pcm().summary.media_duration;
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        let before = worker.diagnostics().unwrap();
+        assert_eq!(before.stage, Stage::Acquisition);
+        assert_eq!(before.waiting_pcm_media, media.saturating_mul(2));
+        for _ in 0..2 {
+            let Event::Pcm(pcm) = receiver.recv_timeout(Duration::from_secs(2)).unwrap() else {
+                panic!("expected queued PCM");
+            };
+            drop(pcm.into_pcm());
+        }
+        // Make this the longest acquisition without assuming a particular scheduler speed.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while worker.diagnostics().unwrap().elapsed <= before.acquisition_max {
+            assert!(
+                Instant::now() < deadline,
+                "acquisition clock did not advance"
+            );
+            thread::yield_now();
+        }
+        release.send(()).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::End
+        ));
+        worker.handle.take().unwrap().join().unwrap();
+        let after = worker.diagnostics().unwrap();
+        assert_eq!(after.acquisition_max_pcm_start, media.saturating_mul(2));
+        assert_eq!(after.acquisition_max_pcm_min, Duration::ZERO);
+        assert_eq!(after.waiting_pcm_segments, 0);
+        assert!(after.acquisition_max > before.acquisition_max);
     }
     #[test]
     fn waiting_pcm_measurements_clear_when_the_output_receiver_disconnects() {

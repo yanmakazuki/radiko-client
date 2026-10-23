@@ -1,0 +1,50 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Format, lint, and tests
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
+      - name: Rust tests
+        run: cargo +stable test --locked --all-targets --all-features
+      - name: Verification script tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  msrv:
+    name: Rust 1.85.0
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Rust tests
+        run: cargo +1.85.0 test --locked --all-targets --all-features

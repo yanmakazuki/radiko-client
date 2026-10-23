@@ -14,10 +14,95 @@ import tempfile
 import signal
 from pathlib import Path
 
-from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, number, select_program, failure_observation
+from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, device_check, number, select_program, failure_observation, check_timefree_end, UnderrunObservations, output_has_started, require_playback_alive
 
 
 class TerminalTests(unittest.TestCase):
+    def test_playing_evidence_requires_positive_output_from_the_requested_slot(self):
+        start = datetime.datetime.fromisoformat('2026-10-06T12:00:00+09:00')
+        end = start + datetime.timedelta(hours=1)
+        initial = ('再生中: [TBS / TimeFree] title 今回の出力 999秒\n'
+                   '10/06 12:00〜10/06 13:00 JST / Buffering / 音量0% / 位置0.0秒\n'
+                   '今回の出力 0.0秒 / 不足 0フレーム')
+        self.assertFalse(output_has_started(initial, 'TBS', start, end, 'TimeFree'))
+        positive = initial.replace('今回の出力 0.0秒', '今回の出力 0.1秒')
+        self.assertTrue(output_has_started(positive, 'TBS', start, end, 'TimeFree'))
+        self.assertFalse(output_has_started(positive, 'LFR', start, end, 'TimeFree'))
+        self.assertFalse(output_has_started(positive, 'TBS', start, end, 'Live'))
+        with mock.patch('verify_tui_playback.report') as report:
+            require_playback_alive(initial, 0)
+            report.assert_not_called()
+            stopped = initial + '\n再生停止: 音声コールバックが進まない synthetic-secret'
+            with self.assertRaisesRegex(RuntimeError, 'playback failed'):
+                require_playback_alive(stopped, 0)
+            self.assertEqual(report.call_args.kwargs['error_kind'], 'output_stalled')
+            self.assertEqual(report.call_args.kwargs['output_seconds'], 0)
+            self.assertNotIn('synthetic-secret', str(report.call_args))
+
+    def test_underrun_observations_are_numeric_capped_and_keep_the_last_increase(self):
+        observer = UnderrunObservations()
+        def screen(frames):
+            return ('title sensitive-url 不足 999999フレーム\n'
+                    f'今回の出力 12.3秒 / 不足 {frames}フレーム\n'
+                    '処理診断 取得1000ms / 取得max2000ms / 復号500/600ms / 音声5000ms')
+        self.assertIsNone(observer.observe(screen(0)))
+        self.assertIsNone(observer.observe('sensitive-url 不足 999999フレーム'))
+        for index in range(1, 12):
+            result = observer.observe(screen(index*10), at_stop=index == 11)
+            self.assertEqual(result is not None, index <= 8)
+            if result:
+                self.assertEqual(result['delta_frames'], 10)
+                self.assertEqual(result['pipeline']['stage'], 'acquisition')
+        self.assertIsNone(observer.observe(screen(110)))
+        summary = observer.summary()
+        self.assertEqual(summary['increases_observed'], 11)
+        self.assertEqual(summary['samples_reported'], 8)
+        self.assertEqual(summary['last']['underrun_frames'], 110)
+        self.assertEqual(summary['last']['sample'], 'stopped')
+        self.assertNotIn('sensitive-url', str(summary))
+        with mock.patch('verify_tui_playback.report') as report:
+            with self.assertRaisesRegex(RuntimeError, 'playback failed'):
+                require_playback_alive(screen(110) + '\n再生停止: 音声コールバックが進まない',
+                                       12.3, observer)
+            self.assertEqual(report.call_args.kwargs['underrun_observations'], summary)
+        with self.assertRaisesRegex(RuntimeError, 'counter reset'):
+            observer.observe(screen(0))
+
+    def test_timefree_natural_end_checks_remaining_media_and_final_generation(self):
+        programs = [dict(starts_at='2026-10-06T12:00:00+09:00', ends_at='2026-10-06T13:00:00+09:00')]
+        now = datetime.datetime.fromisoformat('2026-10-23T09:00:00+09:00')
+        selected, index, end = select_program(programs, '20261006120000', 15, 3590, False, False, now, True)
+        self.assertEqual(index, 0)
+        self.assertEqual((end-selected).total_seconds(), 3600)
+        for seconds, offset in [(9, 3590), (15, 3596), (15, 3600), (15, 0)]:
+            with self.subTest(seconds=seconds, offset=offset), self.assertRaises(RuntimeError):
+                select_program(programs, '20261006120000', seconds, offset, False, False, now, True)
+        with self.assertRaises(RuntimeError):
+            select_program(programs, '20261006120000', 15, 3590, False, False, selected, True)
+        final = ('synthetic title 今回の出力 999秒\n再生中: なし\n'
+                 '停止時: 今回の出力 10.0秒 / 不足 0フレーム\n番組終了')
+        self.assertEqual(check_timefree_end(final, 10), 10)
+        for invalid in [final.replace('10.0秒', '5.0秒'), final.replace('番組終了', '停止しました'),
+                        final.replace('番組終了', 'synthetic title 番組終了'),
+                        final.replace('再生中: なし', '再生中: [TBS / TimeFree]'),
+                        final.replace('停止時:', '直近通知（終了時未集計）:')]:
+            with self.subTest(text=invalid), self.assertRaises(RuntimeError):
+                check_timefree_end(invalid, 10)
+
+    def test_timefree_end_incompatible_checks_fail_before_session_io(self):
+        script = Path(__file__).with_name('verify_tui_playback.py')
+        with tempfile.TemporaryDirectory() as directory:
+            base = [sys.executable, str(script), '--session-file', str(Path(directory) / 'absent.json'),
+                    '--date', '20261006', '--start', '20261006120000', '--timefree-end']
+            for options in [['--live'], ['--live-end'], ['--pause-seconds', '1'],
+                            ['--device-check'], ['--sleep-check'], ['--restart-check']]:
+                with self.subTest(options=options):
+                    result = subprocess.run(base+options, capture_output=True, timeout=5,
+                                            env=dict(os.environ, TMPDIR=directory))
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b'')
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_termination_signals_remove_the_verifier_temporary_directory(self):
         # Run main's real signal/TemporaryDirectory boundary with acquisition replaced.
         # This does not start radiko-client or read a session.
@@ -108,6 +193,53 @@ raise SystemExit(verification.main())
                     self.assertEqual(result.stdout, b'')
                     self.assertFalse(session.exists())
                     self.assertEqual(list(Path(directory).glob('radiko-tui-verification-*')), [])
+
+    def test_device_check_retains_both_operator_observations_without_screen_text(self):
+        start = datetime.datetime.fromisoformat('2026-10-06T12:00:00+09:00')
+        end = start + datetime.timedelta(hours=1)
+        active = ('再生中: [TBS / TimeFree] synthetic sensitive-url\n'
+                  '10/06 12:00〜10/06 13:00 JST / Playing / 音量0% / 位置5.1秒\n'
+                  '今回の出力 5.1秒 / 不足 0フレーム')
+        for stopped in [False, True]:
+            with self.subTest(stopped=stopped):
+                observed = ('再生中: なし\n今回の出力 7.3秒 / 不足 2フレーム\n'
+                            '再生停止: 音声コールバックが進まない sensitive-url') if stopped else active
+                state = dict(text=observed)
+                terminal = mock.Mock()
+                terminal.screen.side_effect = lambda: state['text']
+                events, keys = [], []
+
+                def write(_fd, key):
+                    keys.append(key)
+                    if key == b'?':
+                        state['text'] = observed if '┌操作一覧' in state['text'] else '┌操作一覧'
+                    elif key == b's':
+                        state['text'] = '再生中: なし'
+                    elif key == b'\r':
+                        state['text'] = active
+
+                def wait(predicate, *args, **kwargs):
+                    self.assertTrue(predicate(state['text']))
+                    return state['text']
+
+                with mock.patch('verify_tui_playback.select.select', return_value=([sys.stdin], [], [])), \
+                     mock.patch('verify_tui_playback.os.read', side_effect=[b'disconnected\n', b'reconnected\n']), \
+                     mock.patch('verify_tui_playback.os.write', side_effect=write), \
+                     mock.patch('verify_tui_playback.report', side_effect=lambda **event: events.append(event)):
+                    result = device_check(terminal, mock.Mock(poll=lambda: None), -1, 'TBS', start, end, wait)
+                for action in ('disconnected', 'reconnected'):
+                    sample = result[action]
+                    self.assertEqual(sample['action'], action)
+                    self.assertTrue(sample['operator_acknowledged'])
+                    self.assertEqual(sample['playback_error_observed'], stopped)
+                    self.assertEqual(sample['inactive_observed'], stopped)
+                    self.assertEqual(sample['output_seconds_at_ack'], 7.3 if stopped else 5.1)
+                    self.assertEqual(sample['underrun_frames_at_ack'], 2 if stopped else 0)
+                    self.assertEqual(sample['error_kind'], 'output_stalled' if stopped else None)
+                self.assertNotIn('sensitive-url', str(result))
+                self.assertNotIn('sensitive-url', str(events))
+                self.assertEqual(keys, [b'?', b'?', b's', b'\r'])
+                self.assertEqual(events[-1]['phase'], 'device_replay_started')
 
     def test_sleep_check_observes_both_stop_and_continuation_before_explicit_replay(self):
         start = datetime.datetime.fromisoformat('2026-10-06T12:00:00+09:00')

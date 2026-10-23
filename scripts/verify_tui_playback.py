@@ -166,6 +166,11 @@ def target_matches(text, station, start, end, mode=None):
     return False
 
 
+def output_has_started(text, station, start, end, mode):
+    output = number(text, r'今回の出力\s+([0-9.]+)秒')
+    return output is not None and output > 0 and target_matches(text, station, start, end, mode)
+
+
 def failure_diagnostics(text):
     """Only classify a footer notice into fixed labels; never return notice/program text."""
     notice = next((line.strip(' │') for line in text.splitlines()[-8:]
@@ -216,6 +221,15 @@ def diagnostic_row(text, prefix):
         if line.startswith(prefix):
             return re.sub(r'\s+', '', line)
     return ''
+
+
+def require_playback_alive(text, previous_output, underruns=None):
+    failure = failure_observation(text, previous_output)
+    if failure is not None:
+        if underruns is not None:
+            failure['underrun_observations'] = underruns.summary()
+        report(phase='playback_failure', **failure)
+        raise RuntimeError('playback failed')
 
 
 def pipeline_diagnostics(text):
@@ -291,18 +305,23 @@ def device_check(terminal, proc, master, station, selected, ends_at, wait):
                 if b'\n' in pending:
                     require(pending.strip() == expected.encode(), 'unexpected operator acknowledgment')
                     # This acknowledges an operator action, not proof of the OS route.
-                    report(phase='device_acknowledged', action=expected,
-                           playback_error_observed=saw_error, inactive_observed=saw_inactive)
-                    return
+                    result = dict(action=expected, operator_acknowledged=True,
+                                  playback_error_observed=saw_error, inactive_observed=saw_inactive,
+                                  output_seconds_at_ack=number(text, r'今回の出力\s+([0-9.]+)秒'),
+                                  underrun_frames_at_ack=number(text, r'不足\s+(\d+)フレーム'),
+                                  pipeline_last_notification=pipeline_diagnostics(text),
+                                  **failure_diagnostics(text))
+                    report(phase='device_acknowledged', **result)
+                    return result
         raise RuntimeError('operator acknowledgment timed out')
 
-    acknowledge('disconnected')
+    disconnected = acknowledge('disconnected')
     # Check that application input still responds with the device absent.
     os.write(master, b'?')
     wait(lambda t: '┌操作一覧' in t, 10)
     os.write(master, b'?')
     wait(lambda t: '┌操作一覧' not in t, 10)
-    acknowledge('reconnected')
+    reconnected = acknowledge('reconnected')
     # A new explicit play request resolves and opens the current default output.
     os.write(master, b's')
     wait(lambda t: '再生中: なし' in t, 10)
@@ -311,6 +330,7 @@ def device_check(terminal, proc, master, station, selected, ends_at, wait):
     wait(lambda t: 'Playing' in t and target_matches(t, station, selected, ends_at, 'TimeFree') and
          (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 2, 90)
     report(phase='device_replay_started', muted=True)
+    return dict(disconnected=disconnected, reconnected=reconnected)
 
 
 def sleep_check(terminal, proc, master, station, selected, ends_at, wait):
@@ -395,7 +415,37 @@ def restart_check(terminal, master, wait, args, selected, ends_at, index, filter
 
 
 
-def select_program(programs, start, seconds, offset, live, live_end, now):
+class UnderrunObservations:
+    """Keep one numeric sample and print at most eight increases; never retain screen text."""
+    limit = 8
+
+    def __init__(self):
+        self.frames = 0
+        self.events = 0
+        self.last = None
+
+    def observe(self, text, at_stop=False):
+        frames = number(text, r'不足\s+(\d+)フレーム')
+        output = number(text, r'今回の出力\s+([0-9.]+)秒')
+        if frames is None or output is None:
+            return None
+        frames = int(frames)
+        require(frames >= self.frames, 'unexpected underrun counter reset')
+        if frames == self.frames:
+            return None
+        self.last = dict(output_seconds=output, underrun_frames=frames,
+                         delta_frames=frames-self.frames, sample='stopped' if at_stop else 'running',
+                         pipeline=pipeline_diagnostics(text))
+        self.frames = frames
+        self.events += 1
+        return self.last if self.events <= self.limit else None
+
+    def summary(self):
+        return dict(increases_observed=self.events, samples_reported=min(self.events, self.limit),
+                    last=self.last)
+
+
+def select_program(programs, start, seconds, offset, live, live_end, now, timefree_end=False):
     """Choose a slot without I/O; bounded live output and natural end are distinct."""
     jst = datetime.timezone(datetime.timedelta(hours=9))
     if start == 'auto':
@@ -425,9 +475,30 @@ def select_program(programs, start, seconds, offset, live, live_end, now):
             require(remaining > seconds + 30, 'bounded live needs thirty seconds of setup margin')
     else:
         length = (ends_at-selected).total_seconds()
-        require(length > offset + seconds + 10,
-                'selected slot must exceed offset plus verification duration by ten seconds')
+        if timefree_end:
+            require(ends_at <= now, 'time-free end requires an already-ended broadcast')
+            require(5 <= length-offset <= seconds,
+                    'time-free end must be five..seconds of media after the offset')
+        else:
+            require(length > offset + seconds + 10,
+                    'selected slot must exceed offset plus verification duration by ten seconds')
     return selected, index, ends_at
+
+
+def natural_end_visible(text):
+    footer = [line.strip(' │') for line in text.splitlines()[-10:]]
+    return ('番組終了' in footer and any(line.startswith('再生中: なし') for line in footer)
+            and any(line.startswith('停止時: 今回の出力') for line in footer))
+
+
+def check_timefree_end(text, expected_seconds):
+    """Validate the final output generation, independent of the wall-clock broadcast end."""
+    require(natural_end_visible(text),
+            'final time-free end diagnostics absent')
+    output = number(text, r'今回の出力\s+([0-9.]+)秒')
+    require(output is not None and abs(output-expected_seconds) <= 0.2,
+            'time-free end outside media-duration tolerance')
+    return output
 
 
 def verify(args, directory):
@@ -453,10 +524,13 @@ def verify(args, directory):
     live_mode = args.live or args.live_end
     selected, index, ends_at = select_program(programs, args.start, args.seconds, args.offset,
                                               args.live, args.live_end,
-                                              datetime.datetime.now(datetime.timezone.utc))
+                                              datetime.datetime.now(datetime.timezone.utc), args.timefree_end)
     args.start = selected.strftime('%Y%m%d%H%M%S')
     expected_mode = 'Live' if live_mode else 'TimeFree'
-    verification_mode = 'live_end' if args.live_end else ('live' if args.live else 'timefree')
+    verification_mode = ('timefree_end' if args.timefree_end else
+                         'live_end' if args.live_end else 'live' if args.live else 'timefree')
+    natural_end = args.live_end or args.timefree_end
+    expected_media = (ends_at-selected).total_seconds() - args.offset
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', Terminal.rows, Terminal.columns, 0, 0))
     before = termios.tcgetattr(slave)
@@ -470,12 +544,14 @@ def verify(args, directory):
                                 stdout=slave, stderr=slave, start_new_session=True,
                                 env=dict(os.environ, TERM='xterm-256color'))
 
-        def wait(predicate, timeout=90, check="expected UI state did not appear"):
+        def wait(predicate, timeout=90, check="expected UI state did not appear", check_playback=False):
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 terminal.pump()
                 text = terminal.screen()
                 require(proc.poll() is None, 'TUI exited early (code=%s)' % proc.returncode)
+                if check_playback:
+                    require_playback_alive(text, last_output)
                 if predicate(text):
                     return text
             text = terminal.screen()
@@ -495,20 +571,23 @@ def verify(args, directory):
              check='completed TUI frame did not match requested PTY dimensions')
         os.write(master, b'-----')
         wait(lambda t: '音量0%' in t)
+        report(phase='starting', binary_sha256=digest, station=args.station, start=args.start,
+               ends_at=ends_at.isoformat(), offset_seconds=args.offset, mode=verification_mode, muted=True)
         os.write(master, b'j' * index + (b'l' if live_mode else b'\r'))
-        wait(lambda t: '今回の出力' in t and target_matches(t, args.station, selected, ends_at, expected_mode))
+        wait(lambda t: output_has_started(t, args.station, selected, ends_at, expected_mode),
+             check='requested slot never produced output', check_playback=True)
         sleep_result = sleep_check(terminal, proc, master, args.station, selected, ends_at, wait) \
             if args.sleep_check else None
-        if args.device_check:
-            device_check(terminal, proc, master, args.station, selected, ends_at, wait)
+        device_result = device_check(terminal, proc, master, args.station, selected, ends_at, wait) \
+            if args.device_check else None
         if args.offset:
             os.write(master, b'g' + str(args.offset).encode() + b'\r')
             wait(lambda t: (number(t, r'位置([0-9.]+)秒') or 0) >= args.offset and
                  (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) > 0,
-                 check='requested offset did not start output')
+                 check='requested offset did not start output', check_playback=True)
         pause_elapsed = None
         if args.pause_seconds:
-            wait(lambda t: (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 2)
+            wait(lambda t: (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 2, check_playback=True)
             os.write(master, b' ')
             paused = wait(lambda t: 'Paused' in t)
             position = number(paused, r'位置([0-9.]+)秒')
@@ -559,7 +638,7 @@ def verify(args, directory):
             pause_elapsed = time.monotonic() - paused_at
             os.write(master, b' ')
             resumed = wait(lambda t: 'Playing' in t and
-                           (number(t, r'位置([0-9.]+)秒') or 0) > position + 1)
+                           (number(t, r'位置([0-9.]+)秒') or 0) > position + 1, check_playback=True)
             require(target_matches(resumed, args.station, selected, ends_at, expected_mode), 'resumed slot changed')
             report(phase='resumed', paused_seconds=round(pause_elapsed, 1),
                    position_seconds=number(resumed, r'位置([0-9.]+)秒'))
@@ -568,17 +647,20 @@ def verify(args, directory):
         report(phase='playing', binary_sha256=digest, station=args.station, start=args.start,
                ends_at=ends_at.isoformat(), offset_seconds=args.offset, mode=verification_mode, muted=True)
         end_delta = None
+        underruns = UnderrunObservations()
         while True:
             terminal.pump(1)
             text = terminal.screen()
             require(proc.poll() is None, 'TUI exited early (code=%s)' % proc.returncode)
-            failure = failure_observation(text, last_output)
-            if failure is not None:
-                report(phase='playback_failure', **failure)
-                raise RuntimeError('playback failed')
-            if args.live_end and '番組終了' in text and '再生中: なし' in text:
-                end_delta = (datetime.datetime.now(datetime.timezone.utc) - ends_at).total_seconds()
-                require(-0.5 <= end_delta <= 5, 'live program end outside wall-clock tolerance')
+            require_playback_alive(text, last_output, underruns)
+            if observation := underruns.observe(text):
+                report(phase='underrun_observed', **observation)
+            if natural_end and natural_end_visible(text):
+                if args.timefree_end:
+                    check_timefree_end(text, expected_media)
+                else:
+                    end_delta = (datetime.datetime.now(datetime.timezone.utc) - ends_at).total_seconds()
+                    require(-0.5 <= end_delta <= 5, 'live program end outside wall-clock tolerance')
                 break
             require(target_matches(text, args.station, selected, ends_at, expected_mode), 'active playback slot changed')
             output = number(text, r'今回の出力\s+([0-9.]+)秒')
@@ -589,8 +671,13 @@ def verify(args, directory):
                 last_output = output
             require(time.monotonic()-changed < 60, 'output stalled for sixty seconds')
             require(time.monotonic()-began < args.seconds+180, 'verification wall-clock limit exceeded')
-            if not args.live_end and last_output >= args.seconds:
+            if not natural_end and last_output >= args.seconds:
                 break
+            if natural_end:
+                remaining = expected_media-last_output if args.timefree_end else \
+                    (ends_at-datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                if remaining <= 10:
+                    continue  # Keep the final end notification visible rather than opening a modal.
             if time.monotonic()-operated < args.interval:
                 continue
             cycles += 1
@@ -661,11 +748,18 @@ def verify(args, directory):
                    underrun_frames=number(text, r'不足\s+(\d+)フレーム'),
                    pipeline=pipeline_diagnostics(text))
             operated = time.monotonic()
-        if args.live_end:
+        if natural_end:
             final = text
-            require('停止時:' in final, 'final live diagnostics absent')
-            terminal.pump(1)
-            require('再生中: なし' in terminal.screen(), 'playback auto-advanced after program end')
+            require('停止時:' in final, 'final natural-end diagnostics absent')
+            settled = time.monotonic() + 3
+            while time.monotonic() < settled:
+                terminal.pump(0.2)
+                require(proc.poll() is None, 'TUI exited after program end')
+                current = terminal.screen()
+                require(natural_end_visible(current),
+                        'playback auto-advanced after program end')
+                if args.timefree_end:
+                    check_timefree_end(current, expected_media)
         else:
             os.write(master, b's')
             final = wait(lambda t: '停止しました' in t and '停止時:' in t, 10,
@@ -675,8 +769,13 @@ def verify(args, directory):
         final_output = number(final, r'今回の出力\s+([0-9.]+)秒')
         require(final_output is not None and final_output >= last_output, 'final output counter absent or reset')
         last_output = final_output
+        if observation := underruns.observe(final, at_stop=True):
+            report(phase='underrun_observed', **observation)
+        final_pipeline = pipeline_diagnostics(final)
         report(phase='stopped', mode=verification_mode, output_seconds=last_output,
-               final_underrun_frames=int(underrun), live_end_delta_seconds=end_delta)
+               final_underrun_frames=int(underrun), live_end_delta_seconds=end_delta,
+               underrun_observations=underruns.summary(),
+               pipeline=final_pipeline)
         restarted = restart_check(terminal, master, wait, args, selected, ends_at, index, filtered) \
             if args.restart_check else None
         os.write(master, b'q')
@@ -687,7 +786,12 @@ def verify(args, directory):
                final_underrun_frames=int(underrun), confirmed_searches=cycles//8,
                chapter_scroll_checks=chapter_scroll_checks,
                terminal_restored=True, exit_code=proc.returncode, binary_sha256=digest,
-               live_end_delta_seconds=end_delta, paused_seconds=pause_elapsed, restarted=restarted, sleep_check=sleep_result)
+               live_end_delta_seconds=end_delta, paused_seconds=pause_elapsed, restarted=restarted,
+               sleep_check=sleep_result, device_check=device_result,
+               expected_media_seconds=expected_media if args.timefree_end else None,
+               settled_seconds=3 if natural_end else None,
+               underrun_observations=underruns.summary(),
+               pipeline=final_pipeline)
         completed = True
     finally:
         try:
@@ -740,6 +844,8 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--live', action='store_true', help='stop live output after the requested seconds; no natural-end claim')
     modes.add_argument('--live-end', action='store_true', help='play selected on-air slot until its natural end')
+    modes.add_argument('--timefree-end', action='store_true',
+                       help='play time-free media from offset to its natural end; seconds bounds remaining media')
     args = parser.parse_args()
     if not 1 <= args.seconds <= 86400 or not 1 <= args.interval <= 300:
         parser.error('seconds must be 1..86400 and interval 1..300')
@@ -756,6 +862,8 @@ def main():
         parser.error('sleep-check cannot be combined with live, live-end, device-check or pause-seconds')
     if args.restart_check and live_mode:
         parser.error('restart-check is only available for time-free')
+    if args.timefree_end and (args.device_check or args.sleep_check or args.pause_seconds or args.restart_check):
+        parser.error('timefree-end cannot be combined with device, sleep, pause or restart checks')
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupt)

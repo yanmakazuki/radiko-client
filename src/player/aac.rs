@@ -14,6 +14,8 @@ pub enum AacError {
     Cancelled,
     TooLarge,
     InvalidMetadata,
+    InvalidConfig,
+    InvalidPacket,
     InvalidHeader,
     TruncatedFrame,
     Empty,
@@ -32,6 +34,8 @@ impl fmt::Display for AacError {
             Self::Cancelled => "AACデコードを取り消しました",
             Self::TooLarge => "AACセグメントのサイズ上限を超えました",
             Self::InvalidMetadata => "AACに付加されたID3の形式が不正です",
+            Self::InvalidConfig => "AACの設定情報（ASC）が不正・未対応です",
+            Self::InvalidPacket => "AACアクセスユニットに余分なデータがあります",
             Self::InvalidHeader => "ADTSヘッダーが不正です",
             Self::TruncatedFrame => "ADTSフレームが途中で切れています",
             Self::Empty => "AAC音声フレームがありません",
@@ -88,6 +92,7 @@ struct Format {
 struct Frame<'a> {
     format: Format,
     payload: &'a [u8],
+    complete_access_unit: bool,
 }
 
 fn frames<'a>(
@@ -135,6 +140,7 @@ fn frames<'a>(
         frames.push(Frame {
             format,
             payload: &remaining[header.header_len..header.frame_length],
+            complete_access_unit: false,
         });
         remaining = &remaining[header.frame_length..];
     }
@@ -203,11 +209,21 @@ impl AdtsDecoder {
         &mut self,
         bytes: &[u8],
         declared_codec: Option<&str>,
-        mut pcm: Option<&mut Vec<f32>>,
+        pcm: Option<&mut Vec<f32>>,
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<AacSummary, AacError> {
         let started = Instant::now();
         let frames = frames(bytes, cancelled)?;
+        self.decode_frames(frames, declared_codec, pcm, cancelled, started)
+    }
+    fn decode_frames(
+        &mut self,
+        frames: Vec<Frame<'_>>,
+        declared_codec: Option<&str>,
+        mut pcm: Option<&mut Vec<f32>>,
+        cancelled: &mut dyn FnMut() -> bool,
+        started: Instant,
+    ) -> Result<AacSummary, AacError> {
         if cancelled() {
             return Err(AacError::Cancelled);
         }
@@ -244,7 +260,12 @@ impl AdtsDecoder {
             if cancelled() {
                 return Err(AacError::Cancelled);
             }
-            let audio = decoder.decode(frame.payload, None).map_err(map_error)?;
+            let (audio, consumed) = decoder
+                .decode_block(frame.payload, None)
+                .map_err(map_error)?;
+            if frame.complete_access_unit && consumed != frame.payload.len() {
+                return Err(AacError::InvalidPacket);
+            }
             if cancelled() {
                 return Err(AacError::Cancelled);
             }
@@ -308,6 +329,139 @@ impl AdtsDecoder {
         Ok(summary)
     }
 }
+/// ASC-configured access units with bounded optional PCM retention.
+/// ADTS playback keeps its existing transport and decoder ownership.
+pub struct RawAacDecoder {
+    config: StreamConfig,
+    inner: AdtsDecoder,
+}
+impl RawAacDecoder {
+    pub fn new(asc: &[u8]) -> Result<Self, AacError> {
+        if !(2..=1024).contains(&asc.len()) {
+            return Err(AacError::InvalidConfig);
+        }
+        let config = rusty_aac::config::parse(asc).map_err(|_| AacError::InvalidConfig)?;
+        if config.object_type != 2
+            || config.frame_length != 1024
+            || config.pce.is_some()
+            || !(1..=7).contains(&config.channel_config)
+            || !(8000..=96000).contains(&config.sample_rate)
+            || config.depends_on_core_coder
+            || config.section_data_resilience
+            || config.scalefactor_data_resilience
+            || config.spectral_data_resilience
+            || (config.sbr && config.ext_sample_rate != config.sample_rate.saturating_mul(2))
+            || (config.ps && (!config.sbr || config.channel_config != 1))
+        {
+            return Err(AacError::InvalidConfig);
+        }
+        Ok(Self {
+            config,
+            inner: AdtsDecoder::new(),
+        })
+    }
+    pub fn decode_packets(
+        &mut self,
+        packets: &[&[u8]],
+        declared_codec: Option<&str>,
+    ) -> Result<AacSummary, AacError> {
+        self.decode_packets_controlled(packets, declared_codec, || false)
+    }
+    pub fn decode_packets_controlled(
+        &mut self,
+        packets: &[&[u8]],
+        declared_codec: Option<&str>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<AacSummary, AacError> {
+        self.decode_raw(packets, declared_codec, None, &mut cancelled)
+    }
+    pub fn decode_packets_pcm(
+        &mut self,
+        packets: &[&[u8]],
+        declared_codec: Option<&str>,
+    ) -> Result<DecodedPcm, AacError> {
+        self.decode_packets_pcm_controlled(packets, declared_codec, || false)
+    }
+    /// PCM escapes only after every access unit and final declaration check succeeds.
+    pub fn decode_packets_pcm_controlled(
+        &mut self,
+        packets: &[&[u8]],
+        declared_codec: Option<&str>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<DecodedPcm, AacError> {
+        if cancelled() {
+            self.inner = AdtsDecoder::new();
+            return Err(AacError::Cancelled);
+        }
+        let mut samples = Vec::with_capacity(MAX_PCM_SAMPLES);
+        self.decode_raw(packets, declared_codec, Some(&mut samples), &mut cancelled)
+            .map(|summary| DecodedPcm { summary, samples })
+    }
+    fn decode_raw(
+        &mut self,
+        packets: &[&[u8]],
+        declared_codec: Option<&str>,
+        pcm: Option<&mut Vec<f32>>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<AacSummary, AacError> {
+        let started = Instant::now();
+        let result = (|| {
+            if cancelled() {
+                return Err(AacError::Cancelled);
+            }
+            if packets.is_empty() {
+                return Err(AacError::Empty);
+            }
+            if packets.len() > MAX_PACKETS {
+                return Err(AacError::TooManyPackets);
+            }
+            let mut bytes = 0usize;
+            let format = Format {
+                object_type: self.config.object_type,
+                sample_rate: self.config.sample_rate,
+                channels: u16::from(self.config.channel_config),
+            };
+            let mut frames = Vec::with_capacity(packets.len());
+            for &payload in packets {
+                if cancelled() {
+                    return Err(AacError::Cancelled);
+                }
+                if payload.is_empty() {
+                    return Err(AacError::Empty);
+                }
+                bytes = bytes.checked_add(payload.len()).ok_or(AacError::TooLarge)?;
+                if bytes > MAX_SEGMENT_BYTES {
+                    return Err(AacError::TooLarge);
+                }
+                frames.push(Frame {
+                    format,
+                    payload,
+                    complete_access_unit: true,
+                });
+            }
+            if self.inner.decoder.is_none() {
+                self.inner.decoder =
+                    Some(Decoder::with_stream_config(self.config.clone()).map_err(map_error)?);
+                self.inner.format = Some(format);
+            }
+            let summary =
+                self.inner
+                    .decode_frames(frames, declared_codec, pcm, cancelled, started)?;
+            if self.config.sbr && !summary.sbr_detected {
+                return Err(AacError::DeclaredSbrMissing);
+            }
+            if self.config.sbr && summary.sample_rate != self.config.ext_sample_rate {
+                return Err(AacError::InvalidPcm);
+            }
+            Ok(summary)
+        })();
+        if result.is_err() {
+            self.inner = AdtsDecoder::new();
+        }
+        result
+    }
+}
+
 fn map_error(error: rusty_aac::Error) -> AacError {
     match error {
         rusty_aac::Error::Unsupported(_) | rusty_aac::Error::Unimplemented(_) => {
@@ -346,6 +500,195 @@ mod tests {
         }
         assert!(result.len() >= 3);
         result
+    }
+    #[test]
+    fn asc_packets_match_adts_and_keep_state_across_calls() {
+        let packets = generated_adts(24000, false);
+        let raw: Vec<_> = packets.iter().map(|p| &p[7..]).collect();
+        let adts = AdtsDecoder::new()
+            .decode_segment(&packets.concat(), None)
+            .unwrap();
+        let mut decoder = RawAacDecoder::new(&[0x13, 0x08]).unwrap();
+        let first = decoder.decode_packets(&raw[..1], None).unwrap();
+        let rest = decoder.decode_packets(&raw[1..], None).unwrap();
+        assert_eq!(first.frames + rest.frames, adts.frames);
+        assert_eq!(
+            first.nonzero_samples + rest.nonzero_samples,
+            adts.nonzero_samples
+        );
+        assert_eq!(
+            (rest.sample_rate, rest.channels, rest.sbr_detected),
+            (24000, 1, false)
+        );
+        for declaration in ["mp4a.40.5", "mp4a.40.29"] {
+            assert_eq!(
+                decoder.decode_packets(&raw, Some(declaration)).unwrap_err(),
+                AacError::DeclaredSbrMissing
+            );
+            assert!(decoder.inner.decoder.is_none());
+            assert_eq!(
+                decoder.decode_packets(&raw, None).unwrap().frames,
+                adts.frames
+            );
+        }
+    }
+    #[test]
+    fn raw_pcm_is_complete_matches_adts_and_is_discarded_on_error_or_cancel() {
+        let packets = generated_adts(24000, false);
+        let raw: Vec<_> = packets.iter().map(|p| &p[7..]).collect();
+        let reference = AdtsDecoder::new()
+            .decode_segment_pcm(&packets.concat(), None)
+            .unwrap();
+        let mut decoder = RawAacDecoder::new(&[0x13, 0x08]).unwrap();
+        let actual = decoder.decode_packets_pcm(&raw, None).unwrap();
+        assert_eq!(actual.samples, reference.samples);
+        assert_eq!(
+            actual.samples.len(),
+            actual.summary.frames * usize::from(actual.summary.channels)
+        );
+        assert!(actual.samples.capacity() <= MAX_PCM_SAMPLES);
+        let mut checkpoints = 0;
+        RawAacDecoder::new(&[0x13, 0x08])
+            .unwrap()
+            .decode_packets_pcm_controlled(&raw, None, || {
+                checkpoints += 1;
+                false
+            })
+            .unwrap();
+        for at in 1..=checkpoints {
+            let mut seen = 0;
+            assert_eq!(
+                decoder
+                    .decode_packets_pcm_controlled(&raw, None, || {
+                        seen += 1;
+                        seen >= at
+                    })
+                    .unwrap_err(),
+                AacError::Cancelled
+            );
+            assert!(decoder.inner.decoder.is_none());
+            assert_eq!(
+                decoder.decode_packets_pcm(&raw, None).unwrap().samples,
+                reference.samples
+            );
+        }
+        assert_eq!(
+            decoder
+                .decode_packets_pcm(&raw, Some("mp4a.40.5"))
+                .unwrap_err(),
+            AacError::DeclaredSbrMissing
+        );
+        assert!(decoder.inner.decoder.is_none());
+        let too_many_samples = vec![raw[0]; MAX_PCM_SAMPLES / 1024 + 1];
+        assert_eq!(
+            decoder
+                .decode_packets_pcm(&too_many_samples, None)
+                .unwrap_err(),
+            AacError::TooLarge
+        );
+        assert!(decoder.inner.decoder.is_none());
+        assert_eq!(
+            decoder.decode_packets_pcm(&raw, None).unwrap().samples,
+            reference.samples
+        );
+    }
+    #[test]
+    fn asc_configuration_and_access_unit_limits_are_checked_without_partial_success() {
+        for asc in [
+            &[][..],
+            &[0x13][..],
+            &[0x13, 0x0c][..],
+            &[0x13, 0x00][..],
+            &[0xff, 0xff][..],
+        ] {
+            assert!(RawAacDecoder::new(asc).is_err());
+        }
+        assert!(RawAacDecoder::new(&vec![0; 1025]).is_err());
+        let packet = generated_adts(24000, false).remove(0);
+        let raw = &packet[7..];
+        let mut decoder = RawAacDecoder::new(&[0x13, 0x08]).unwrap();
+        assert_eq!(
+            decoder.decode_packets(&[], None).unwrap_err(),
+            AacError::Empty
+        );
+        assert_eq!(
+            decoder.decode_packets(&[raw, &[]], None).unwrap_err(),
+            AacError::Empty
+        );
+        assert_eq!(
+            decoder
+                .decode_packets(&vec![raw; MAX_PACKETS + 1], None)
+                .unwrap_err(),
+            AacError::TooManyPackets
+        );
+        assert_eq!(
+            decoder
+                .decode_packets(&[&vec![0; MAX_SEGMENT_BYTES + 1]], None)
+                .unwrap_err(),
+            AacError::TooLarge
+        );
+        assert!(decoder.decode_packets(&[raw, &[0]], None).is_err());
+        let trailing = [raw, &[0]].concat();
+        assert_eq!(
+            decoder.decode_packets(&[&trailing], None).unwrap_err(),
+            AacError::InvalidPacket
+        );
+        assert!(decoder.inner.decoder.is_none());
+        assert!(decoder.decode_packets(&[raw], None).is_ok());
+    }
+    #[test]
+    fn explicit_sbr_configuration_without_an_sbr_payload_is_not_successful() {
+        fn asc(object_type: u32) -> Vec<u8> {
+            let mut bits = format!("{object_type:05b}01100001001100010000");
+            while bits.len() % 8 != 0 {
+                bits.push('0');
+            }
+            bits.as_bytes()
+                .chunks(8)
+                .map(|part| part.iter().fold(0u8, |n, bit| (n << 1) | (bit - b'0')))
+                .collect()
+        }
+        let packet = generated_adts(24000, false).remove(0);
+        for object_type in [5, 29] {
+            let config = asc(object_type);
+            let parsed = rusty_aac::config::parse(&config).unwrap();
+            assert!(parsed.sbr);
+            assert_eq!((parsed.sample_rate, parsed.ext_sample_rate), (24000, 48000));
+            assert_eq!(parsed.ps, object_type == 29);
+            let result = RawAacDecoder::new(&config)
+                .unwrap()
+                .decode_packets(&[&packet[7..]], None);
+            assert_eq!(result.unwrap_err(), AacError::DeclaredSbrMissing);
+        }
+    }
+    #[test]
+    fn raw_packet_cancellation_discards_state_at_every_checkpoint() {
+        let packets = generated_adts(24000, false);
+        let raw: Vec<_> = packets.iter().map(|p| &p[7..]).collect();
+        let mut checkpoints = 0;
+        RawAacDecoder::new(&[0x13, 0x08])
+            .unwrap()
+            .decode_packets_controlled(&raw, None, || {
+                checkpoints += 1;
+                false
+            })
+            .unwrap();
+        for at in 1..=checkpoints {
+            let mut decoder = RawAacDecoder::new(&[0x13, 0x08]).unwrap();
+            decoder.decode_packets(&raw, None).unwrap();
+            let mut seen = 0;
+            assert_eq!(
+                decoder
+                    .decode_packets_controlled(&raw, None, || {
+                        seen += 1;
+                        seen >= at
+                    })
+                    .unwrap_err(),
+                AacError::Cancelled
+            );
+            assert!(decoder.inner.decoder.is_none());
+            assert!(decoder.decode_packets(&raw, None).is_ok());
+        }
     }
     #[test]
     fn cancellation_at_every_checkpoint_discards_partial_pcm_and_resets_decoder_state() {

@@ -1137,6 +1137,40 @@ mod tests {
         }
     }
     #[test]
+    fn mapped_mp4_probe_decodes_only_the_first_packet_without_retaining_output_pcm() {
+        let (init, media) = crate::player::fixtures::mp4_aac(&[0x13, 0x08]);
+        for retain in [false, true] {
+            let mock = Mock {
+                steps: RefCell::new(vec![
+                    step("/variants.m3u8", b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=64000,CODECS=\"mp4a.40.2\"\naudio.m3u8\n"),
+                    step("/audio.m3u8", b"#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MAP:URI=\"setup.mp4\"\n#EXTINF:5,\nchunk.m4s\n#EXT-X-ENDLIST\n"),
+                    step("/setup.mp4", &init), step("/chunk.m4s", &media),
+                ].into()), seen: RefCell::new(Vec::new()),
+            };
+            let result = inspect_hls(
+                &mock,
+                Url::parse("https://radiko.jp/variants.m3u8").unwrap(),
+                &HeaderMap::new(),
+                retain,
+            )
+            .unwrap();
+            let DecodeProbe::RawAacDecoded(summary) = result.decode else {
+                panic!("ASC AAC probe failed");
+            };
+            assert_eq!(
+                (
+                    summary.sample_rate,
+                    summary.channels,
+                    summary.frames,
+                    summary.packets
+                ),
+                (24000, 1, 1024, 1)
+            );
+            assert!(result.audio.is_none());
+            assert!(mock.steps.borrow().is_empty());
+        }
+    }
+    #[test]
     fn live_probe_resolves_auth_and_hls_without_leaking_member_credentials_to_cdn() {
         let mock = flow();
         let now = dt("2026-10-15T12:00:00+09:00");
