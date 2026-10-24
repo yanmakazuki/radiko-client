@@ -258,23 +258,38 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         .as_ref()
         .filter(|_| request.range.days().len() == 1)
     {
-        let list = catalog::list_programs(station, request.day)?;
-        if request.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&snapshot(&list, now, &request.filter)?)?
-            );
-        } else {
-            print_list(&list, now, &request.filter)?;
-            if request.classifications {
-                print_classifications(&ObservedClassifications::collect(&list.programs));
-            }
-        }
-        if list.invalid_count > 0 {
-            return Err("取得結果に不正な放送枠があり、結果が不完全です".into());
-        }
-        return Ok(());
+        return print_station_day(station, &request, now);
     }
+    acquire_range(&request, now)
+}
+
+fn print_station_day(
+    station: &str,
+    request: &Request,
+    now: DateTime<FixedOffset>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let list = catalog::list_programs(station, request.day)?;
+    if request.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot(&list, now, &request.filter)?)?
+        );
+    } else {
+        print_list(&list, now, &request.filter)?;
+        if request.classifications {
+            print_classifications(&ObservedClassifications::collect(&list.programs));
+        }
+    }
+    if list.invalid_count > 0 {
+        return Err("取得結果に不正な放送枠があり、結果が不完全です".into());
+    }
+    Ok(())
+}
+
+fn acquire_range(
+    request: &Request,
+    now: DateTime<FixedOffset>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = catalog::CatalogClient::new()?;
     let mut display_error = None;
     let mut on_progress = |progress: radiko_client::catalog::Progress<'_>| {

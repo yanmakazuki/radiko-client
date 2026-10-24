@@ -69,13 +69,28 @@ fn compatible_config(
         .max_by_key(|config| config.channels())
 }
 
+/// The OS default output, opened as an enumerated device when its name matches.
+/// CPAL 0.16 registers a device-removal callback only for non-default devices and
+/// otherwise uses an output unit that follows later OS default changes.
+fn selected_output_device() -> Result<cpal::Device, OutputError> {
+    let host = cpal::default_host();
+    let fallback = host.default_output_device().ok_or(OutputError::NoDevice)?;
+    let name = fallback.name().map_err(|_| OutputError::DeviceInfo)?;
+    if let Ok(devices) = host.output_devices() {
+        for device in devices {
+            if device.name().ok().as_deref() == Some(name.as_str()) {
+                return Ok(device);
+            }
+        }
+    }
+    Ok(fallback)
+}
+
 pub fn inspect_default_output(sample_rate: u32) -> Result<OutputDeviceInfo, OutputError> {
     if !PCM_SAMPLE_RATE_RANGE.contains(&sample_rate) {
         return Err(OutputError::InvalidPcm);
     }
-    let device = cpal::default_host()
-        .default_output_device()
-        .ok_or(OutputError::NoDevice)?;
+    let device = selected_output_device()?;
     let name = device.name().map_err(|_| OutputError::DeviceInfo)?;
     let name: String = name.chars().filter(|c| !c.is_control()).take(256).collect();
     let configs = device
@@ -238,9 +253,7 @@ impl Output {
         deadline: Option<Instant>,
         stop: StopToken,
     ) -> Result<Self, OutputError> {
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or(OutputError::NoDevice)?;
+        let device = selected_output_device()?;
         let configs = device
             .supported_output_configs()
             .map_err(|_| OutputError::Device)?;
@@ -566,6 +579,7 @@ fn silent_pcm() -> DecodedPcm {
             frames: 48_000,
             sbr_detected: false,
             stereo_expansion: false,
+            explicit_ps: false,
             media_duration: Duration::from_secs(1),
             decode_duration: Duration::ZERO,
             nonzero_samples: 0,
@@ -599,6 +613,7 @@ pub fn probe_tone(seconds: u32) -> Result<OutputSummary, OutputError> {
                 frames,
                 sbr_detected: false,
                 stereo_expansion: false,
+                explicit_ps: false,
                 media_duration: Duration::from_secs(u64::from(seconds)),
                 decode_duration: Duration::ZERO,
                 nonzero_samples: 0,
@@ -824,6 +839,7 @@ mod tests {
             frames: 1,
             sbr_detected: false,
             stereo_expansion: false,
+            explicit_ps: false,
             media_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             nonzero_samples: 0,

@@ -123,6 +123,78 @@ struct Screen {
     preferences_notice: String,
 }
 impl Screen {
+    fn new(criteria: SearchCriteria, preferences_notice: String) -> Self {
+        Self {
+            help_open: false,
+            help_scroll: scroll::Scroll::default(),
+            failures_open: false,
+            failure_list: ListState::default(),
+            failure_height: 1,
+            login: None,
+            login_requested: None,
+            logout_confirm: false,
+            logout_requested: false,
+            live_mode: false,
+            live_rows: vec![],
+            live_refresh_at: None,
+            last_live_time: None,
+            timefree_criteria: None,
+            seek: None,
+            named: None,
+            named_action: None,
+            named_generation: 0,
+            filters: None,
+            auth_refresh: false,
+            chapter_action: None,
+            chapter_list: ListState::default(),
+            chapter_height: 1,
+            chapter_summary_focused: false,
+            chapter_summary_scroll: scroll::Scroll::default(),
+            chapter_notice: String::new(),
+            playback_action: None,
+            playback_notice: String::new(),
+            playback_diagnostics: String::new(),
+            pipeline_diagnostics: String::new(),
+            volume: 25,
+            app: AppState::new(criteria),
+            list: ListState::default(),
+            list_height: 1,
+            input: None,
+            preferences_notice,
+        }
+    }
+    fn dispatch_requested(
+        &mut self,
+        player: &mut PlaybackService,
+        authentication: &mut AuthService,
+        login_service: &mut LoginService,
+        logout: &mut LogoutService,
+        chapters: &mut ChapterService,
+    ) -> Result<(), &'static str> {
+        if let Some(credentials) = self.login_requested.take() {
+            self.auth_refresh = false;
+            authentication.cancel();
+            login_service.submit(self.app.authentication.begin_login()?, credentials)?;
+        }
+        if std::mem::take(&mut self.logout_requested) {
+            player.stop();
+            self.playback_action = None;
+            self.auth_refresh = false;
+            authentication.cancel();
+            logout.submit(self.app.authentication.begin_logout()?)?;
+        }
+        if std::mem::take(&mut self.auth_refresh) {
+            authentication.submit(self.app.authentication.begin()?);
+        }
+        if let Some(action) = self.chapter_action.take() {
+            match action {
+                ChapterAction::Fetch(id, target) => chapters.submit(id, *target),
+                ChapterAction::Cancel => chapters.cancel(),
+            }
+        }
+        self.dispatch_playback(player, Utc::now().fixed_offset());
+        Ok(())
+    }
     fn dispatch_playback(&mut self, player: &mut PlaybackService, now: DateTime<FixedOffset>) {
         let Some(action) = self.playback_action.take() else {
             return;
@@ -381,37 +453,70 @@ impl Screen {
             return Ok(true);
         }
         if self.help_open {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
-                self.help_open = false;
-            } else {
-                self.help_scroll.key(key.code);
-            }
-            return Ok(false);
+            return self.key_help(key);
         }
         if self.failures_open {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('e' | 'q') => self.failures_open = false,
-                key => viewport::navigate(
-                    &mut self.failure_list,
-                    failures::count(&self.app),
-                    self.failure_height,
-                    key,
-                ),
-            }
-            return Ok(false);
+            return self.key_failures(key);
         }
         if self.logout_confirm {
-            match key.code {
-                KeyCode::Char('y') => {
-                    self.logout_confirm = false;
-                    self.logout_requested = true;
-                }
-                KeyCode::Char('n') | KeyCode::Esc => self.logout_confirm = false,
-                KeyCode::Char('q') => return Ok(true),
-                _ => (),
-            }
-            return Ok(false);
+            return self.key_logout(key);
         }
+        if self.login.is_some() {
+            return self.key_login(key);
+        }
+        if self.seek.is_some() {
+            return self.key_seek(key);
+        }
+        if self.named.is_some() {
+            return self.key_named(key);
+        }
+        if self.filters.is_some() {
+            return self.key_filters(key, service);
+        }
+        if self.input.is_some() {
+            return self.key_keyword(key, service);
+        }
+        if let Some(stopped) = self.key_while_authenticating(key) {
+            return Ok(stopped);
+        }
+        if let Some(stopped) = self.key_chapters(key)? {
+            return Ok(stopped);
+        }
+        self.key_browser(key, service)
+    }
+    fn key_help(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
+            self.help_open = false;
+        } else {
+            self.help_scroll.key(key.code);
+        }
+        Ok(false)
+    }
+    fn key_failures(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('e' | 'q') => self.failures_open = false,
+            key => viewport::navigate(
+                &mut self.failure_list,
+                failures::count(&self.app),
+                self.failure_height,
+                key,
+            ),
+        }
+        Ok(false)
+    }
+    fn key_logout(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
+        match key.code {
+            KeyCode::Char('y') => {
+                self.logout_confirm = false;
+                self.logout_requested = true;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.logout_confirm = false,
+            KeyCode::Char('q') => return Ok(true),
+            _ => (),
+        }
+        Ok(false)
+    }
+    fn key_login(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
         if let Some(editor) = &mut self.login {
             match editor.handle(key) {
                 login::Action::Close => self.login = None,
@@ -421,8 +526,10 @@ impl Screen {
                 }
                 login::Action::None => (),
             }
-            return Ok(false);
         }
+        Ok(false)
+    }
+    fn key_seek(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
         if let Some(editor) = &mut self.seek {
             match editor.handle(key) {
                 seek::Action::Close => self.seek = None,
@@ -432,8 +539,10 @@ impl Screen {
                 }
                 seek::Action::None => (),
             }
-            return Ok(false);
         }
+        Ok(false)
+    }
+    fn key_named(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
         if let Some(manager) = &mut self.named {
             match manager.handle(key, &self.app.committed) {
                 named::Action::Close => self.named = None,
@@ -441,8 +550,10 @@ impl Screen {
                 named::Action::Operation(operation) => self.named_action = Some(operation),
                 named::Action::None => (),
             }
-            return Ok(false);
         }
+        Ok(false)
+    }
+    fn key_filters(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
         if let Some(editor) = &mut self.filters {
             match editor.handle(key) {
                 filters::Action::Cancel => {
@@ -465,8 +576,10 @@ impl Screen {
                 }
                 filters::Action::None => (),
             }
-            return Ok(false);
         }
+        Ok(false)
+    }
+    fn key_keyword(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
         if let Some(input) = self.input.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -496,23 +609,25 @@ impl Screen {
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                         && input.len() + c.len_utf8() <= 1024 =>
                 {
-                    input.push(c)
+                    input.push(c);
                 }
                 _ => (),
             }
-            if let Some(input) = &self.input {
-                self.app
-                    .edit_keyword((!input.trim().is_empty()).then(|| input.clone()))?;
-            }
-            return Ok(false);
         }
+        if let Some(input) = &self.input {
+            self.app
+                .edit_keyword((!input.trim().is_empty()).then(|| input.clone()))?;
+        }
+        Ok(false)
+    }
+    fn key_while_authenticating(&mut self, key: KeyEvent) -> Option<bool> {
         if matches!(
             self.app.authentication.status,
             AuthStatus::LoggingOut | AuthStatus::LoggingIn
         ) && matches!(key.code, KeyCode::Char('I' | 'O' | 'a'))
         {
             self.playback_notice = "認証情報の更新処理中です".into();
-            return Ok(false);
+            return Some(false);
         }
         if matches!(self.app.authentication.status, AuthStatus::LoggingOut)
             && matches!(
@@ -524,90 +639,97 @@ impl Screen {
             )
         {
             self.playback_notice = "ログアウト処理中です".into();
-            return Ok(false);
+            return Some(false);
         }
-        if self.app.chapters.target.is_some() {
-            match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    self.chapter_summary_focused = !self.chapter_summary_focused;
-                    return Ok(false);
-                }
-                KeyCode::Esc => {
-                    self.close_chapters();
-                    return Ok(false);
-                }
-                KeyCode::Char('r') | KeyCode::Char('c') => {
-                    if let Some(target) = self.app.chapters.target.clone() {
-                        self.open_chapters(target)?;
-                    }
-                    return Ok(false);
-                }
-                KeyCode::Down
-                | KeyCode::Char('j')
-                | KeyCode::Up
-                | KeyCode::Char('k')
-                | KeyCode::PageDown
-                | KeyCode::PageUp
-                | KeyCode::Home
-                | KeyCode::End => {
-                    let count = self
-                        .app
-                        .chapters
-                        .candidates
-                        .as_ref()
-                        .map_or(0, |set| set.chapters.len());
-                    if self.chapter_summary_focused {
-                        self.chapter_summary_scroll.key(key.code);
-                    } else {
-                        let previous = self.chapter_list.selected();
-                        viewport::navigate(
-                            &mut self.chapter_list,
-                            count,
-                            self.chapter_height,
-                            key.code,
-                        );
-                        if self.chapter_list.selected() != previous {
-                            self.chapter_summary_scroll = scroll::Scroll::default();
-                        }
-                    }
-                    return Ok(false);
-                }
-                KeyCode::Enter => {
-                    let index = self.chapter_list.selected().unwrap_or_default();
-                    match self.app.chapters.jump(index) {
-                        Ok((program, position)) => {
-                            match radiko_client::app::playback::request(
-                                program,
-                                Utc::now().fixed_offset(),
-                            ) {
-                                Err(reason) => self.chapter_notice = reason.into(),
-                                Ok(_) => {
-                                    let same = self.app.playback.as_ref().is_some_and(|p| {
-                                        p.info.station == program.key.station_id
-                                            && p.info.starts_at == program.key.starts_at
-                                            && p.info.mode == radiko_client::radiko::stream::ProbeMode::TimeFree
-                                    });
-                                    self.playback_action = Some(if same {
-                                        PlaybackAction::Command(Command::SeekSlot {
-                                            key: program.key.clone(),
-                                            position,
-                                        })
-                                    } else {
-                                        PlaybackAction::Chapter(program.clone(), position)
-                                    });
-                                    self.chapter_notice =
-                                        "チャプター再生を準備します（成功後に切替）".into();
-                                }
-                            }
-                        }
-                        Err(reason) => self.chapter_notice = reason.into(),
-                    }
-                    return Ok(false);
-                }
-                KeyCode::Char('/') | KeyCode::Char('f') | KeyCode::Char('b') => return Ok(false),
-                _ => (),
+        None
+    }
+    fn key_chapters(&mut self, key: KeyEvent) -> Result<Option<bool>, &'static str> {
+        if self.app.chapters.target.is_none() {
+            return Ok(None);
+        }
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.chapter_summary_focused = !self.chapter_summary_focused;
+                Ok(Some(false))
             }
+            KeyCode::Esc => {
+                self.close_chapters();
+                Ok(Some(false))
+            }
+            KeyCode::Char('r') | KeyCode::Char('c') => {
+                if let Some(target) = self.app.chapters.target.clone() {
+                    self.open_chapters(target)?;
+                }
+                Ok(Some(false))
+            }
+            KeyCode::Down
+            | KeyCode::Char('j')
+            | KeyCode::Up
+            | KeyCode::Char('k')
+            | KeyCode::PageDown
+            | KeyCode::PageUp
+            | KeyCode::Home
+            | KeyCode::End => {
+                let count = self
+                    .app
+                    .chapters
+                    .candidates
+                    .as_ref()
+                    .map_or(0, |set| set.chapters.len());
+                if self.chapter_summary_focused {
+                    self.chapter_summary_scroll.key(key.code);
+                } else {
+                    let previous = self.chapter_list.selected();
+                    viewport::navigate(
+                        &mut self.chapter_list,
+                        count,
+                        self.chapter_height,
+                        key.code,
+                    );
+                    if self.chapter_list.selected() != previous {
+                        self.chapter_summary_scroll = scroll::Scroll::default();
+                    }
+                }
+                Ok(Some(false))
+            }
+            KeyCode::Enter => {
+                self.confirm_chapter()?;
+                Ok(Some(false))
+            }
+            KeyCode::Char('/') | KeyCode::Char('f') | KeyCode::Char('b') => Ok(Some(false)),
+            _ => Ok(None),
         }
+    }
+    fn confirm_chapter(&mut self) -> Result<(), &'static str> {
+        let index = self.chapter_list.selected().unwrap_or_default();
+        match self.app.chapters.jump(index) {
+            Ok((program, position)) => {
+                match radiko_client::app::playback::request(program, Utc::now().fixed_offset()) {
+                    Err(reason) => self.chapter_notice = reason.into(),
+                    Ok(_) => {
+                        let same = self.app.playback.as_ref().is_some_and(|playback| {
+                            playback.info.station == program.key.station_id
+                                && playback.info.starts_at == program.key.starts_at
+                                && playback.info.mode
+                                    == radiko_client::radiko::stream::ProbeMode::TimeFree
+                        });
+                        self.playback_action = Some(if same {
+                            PlaybackAction::Command(Command::SeekSlot {
+                                key: program.key.clone(),
+                                position,
+                            })
+                        } else {
+                            PlaybackAction::Chapter(program.clone(), position)
+                        });
+                        self.chapter_notice = "チャプター再生を準備します（成功後に切替）".into();
+                    }
+                }
+            }
+            Err(reason) => self.chapter_notice = reason.into(),
+        }
+        Ok(())
+    }
+    fn key_browser(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('?') => {
@@ -737,6 +859,44 @@ impl Screen {
         }
         Ok(false)
     }
+    fn control_hint(&self) -> String {
+        if self.login.is_some() {
+            return "Tab 入力欄 / Enter 次の欄・ログイン確定 / Ctrl+U 消去 / Esc 取消 / Ctrl+C 終了"
+                .into();
+        }
+        if self.logout_confirm {
+            return "ログアウトしますか？ 再生を停止し保存セッションを削除 / y 確定 / n・Esc 取消"
+                .into();
+        }
+        if let Some(editor) = &self.seek {
+            return editor.prompt();
+        }
+        if let Some(manager) = &self.named {
+            return manager.controls().into();
+        }
+        if let Some(editor) = &self.filters {
+            return editor.controls().into();
+        }
+        let enter = if self.app.chapters.target.is_some() {
+            if self
+                .app
+                .chapters
+                .jump(self.chapter_list.selected().unwrap_or_default())
+                .is_ok()
+            {
+                "Enter チャプターから再生 / r 再取得 / Esc 詳細へ"
+            } else {
+                "Enter ジャンプ不可（位置未検証）"
+            }
+        } else if self.live_mode {
+            "Enter ライブ再生 / v TF画面 / f 条件 / b 保存条件 / c チャプター"
+        } else {
+            "Enter TF再生 / v ライブ画面 / l ライブ / f 条件 / b 保存条件 / c チャプター"
+        };
+        format!(
+            "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了"
+        )
+    }
 }
 fn local(time: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
     FixedOffset::east_opt(9 * 3600)
@@ -811,7 +971,30 @@ fn preview(text: &str) -> String {
     }
     output.chars().take(1200).collect()
 }
+fn highlighted_chapter(screen: &Screen, now: DateTime<FixedOffset>) -> Option<usize> {
+    let state = &screen.app.chapters;
+    let playback = screen.app.playback.as_ref()?;
+    if playback.info.mode != radiko_client::radiko::stream::ProbeMode::TimeFree {
+        return None;
+    }
+    let (bound, _) = state.jump(0).ok()?;
+    if radiko_client::app::playback::availability(
+        bound,
+        radiko_client::radiko::stream::ProbeMode::TimeFree,
+        now,
+        Some(playback),
+    ) != radiko_client::domain::ListeningAvailability::CurrentOutput
+    {
+        return None;
+    }
+    state
+        .candidates
+        .as_ref()?
+        .current(playback.position?)
+        .map(|chapter| chapter.source_index)
+}
 fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTime<FixedOffset>) {
+    let current = highlighted_chapter(screen, now);
     let state = &screen.app.chapters;
     let Some(target) = &state.target else {
         return;
@@ -851,26 +1034,6 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
     frame.render_widget(Paragraph::new(format!("{} / {}\n{}〜{} JST\n{} / {}\nr 再取得 / Esc 番組詳細へ（選択移動では再生しません）\n{}",
         target.title, target.key.station_id, local(target.key.starts_at).format("%Y/%m/%d %H:%M"), local(target.ends_at).format("%Y/%m/%d %H:%M"),
         state.label(), counts, failure)).block(Block::default().borders(Borders::ALL).title("公式AIチャプター・閲覧中")), panes[0]);
-    let current = screen.app.playback.as_ref().and_then(|p| {
-        if p.info.mode != radiko_client::radiko::stream::ProbeMode::TimeFree {
-            return None;
-        }
-        let (bound, _) = state.jump(0).ok()?;
-        if radiko_client::app::playback::availability(
-            bound,
-            radiko_client::radiko::stream::ProbeMode::TimeFree,
-            now,
-            Some(p),
-        ) != radiko_client::domain::ListeningAvailability::CurrentOutput
-        {
-            return None;
-        }
-        state
-            .candidates
-            .as_ref()?
-            .current(p.position?)
-            .map(|c| c.source_index)
-    });
     let items: Vec<_> = state
         .candidates
         .as_ref()
@@ -941,39 +1104,7 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
         panes[2],
     );
 }
-fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
-    if screen.failures_open {
-        failures::draw(
-            frame,
-            &screen.app,
-            &mut screen.failure_list,
-            &mut screen.failure_height,
-        );
-        return;
-    }
-    if screen.help_open {
-        help::draw(
-            frame,
-            screen.app.playback.as_ref(),
-            screen.volume,
-            &mut screen.help_scroll,
-            &screen.pipeline_diagnostics,
-        );
-        return;
-    }
-    let show_http = frame.area().height >= 36;
-    let areas = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Min(1),
-        Constraint::Length(if screen.input.is_some() {
-            4
-        } else if screen.seek.is_some() {
-            11 + u16::from(show_http)
-        } else {
-            10 + u16::from(show_http)
-        }),
-    ])
-    .split(frame.area());
+fn draw_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, area: Rect) {
     let scope = match screen.app.committed.scope() {
         Scope::Nationwide => "全国".into(),
         Scope::Station(id) => id.clone(),
@@ -1010,8 +1141,221 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
                 .title("radiko-client")
                 .borders(Borders::ALL),
         ),
-        areas[0],
+        area,
     );
+}
+fn draw_programs(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>, area: Rect) {
+    let panes =
+        Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).split(area);
+    screen.list_height = usize::from(panes[0].height.saturating_sub(2));
+    let count = screen.rows().len();
+    let visible = viewport::visible(&mut screen.list, count, screen.list_height);
+    let mut local_list = ListState::default();
+    local_list.select(
+        screen
+            .list
+            .selected()
+            .filter(|i| visible.contains(i))
+            .map(|i| i - visible.start),
+    );
+    let items: Vec<_> = screen.rows()[visible]
+        .iter()
+        .map(|i| {
+            let p = &screen.app.programs[*i];
+            ListItem::new(format!(
+                "{} {} [{}] {}",
+                local(p.key.starts_at).format("%m/%d %H:%M"),
+                p.key.station_id,
+                status(p, now),
+                p.title.chars().take(120).collect::<String>()
+            ))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "番組一覧 一致{} / 取得{}枠",
+                screen.rows().len(),
+                screen.app.programs.len()
+            )))
+            .highlight_style(Style::default().bg(Color::DarkGray))
+            .highlight_symbol("▶ "),
+        panes[0],
+        &mut local_list,
+    );
+    let mut detail = screen
+        .selected()
+        .map(|p| {
+            format!(
+                "{}\n{} / {}〜{} JST\n{} / {}\n出演: {}\n\n{}\n{}",
+                p.title,
+                p.key.station_id,
+                local(p.key.starts_at).format("%m/%d %H:%M"),
+                local(p.ends_at).format("%m/%d %H:%M"),
+                status(p, now),
+                radiko_client::app::playback::availability(
+                    p,
+                    if screen.live_mode {
+                        radiko_client::radiko::stream::ProbeMode::Live
+                    } else {
+                        radiko_client::radiko::stream::ProbeMode::TimeFree
+                    },
+                    now,
+                    screen.app.playback.as_ref(),
+                )
+                .label(),
+                p.performer,
+                preview(&p.description),
+                preview(&p.info)
+            )
+        })
+        .unwrap_or_else(|| "選択できる番組はありません".into());
+    for failure in screen
+        .app
+        .area_failures
+        .iter()
+        .chain(&screen.app.schedule_failures)
+        .take(5)
+    {
+        detail.push_str(&format!(
+            "\n未取得: {} {} {}",
+            failure.target,
+            failure.day.map(|d| d.to_string()).unwrap_or_default(),
+            failure.error
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(detail).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("番組詳細（閲覧中）")
+                .borders(Borders::ALL),
+        ),
+        panes[1],
+    );
+}
+fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) {
+    let state = match screen.app.status {
+        SearchStatus::Idle => "未取得",
+        SearchStatus::Loading => "取得中",
+        SearchStatus::Ready => "取得完了",
+        SearchStatus::Partial => "部分取得・未取得あり",
+        SearchStatus::Failed => "取得失敗",
+    };
+    let progress = screen
+        .app
+        .progress
+        .as_ref()
+        .map(|p| {
+            format!(
+                "{} {}/{} 失敗{} / {} {}",
+                p.phase,
+                p.completed,
+                p.total,
+                p.failed,
+                p.target,
+                p.day.map(|d| d.to_string()).unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    let playing = screen
+        .app
+        .playback
+        .as_ref()
+        .map(|p| {
+            format!(
+                "再生中: [{} / {:?}] {}\n{}〜{} JST / {:?} / 音量{}% / {}",
+                p.info.station,
+                p.info.mode,
+                p.info.title.as_deref().unwrap_or("番組名未取得"),
+                local(p.info.starts_at).format("%m/%d %H:%M"),
+                local(p.info.ends_at).format("%m/%d %H:%M"),
+                p.state,
+                p.volume,
+                p.position
+                    .map(|v| format!("位置{:.1}秒", v.as_secs_f64()))
+                    .unwrap_or_else(|| "番組内位置未確認".into())
+            )
+        })
+        .unwrap_or_else(|| format!("再生中: なし / 音量{}%", screen.volume));
+    let controls = screen.control_hint();
+    let pipeline = screen
+        .app
+        .playback
+        .as_ref()
+        .and_then(|p| p.pipeline.as_ref())
+        .map(|p| p.lines())
+        .unwrap_or_else(|| {
+            if screen.pipeline_diagnostics.is_empty() {
+                "処理診断 未取得\n通信診断 未取得".into()
+            } else {
+                screen.pipeline_diagnostics.clone()
+            }
+        });
+    let pipeline = if show_http {
+        pipeline
+    } else {
+        pipeline
+            .lines()
+            .next()
+            .unwrap_or("処理診断 未取得")
+            .to_owned()
+    };
+    let footer = format!(
+        "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}\n{}\n{} {}",
+        state,
+        progress,
+        screen.app.invalid_count,
+        playing,
+        screen.playback_diagnostics,
+        pipeline,
+        controls,
+        screen.playback_notice,
+        screen
+            .filters
+            .as_ref()
+            .map(|editor| editor.error.as_str())
+            .unwrap_or(&screen.app.notification),
+        screen.preferences_notice
+    );
+    frame.render_widget(
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+}
+fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
+    if screen.failures_open {
+        failures::draw(
+            frame,
+            &screen.app,
+            &mut screen.failure_list,
+            &mut screen.failure_height,
+        );
+        return;
+    }
+    if screen.help_open {
+        help::draw(
+            frame,
+            screen.app.playback.as_ref(),
+            screen.volume,
+            &mut screen.help_scroll,
+            &screen.pipeline_diagnostics,
+        );
+        return;
+    }
+    let show_http = frame.area().height >= 36;
+    let areas = Layout::vertical([
+        Constraint::Length(7),
+        Constraint::Min(1),
+        Constraint::Length(if screen.input.is_some() {
+            4
+        } else if screen.seek.is_some() {
+            11 + u16::from(show_http)
+        } else {
+            10 + u16::from(show_http)
+        }),
+    ])
+    .split(frame.area());
+    draw_header(frame, screen, now, areas[0]);
     if let Some(editor) = &screen.login {
         editor.draw(frame, areas[1]);
     } else if let Some(manager) = &mut screen.named {
@@ -1021,93 +1365,7 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     } else if screen.app.chapters.target.is_some() {
         draw_chapters(frame, screen, areas[1], now);
     } else {
-        let panes = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
-            .split(areas[1]);
-        screen.list_height = usize::from(panes[0].height.saturating_sub(2));
-        let count = screen.rows().len();
-        let visible = viewport::visible(&mut screen.list, count, screen.list_height);
-        let mut local_list = ListState::default();
-        local_list.select(
-            screen
-                .list
-                .selected()
-                .filter(|i| visible.contains(i))
-                .map(|i| i - visible.start),
-        );
-        let items: Vec<_> = screen.rows()[visible]
-            .iter()
-            .map(|i| {
-                let p = &screen.app.programs[*i];
-                ListItem::new(format!(
-                    "{} {} [{}] {}",
-                    local(p.key.starts_at).format("%m/%d %H:%M"),
-                    p.key.station_id,
-                    status(p, now),
-                    p.title.chars().take(120).collect::<String>()
-                ))
-            })
-            .collect();
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(format!(
-                    "番組一覧 一致{} / 取得{}枠",
-                    screen.rows().len(),
-                    screen.app.programs.len()
-                )))
-                .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("▶ "),
-            panes[0],
-            &mut local_list,
-        );
-        let mut detail = screen
-            .selected()
-            .map(|p| {
-                format!(
-                    "{}\n{} / {}〜{} JST\n{} / {}\n出演: {}\n\n{}\n{}",
-                    p.title,
-                    p.key.station_id,
-                    local(p.key.starts_at).format("%m/%d %H:%M"),
-                    local(p.ends_at).format("%m/%d %H:%M"),
-                    status(p, now),
-                    radiko_client::app::playback::availability(
-                        p,
-                        if screen.live_mode {
-                            radiko_client::radiko::stream::ProbeMode::Live
-                        } else {
-                            radiko_client::radiko::stream::ProbeMode::TimeFree
-                        },
-                        now,
-                        screen.app.playback.as_ref(),
-                    )
-                    .label(),
-                    p.performer,
-                    preview(&p.description),
-                    preview(&p.info)
-                )
-            })
-            .unwrap_or_else(|| "選択できる番組はありません".into());
-        for failure in screen
-            .app
-            .area_failures
-            .iter()
-            .chain(&screen.app.schedule_failures)
-            .take(5)
-        {
-            detail.push_str(&format!(
-                "\n未取得: {} {} {}",
-                failure.target,
-                failure.day.map(|d| d.to_string()).unwrap_or_default(),
-                failure.error
-            ));
-        }
-        frame.render_widget(
-            Paragraph::new(detail).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .title("番組詳細（閲覧中）")
-                    .borders(Borders::ALL),
-            ),
-            panes[1],
-        );
+        draw_programs(frame, screen, now, areas[1]);
     }
     if let Some(input) = &screen.input {
         frame.render_widget(
@@ -1118,151 +1376,15 @@ fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
             areas[2],
         );
     } else {
-        let state = match screen.app.status {
-            SearchStatus::Idle => "未取得",
-            SearchStatus::Loading => "取得中",
-            SearchStatus::Ready => "取得完了",
-            SearchStatus::Partial => "部分取得・未取得あり",
-            SearchStatus::Failed => "取得失敗",
-        };
-        let progress = screen
-            .app
-            .progress
-            .as_ref()
-            .map(|p| {
-                format!(
-                    "{} {}/{} 失敗{} / {} {}",
-                    p.phase,
-                    p.completed,
-                    p.total,
-                    p.failed,
-                    p.target,
-                    p.day.map(|d| d.to_string()).unwrap_or_default()
-                )
-            })
-            .unwrap_or_default();
-        let playing = screen
-            .app
-            .playback
-            .as_ref()
-            .map(|p| {
-                format!(
-                    "再生中: [{} / {:?}] {}\n{}〜{} JST / {:?} / 音量{}% / {}",
-                    p.info.station,
-                    p.info.mode,
-                    p.info.title.as_deref().unwrap_or("番組名未取得"),
-                    local(p.info.starts_at).format("%m/%d %H:%M"),
-                    local(p.info.ends_at).format("%m/%d %H:%M"),
-                    p.state,
-                    p.volume,
-                    p.position
-                        .map(|v| format!("位置{:.1}秒", v.as_secs_f64()))
-                        .unwrap_or_else(|| "番組内位置未確認".into())
-                )
-            })
-            .unwrap_or_else(|| format!("再生中: なし / 音量{}%", screen.volume));
-        let controls = if screen.login.is_some() {
-            "Tab 入力欄 / Enter 次の欄・ログイン確定 / Ctrl+U 消去 / Esc 取消 / Ctrl+C 終了".into()
-        } else if screen.logout_confirm {
-            "ログアウトしますか？ 再生を停止し保存セッションを削除 / y 確定 / n・Esc 取消".into()
-        } else if let Some(editor) = &screen.seek {
-            editor.prompt()
-        } else if let Some(manager) = &screen.named {
-            manager.controls().into()
-        } else if let Some(editor) = &screen.filters {
-            editor.controls().into()
-        } else {
-            let enter = if screen.app.chapters.target.is_some() {
-                if screen
-                    .app
-                    .chapters
-                    .jump(screen.chapter_list.selected().unwrap_or_default())
-                    .is_ok()
-                {
-                    "Enter チャプターから再生 / r 再取得 / Esc 詳細へ"
-                } else {
-                    "Enter ジャンプ不可（位置未検証）"
-                }
-            } else {
-                if screen.live_mode {
-                    "Enter ライブ再生 / v TF画面 / f 条件 / b 保存条件 / c チャプター"
-                } else {
-                    "Enter TF再生 / v ライブ画面 / l ライブ / f 条件 / b 保存条件 / c チャプター"
-                }
-            };
-            format!(
-                "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了"
-            )
-        };
-        let pipeline = screen
-            .app
-            .playback
-            .as_ref()
-            .and_then(|p| p.pipeline.as_ref())
-            .map(|p| p.lines())
-            .unwrap_or_else(|| {
-                if screen.pipeline_diagnostics.is_empty() {
-                    "処理診断 未取得\n通信診断 未取得".into()
-                } else {
-                    screen.pipeline_diagnostics.clone()
-                }
-            });
-        let pipeline = if show_http {
-            pipeline
-        } else {
-            pipeline
-                .lines()
-                .next()
-                .unwrap_or("処理診断 未取得")
-                .to_owned()
-        };
-        let footer = format!(
-            "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}\n{}\n{} {}",
-            state,
-            progress,
-            screen.app.invalid_count,
-            playing,
-            screen.playback_diagnostics,
-            pipeline,
-            controls,
-            screen.playback_notice,
-            screen
-                .filters
-                .as_ref()
-                .map(|editor| editor.error.as_str())
-                .unwrap_or(&screen.app.notification),
-            screen.preferences_notice
-        );
-        frame.render_widget(
-            Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
-            areas[2],
-        );
+        draw_status(frame, screen, areas[2], show_http);
     }
 }
-pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    if args == ["--help"] {
-        println!("{USAGE}");
-        return Ok(());
-    }
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--json" | "--classifications"))
-    {
-        return Err("TUIでは表示用CLIオプションは使用できません".into());
-    }
-    let now = Utc::now().fixed_offset();
-    let explicit = if args.is_empty() {
-        None
-    } else {
-        Some(crate::programs::criteria(args, now)?)
-    };
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err("tuiは対話端末で実行してください".into());
-    }
+fn saved_criteria(
+    explicit: Option<SearchCriteria>,
+    data_dir: Option<PathBuf>,
+    now: DateTime<FixedOffset>,
+) -> Result<(SearchCriteria, Option<SearchStore>, String), Box<dyn std::error::Error>> {
     let mut preferences_notice = String::new();
-    let playback_dir = data_dir.clone();
-    let auth_dir = data_dir.clone();
-    let named_dir = data_dir.clone();
     let store = match data_dir {
         Some(path) => Some(SearchStore::new(path)),
         None => match SearchStore::default_location() {
@@ -1289,6 +1411,75 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     } else {
         SearchCriteria::initial(now)?
     };
+    Ok((criteria, store, preferences_notice))
+}
+struct Services<'a> {
+    named: &'a mut NamedService,
+    login: &'a mut LoginService,
+    logout: &'a mut LogoutService,
+    authentication: &'a mut AuthService,
+    search: &'a mut Service,
+    chapters: &'a mut ChapterService,
+    player: &'a mut PlaybackService,
+}
+async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(), &'static str> {
+    if let Some(event) = jobs.named.poll().await {
+        screen.named_event(event)?;
+    }
+    screen.dispatch_named(jobs.named);
+    if let Some(event) = jobs.login.poll().await {
+        screen.app.authentication.apply(event);
+    }
+    if let Some(event) = jobs.logout.poll().await {
+        screen.app.authentication.apply(event);
+    }
+    if let Some(event) = jobs.authentication.poll().await {
+        screen.app.authentication.apply(event);
+    }
+    for event in jobs.search.poll().await {
+        screen.apply(event);
+    }
+    if let Some(event) = jobs.chapters.poll().await {
+        screen.app.chapters.apply(event);
+        if screen.chapter_list.selected().is_none()
+            && screen
+                .app
+                .chapters
+                .candidates
+                .as_ref()
+                .is_some_and(|set| !set.chapters.is_empty())
+        {
+            screen.chapter_list.select(Some(0));
+        }
+    }
+    screen.apply_playback(jobs.player.poll());
+    screen.refresh_live(Utc::now().fixed_offset());
+    Ok(())
+}
+pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    if args == ["--help"] {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--json" | "--classifications"))
+    {
+        return Err("TUIでは表示用CLIオプションは使用できません".into());
+    }
+    let now = Utc::now().fixed_offset();
+    let explicit = if args.is_empty() {
+        None
+    } else {
+        Some(crate::programs::criteria(args, now)?)
+    };
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("tuiは対話端末で実行してください".into());
+    }
+    let playback_dir = data_dir.clone();
+    let auth_dir = data_dir.clone();
+    let named_dir = data_dir.clone();
+    let (criteria, store, preferences_notice) = saved_criteria(explicit, data_dir, now)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal = shutdown.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Release))
@@ -1307,44 +1498,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     let result = {
         let _restore = RestoreTerminal;
         let mut terminal = ratatui::try_init()?;
-        let mut screen = Screen {
-            help_open: false,
-            help_scroll: scroll::Scroll::default(),
-            failures_open: false,
-            failure_list: ListState::default(),
-            failure_height: 1,
-            login: None,
-            login_requested: None,
-            logout_confirm: false,
-            logout_requested: false,
-            live_mode: false,
-            live_rows: vec![],
-            live_refresh_at: None,
-            last_live_time: None,
-            timefree_criteria: None,
-            seek: None,
-            named: None,
-            named_action: None,
-            named_generation: 0,
-            filters: None,
-            auth_refresh: false,
-            chapter_action: None,
-            chapter_list: ListState::default(),
-            chapter_height: 1,
-            chapter_summary_focused: false,
-            chapter_summary_scroll: scroll::Scroll::default(),
-            chapter_notice: String::new(),
-            playback_action: None,
-            playback_notice: String::new(),
-            playback_diagnostics: String::new(),
-            pipeline_diagnostics: String::new(),
-            volume: 25,
-            app: AppState::new(criteria),
-            list: ListState::default(),
-            list_height: 1,
-            input: None,
-            preferences_notice,
-        };
+        let mut screen = Screen::new(criteria, preferences_notice);
         let rt = runtime.0.as_ref().ok_or("実行環境を開始できません")?;
         rt.block_on(async {
             let mut service = Service::new_cancellable(CatalogClient::new_cancellable);
@@ -1362,37 +1516,19 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                     named_write_pending = named_service.writing();
                     break;
                 }
-                if let Some(event) = named_service.poll().await {
-                    screen.named_event(event)?;
-                }
-                screen.dispatch_named(&mut named_service);
-                if let Some(event) = login_service.poll().await {
-                    screen.app.authentication.apply(event);
-                }
-                if let Some(event) = logout.poll().await {
-                    screen.app.authentication.apply(event);
-                }
-                if let Some(event) = authentication.poll().await {
-                    screen.app.authentication.apply(event);
-                }
-                for event in service.poll().await {
-                    screen.apply(event);
-                }
-                if let Some(event) = chapters.poll().await {
-                    screen.app.chapters.apply(event);
-                    if screen.chapter_list.selected().is_none()
-                        && screen
-                            .app
-                            .chapters
-                            .candidates
-                            .as_ref()
-                            .is_some_and(|set| !set.chapters.is_empty())
-                    {
-                        screen.chapter_list.select(Some(0));
-                    }
-                }
-                screen.apply_playback(player.poll());
-                screen.refresh_live(Utc::now().fixed_offset());
+                poll_services(
+                    &mut screen,
+                    &mut Services {
+                        named: &mut named_service,
+                        login: &mut login_service,
+                        logout: &mut logout,
+                        authentication: &mut authentication,
+                        search: &mut service,
+                        chapters: &mut chapters,
+                        player: &mut player,
+                    },
+                )
+                .await?;
                 terminal.draw(|frame| draw(frame, &mut screen, Utc::now().fixed_offset()))?;
                 let mut quit = false;
                 for _ in 0..32 {
@@ -1402,29 +1538,13 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                     if let Event::Key(key) = event::read()? {
                         let should_quit = screen.key(key, &mut service)?;
                         screen.dispatch_named(&mut named_service);
-                        if let Some(credentials) = screen.login_requested.take() {
-                            screen.auth_refresh = false;
-                            authentication.cancel();
-                            login_service
-                                .submit(screen.app.authentication.begin_login()?, credentials)?;
-                        }
-                        if std::mem::take(&mut screen.logout_requested) {
-                            player.stop();
-                            screen.playback_action = None;
-                            screen.auth_refresh = false;
-                            authentication.cancel();
-                            logout.submit(screen.app.authentication.begin_logout()?)?;
-                        }
-                        if std::mem::take(&mut screen.auth_refresh) {
-                            authentication.submit(screen.app.authentication.begin()?);
-                        }
-                        if let Some(action) = screen.chapter_action.take() {
-                            match action {
-                                ChapterAction::Fetch(id, target) => chapters.submit(id, *target),
-                                ChapterAction::Cancel => chapters.cancel(),
-                            }
-                        }
-                        screen.dispatch_playback(&mut player, Utc::now().fixed_offset());
+                        screen.dispatch_requested(
+                            &mut player,
+                            &mut authentication,
+                            &mut login_service,
+                            &mut logout,
+                            &mut chapters,
+                        )?;
                         if should_quit {
                             player.stop();
                             let deadline = std::time::Instant::now() + Duration::from_millis(200);
@@ -1515,44 +1635,7 @@ mod tests {
     fn screen() -> Screen {
         let now = radiko_client::radiko::stream::parse_time("20261015060000").unwrap();
         let criteria = crate::programs::criteria(&["TBS".into(), "20261015".into()], now).unwrap();
-        Screen {
-            help_open: false,
-            help_scroll: scroll::Scroll::default(),
-            failures_open: false,
-            failure_list: ListState::default(),
-            failure_height: 1,
-            login: None,
-            login_requested: None,
-            logout_confirm: false,
-            logout_requested: false,
-            live_mode: false,
-            live_rows: vec![],
-            live_refresh_at: None,
-            last_live_time: None,
-            timefree_criteria: None,
-            seek: None,
-            named: None,
-            named_action: None,
-            named_generation: 0,
-            filters: None,
-            auth_refresh: false,
-            chapter_action: None,
-            chapter_list: ListState::default(),
-            chapter_height: 1,
-            chapter_summary_focused: false,
-            chapter_summary_scroll: scroll::Scroll::default(),
-            chapter_notice: String::new(),
-            playback_action: None,
-            playback_notice: String::new(),
-            playback_diagnostics: String::new(),
-            pipeline_diagnostics: String::new(),
-            volume: 25,
-            app: AppState::new(criteria),
-            list: ListState::default(),
-            list_height: 1,
-            input: None,
-            preferences_notice: String::new(),
-        }
+        Screen::new(criteria, String::new())
     }
     #[test]
     fn volume_display_changes_only_after_the_playback_service_accepts_the_command() {

@@ -69,6 +69,9 @@ pub struct AacSummary {
     pub sbr_detected: bool,
     /// Output expansion is observable, but does not independently prove PS signalling.
     pub stereo_expansion: bool,
+    /// Parametric Stereo declared by an AudioSpecificConfig. ADTS leaves this false:
+    /// the adopted decoder does not publish a bitstream PS flag.
+    pub explicit_ps: bool,
     pub media_duration: Duration,
     pub decode_duration: Duration,
     pub nonzero_samples: usize,
@@ -256,6 +259,7 @@ impl AdtsDecoder {
             frames: 0,
             sbr_detected: false,
             stereo_expansion: false,
+            explicit_ps: false,
             media_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             nonzero_samples: 0,
@@ -448,9 +452,10 @@ impl RawAacDecoder {
                     Some(Decoder::with_stream_config(self.config.clone()).map_err(map_error)?);
                 self.inner.format = Some(format);
             }
-            let summary =
+            let mut summary =
                 self.inner
                     .decode_frames(frames, declared_codec, pcm, cancelled, started)?;
+            summary.explicit_ps = self.config.ps;
             if self.config.sbr && !summary.sbr_detected {
                 return Err(AacError::DeclaredSbrMissing);
             }
@@ -516,6 +521,8 @@ mod tests {
         let first = decoder.decode_packets(&raw[..1], None).unwrap();
         let rest = decoder.decode_packets(&raw[1..], None).unwrap();
         assert_eq!(first.frames + rest.frames, adts.frames);
+        assert!(!first.explicit_ps);
+        assert!(!adts.explicit_ps);
         assert_eq!(
             first.nonzero_samples + rest.nonzero_samples,
             adts.nonzero_samples

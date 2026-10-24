@@ -15,6 +15,14 @@ pub struct FragmentPcm {
     pub pcm: DecodedPcm,
 }
 
+struct FragmentMedia<'a> {
+    decode_time: u64,
+    duration: u64,
+    next_time: u64,
+    next_sequence: u32,
+    packets: Vec<&'a [u8]>,
+}
+
 /// Restricted to one AAC track, one traf/trun/mdat, relative addressing and no edits.
 /// Initialization changes and discontinuities require a new instance.
 pub struct FragmentedAacDecoder {
@@ -168,12 +176,11 @@ impl FragmentedAacDecoder {
         result
     }
 
-    fn decode(
-        &mut self,
-        bytes: &[u8],
-        declared_codec: Option<&str>,
+    fn read_media<'a>(
+        &self,
+        bytes: &'a [u8],
         cancelled: &mut dyn FnMut() -> bool,
-    ) -> Result<FragmentPcm, AacError> {
+    ) -> Result<FragmentMedia<'a>, AacError> {
         if cancelled() {
             return Err(AacError::Cancelled);
         }
@@ -305,6 +312,22 @@ impl FragmentedAacDecoder {
             .checked_add(duration)
             .ok_or(AacError::InvalidContainer)?;
         let next_sequence = sequence.checked_add(1).ok_or(AacError::InvalidContainer)?;
+        Ok(FragmentMedia {
+            decode_time,
+            duration,
+            next_time,
+            next_sequence,
+            packets,
+        })
+    }
+
+    fn decode(
+        &mut self,
+        bytes: &[u8],
+        declared_codec: Option<&str>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<FragmentPcm, AacError> {
+        let media = self.read_media(bytes, cancelled)?;
         if self.decoder.is_none() {
             self.decoder = Some(RawAacDecoder::new(&self.asc)?);
         }
@@ -312,21 +335,21 @@ impl FragmentedAacDecoder {
             .decoder
             .as_mut()
             .ok_or(AacError::DecodeFailed)?
-            .decode_packets_pcm_controlled(&packets, declared_codec, &mut *cancelled)?;
+            .decode_packets_pcm_controlled(&media.packets, declared_codec, &mut *cancelled)?;
         if pcm.summary.frames as u128 * u128::from(self.timescale)
-            != u128::from(duration) * u128::from(pcm.summary.sample_rate)
+            != u128::from(media.duration) * u128::from(pcm.summary.sample_rate)
         {
             return Err(AacError::InvalidContainer);
         }
         if cancelled() {
             return Err(AacError::Cancelled);
         }
-        self.next_time = Some(next_time);
-        self.next_sequence = Some(next_sequence);
+        self.next_time = Some(media.next_time);
+        self.next_sequence = Some(media.next_sequence);
         Ok(FragmentPcm {
-            decode_time,
+            decode_time: media.decode_time,
             timescale: self.timescale,
-            duration,
+            duration: media.duration,
             pcm,
         })
     }

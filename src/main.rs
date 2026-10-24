@@ -48,246 +48,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return play::run(&args, data_dir);
     }
     if args.first().is_some_and(|arg| arg == "output-info") {
-        const USAGE: &str =
-            "output-info [SAMPLE_RATE]（8000〜192000Hz・既定48000Hz、出力機器の読み取りのみ）";
-        if args == ["output-info", "--help"] {
-            println!("{USAGE}");
-            return Ok(());
-        }
-        if args.len() > 2 {
-            return Err(USAGE.into());
-        }
-        let rate = args
-            .get(1)
-            .map_or(Ok(48_000), |value| value.parse::<u32>())
-            .map_err(|_| "サンプルレートは正の整数Hzで指定してください")?;
-        if !output::PCM_SAMPLE_RATE_RANGE.contains(&rate) {
-            return Err("サンプルレートは8000〜192000Hzで指定してください".into());
-        }
-        let info = output::inspect_default_output(rate)?;
-        println!("現在の既定出力機器: {}", info.name);
-        match info.channels {
-            Some(channels) => println!(
-                "{}Hz / f32 / {}ch: 対応宣言あり（再生時に再確認）",
-                info.sample_rate, channels
-            ),
-            None => println!("{}Hz / f32 / mono・stereo: 対応宣言なし", info.sample_rate),
-        }
-        return Ok(());
+        return output_info(&args);
     }
     if args.first().is_some_and(|arg| arg == "probe-output") {
-        if args.get(1).is_some_and(|arg| arg == "--help") && args.len() == 2 {
-            println!(
-                "probe-output [SECONDS]（生成音・1〜10秒・既定2秒）\nprobe-output --mute [SECONDS]（無音・1〜1800秒・既定30秒、Ctrl+Cで中断）"
-            );
-            return Ok(());
-        }
-        let muted = args.get(1).is_some_and(|arg| arg == "--mute");
-        let values = &args[if muted { 2 } else { 1 }..];
-        if values.len() > 1 {
-            return Err("probe-output [--mute] [SECONDS]（--helpで範囲を確認）".into());
-        }
-        let seconds = values
-            .first()
-            .map(|s| s.parse::<u32>())
-            .transpose()?
-            .unwrap_or(if muted { 30 } else { 2 });
-        if muted {
-            if !(1..=1800).contains(&seconds) {
-                return Err("無音の出力診断は1〜1800秒で指定してください".into());
-            }
-            let stop = output::StopToken::default();
-            let cancelled = stop.clone();
-            ctrlc::set_handler(move || cancelled.cancel())?;
-            let summary = output::probe_silent(seconds, stop.clone(), |summary| {
-                eprintln!(
-                    "無音出力中: {}フレーム / {}Hz / 不足{}フレーム",
-                    summary.frames, summary.sample_rate, summary.underrun_frames
-                );
-            })?;
-            println!(
-                "無音出力{}: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
-                if stop.is_cancelled() {
-                    "中断"
-                } else {
-                    "完了"
-                },
-                summary.frames,
-                summary.sample_rate,
-                summary.channels,
-                summary.underrun_frames
-            );
-            return Ok(());
-        }
-        let summary = output::probe_tone(seconds)?;
-        println!(
-            "生成音の出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
-            summary.frames, summary.sample_rate, summary.channels, summary.underrun_frames
-        );
-        return Ok(());
+        return probe_output(&args);
     }
     if args.first().is_some_and(|arg| arg == "programs") {
         return programs::run(&args[1..], data_dir);
     }
     if args.len() == 1 && matches!(args[0].as_str(), "login" | "session" | "logout") {
-        let store = match data_dir {
-            Some(path) => SessionStore::new(path),
-            None => SessionStore::default_location()?,
-        };
+        let store = session_store(data_dir)?;
         return member_command(&args[0], &store);
     }
     if (args.len() == 2 && args[0] == "probe-live")
         || (args.len() == 3 && args[0] == "probe-timefree")
         || ((2..=3).contains(&args.len()) && args[0] == "play-sample")
     {
-        stream::validate_station(&args[1])?;
-        let mode = if args[0] == "probe-live" || (args[0] == "play-sample" && args.len() == 2) {
-            ProbeMode::Live
-        } else {
-            ProbeMode::TimeFree
-        };
-        let cursor = if mode == ProbeMode::Live {
-            chrono::Utc::now().fixed_offset()
-        } else {
-            stream::parse_time(&args[2])?
-        };
-        if mode == ProbeMode::TimeFree && cursor > chrono::Utc::now() {
-            return Err(stream::ProbeError::Upcoming.into());
-        }
-        let store = match data_dir {
-            Some(path) => SessionStore::new(path),
-            None => SessionStore::default_location()?,
-        };
-        let session = store
-            .load()?
-            .ok_or("未ログインです。loginでログインしてください")?;
-        let membership = MemberClient::new()?.check(&session)?;
-        eprintln!("会員セッション有効。放送枠・配信認証・HLSを検証しています…");
-        let report = if args[0] == "play-sample" {
-            stream::probe_for_output(&args[1], mode, cursor, &session, &membership)?
-        } else {
-            stream::probe(&args[1], mode, cursor, &session, &membership)?
-        };
-        let jst = chrono::FixedOffset::east_opt(9 * 3600).ok_or("日本時間を構成できません")?;
-        println!(
-            "{} / {:?} / {}–{}（日本時間）",
-            report.station,
-            report.mode,
-            report
-                .starts_at
-                .with_timezone(&jst)
-                .format("%Y-%m-%d %H:%M:%S"),
-            report
-                .ends_at
-                .with_timezone(&jst)
-                .format("%Y-%m-%d %H:%M:%S")
-        );
-        println!(
-            "認証エリア: {} / エリア外: {} / 失敗した配信先: {}",
-            report.area, report.outside_area, report.failed_endpoints
-        );
-        println!(
-            "HLS取得成功: {}セグメント / {:.3}秒 / ENDLIST: {}",
-            report.segments, report.playlist_seconds, report.end_list
-        );
-        println!(
-            "HLS宣言コーデック: {} / サンプル形式: {} / {}バイト",
-            report.declared_codec.as_deref().unwrap_or("未宣言"),
-            report.container,
-            report.sample_bytes
-        );
-        match report.decode {
-            DecodeProbe::AacDecoded(summary) => {
-                println!(
-                    "AACセグメントの純Rustデコード成功: {}パケット / {}フレーム / {}Hz / {}ch",
-                    summary.packets, summary.frames, summary.sample_rate, summary.channels
-                );
-                println!(
-                    "AACコア: {}Hz / {}ch / SBR検出: {} / モノラルからステレオへの拡張: {}",
-                    summary.core_sample_rate,
-                    summary.core_channels,
-                    summary.sbr_detected,
-                    summary.stereo_expansion
-                );
-                println!(
-                    "デコードしたメディア: {:.3}秒 / 処理時間: {:.3}秒 / 非ゼロサンプル: {}",
-                    summary.media_duration.as_secs_f64(),
-                    summary.decode_duration.as_secs_f64(),
-                    summary.nonzero_samples
-                );
-                println!("PSの明示シグナルと聴感品質は未確認です");
-            }
-            DecodeProbe::RawAacDecoded(summary) => {
-                println!(
-                    "設定情報付きAACの先頭パケットを純Rustでデコード成功: {}Hz / {}ch / {}フレーム / SBR検出: {}",
-                    summary.sample_rate, summary.channels, summary.frames, summary.sbr_detected
-                );
-                println!(
-                    "先頭パケットの検証結果です。非ADTSの実配信・PSの明示シグナルは未確認です"
-                );
-            }
-            DecodeProbe::AacFailed(error) => println!("サンプル取得済み。AAC検証失敗: {error}"),
-            DecodeProbe::Decoded {
-                codec,
-                sample_rate,
-                channels,
-                frames,
-            } => println!(
-                "先頭パケットの純Rustデコード成功: {codec} / {sample_rate}Hz / {channels}ch / {frames}フレーム"
-            ),
-            DecodeProbe::UnsupportedFormat => {
-                println!("サンプル取得済み。採用中のSymphoniaでコンテナを解析できません")
-            }
-            DecodeProbe::UnsupportedDeclaredCodec => println!(
-                "HE-AAC宣言に対応するコンテナまたは設定情報を確認できません（AACコアだけの成功とは扱いません）"
-            ),
-            DecodeProbe::UnsupportedCodec => {
-                println!("サンプル取得済み。採用中のSymphoniaでコーデックが未対応です")
-            }
-            DecodeProbe::DecodeFailed => println!("サンプル取得済み。音声デコードに失敗しました"),
-            DecodeProbe::NoAudio => {
-                println!("サンプル取得済み。有効な音声フレームを確認できません")
-            }
-            DecodeProbe::Encrypted => {
-                println!("暗号化サンプル取得済み。復号・デコードは未実装です")
-            }
-        }
-        if args[0] == "play-sample" {
-            let pcm = report
-                .audio
-                .as_ref()
-                .ok_or("取得したサンプルは音声出力に対応していません")?;
-            let remaining = if mode == ProbeMode::Live {
-                Some(
-                    (report.ends_at - chrono::Utc::now().fixed_offset())
-                        .to_std()
-                        .map_err(|_| "番組終了")?,
-                )
-            } else {
-                None
-            };
-            // The sample starts at the selected slot's beginning. Never output past its end.
-            if mode == ProbeMode::TimeFree
-                && pcm.summary.media_duration > (report.ends_at - report.starts_at).to_std()?
-            {
-                return Err("サンプルが放送枠の末尾を越えています".into());
-            }
-            let summary = output::play_pcm(pcm, remaining)?;
-            println!(
-                "先頭1セグメントの出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
-                summary.frames, summary.sample_rate, summary.channels, summary.underrun_frames
-            );
-            println!(
-                "サンプル末尾で停止しました。連続再生にはplay-live／play-timefreeを使用してください"
-            );
-        } else {
-            println!("音声出力は行っていません。30分連続再生・実際の番組末尾の停止は未検証です");
-        }
-        return Ok(());
+        return probe_media(&args, data_dir);
     }
-    if args.len() != 4 || args[0] != "inspect-chapters" {
-        return Err("引数が不正です。--helpを参照してください".into());
+    if args.len() == 4 && args[0] == "inspect-chapters" {
+        return inspect_chapters(&args);
     }
+    Err("引数が不正です。--helpを参照してください".into())
+}
+
+fn inspect_chapters(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let seconds: f64 = args[2].parse().map_err(|_| "放送枠の秒数が不正です")?;
     let duration = Duration::try_from_secs_f64(seconds).map_err(|_| "放送枠の秒数が不正です")?;
     let offset: f64 = args[3].parse().map_err(|_| "補正秒数が不正です")?;
@@ -310,6 +95,250 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "不正項目: {} / 除外した楽曲: {}",
         set.invalid_count, set.music_count
+    );
+    Ok(())
+}
+
+fn session_store(data_dir: Option<PathBuf>) -> Result<SessionStore, Box<dyn std::error::Error>> {
+    Ok(match data_dir {
+        Some(path) => SessionStore::new(path),
+        None => SessionStore::default_location()?,
+    })
+}
+
+fn probe_media(
+    args: &[String],
+    data_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stream::validate_station(&args[1])?;
+    let mode = if args[0] == "probe-live" || (args[0] == "play-sample" && args.len() == 2) {
+        ProbeMode::Live
+    } else {
+        ProbeMode::TimeFree
+    };
+    let cursor = if mode == ProbeMode::Live {
+        chrono::Utc::now().fixed_offset()
+    } else {
+        stream::parse_time(&args[2])?
+    };
+    if mode == ProbeMode::TimeFree && cursor > chrono::Utc::now() {
+        return Err(stream::ProbeError::Upcoming.into());
+    }
+    let store = session_store(data_dir)?;
+    let session = store
+        .load()?
+        .ok_or("未ログインです。loginでログインしてください")?;
+    let membership = MemberClient::new()?.check(&session)?;
+    eprintln!("会員セッション有効。放送枠・配信認証・HLSを検証しています…");
+    let report = if args[0] == "play-sample" {
+        stream::probe_for_output(&args[1], mode, cursor, &session, &membership)?
+    } else {
+        stream::probe(&args[1], mode, cursor, &session, &membership)?
+    };
+    let jst = chrono::FixedOffset::east_opt(9 * 3600).ok_or("日本時間を構成できません")?;
+    println!(
+        "{} / {:?} / {}–{}（日本時間）",
+        report.station,
+        report.mode,
+        report
+            .starts_at
+            .with_timezone(&jst)
+            .format("%Y-%m-%d %H:%M:%S"),
+        report
+            .ends_at
+            .with_timezone(&jst)
+            .format("%Y-%m-%d %H:%M:%S")
+    );
+    println!(
+        "認証エリア: {} / エリア外: {} / 失敗した配信先: {}",
+        report.area, report.outside_area, report.failed_endpoints
+    );
+    println!(
+        "HLS取得成功: {}セグメント / {:.3}秒 / ENDLIST: {}",
+        report.segments, report.playlist_seconds, report.end_list
+    );
+    println!(
+        "HLS宣言コーデック: {} / サンプル形式: {} / {}バイト",
+        report.declared_codec.as_deref().unwrap_or("未宣言"),
+        report.container,
+        report.sample_bytes
+    );
+    print_decode(report.decode);
+    if args[0] == "play-sample" {
+        let pcm = report
+            .audio
+            .as_ref()
+            .ok_or("取得したサンプルは音声出力に対応していません")?;
+        let remaining = if mode == ProbeMode::Live {
+            Some(
+                (report.ends_at - chrono::Utc::now().fixed_offset())
+                    .to_std()
+                    .map_err(|_| "番組終了")?,
+            )
+        } else {
+            None
+        };
+        // The sample starts at the selected slot's beginning. Never output past its end.
+        if mode == ProbeMode::TimeFree
+            && pcm.summary.media_duration > (report.ends_at - report.starts_at).to_std()?
+        {
+            return Err("サンプルが放送枠の末尾を越えています".into());
+        }
+        let summary = output::play_pcm(pcm, remaining)?;
+        println!(
+            "先頭1セグメントの出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
+            summary.frames, summary.sample_rate, summary.channels, summary.underrun_frames
+        );
+        println!(
+            "サンプル末尾で停止しました。連続再生にはplay-live／play-timefreeを使用してください"
+        );
+    } else {
+        println!("音声出力は行っていません。30分連続再生・実際の番組末尾の停止は未検証です");
+    }
+    Ok(())
+}
+
+fn print_decode(decode: DecodeProbe) {
+    match decode {
+        DecodeProbe::AacDecoded(summary) => {
+            println!(
+                "AACセグメントの純Rustデコード成功: {}パケット / {}フレーム / {}Hz / {}ch",
+                summary.packets, summary.frames, summary.sample_rate, summary.channels
+            );
+            println!(
+                "AACコア: {}Hz / {}ch / SBR検出: {} / モノラルからステレオへの拡張: {}",
+                summary.core_sample_rate,
+                summary.core_channels,
+                summary.sbr_detected,
+                summary.stereo_expansion
+            );
+            println!(
+                "デコードしたメディア: {:.3}秒 / 処理時間: {:.3}秒 / 非ゼロサンプル: {}",
+                summary.media_duration.as_secs_f64(),
+                summary.decode_duration.as_secs_f64(),
+                summary.nonzero_samples
+            );
+            println!(
+                "ADTSの公開デコードAPIにビットストリームのPSフラグはなく、明示シグナルは未確認です"
+            );
+        }
+        DecodeProbe::RawAacDecoded(summary) => {
+            println!(
+                "設定情報付きAACの先頭パケットを純Rustでデコード成功: {}Hz / {}ch / {}フレーム / SBR検出: {}",
+                summary.sample_rate, summary.channels, summary.frames, summary.sbr_detected
+            );
+            println!(
+                "ASCのPS明示: {} / 先頭パケットの検証です。ビットストリーム上のPS適用とは区別します",
+                if summary.explicit_ps {
+                    "あり"
+                } else {
+                    "なし"
+                }
+            );
+        }
+        DecodeProbe::AacFailed(error) => println!("サンプル取得済み。AAC検証失敗: {error}"),
+        DecodeProbe::Decoded {
+            codec,
+            sample_rate,
+            channels,
+            frames,
+        } => println!(
+            "先頭パケットの純Rustデコード成功: {codec} / {sample_rate}Hz / {channels}ch / {frames}フレーム"
+        ),
+        DecodeProbe::UnsupportedFormat => {
+            println!("サンプル取得済み。採用中のSymphoniaでコンテナを解析できません")
+        }
+        DecodeProbe::UnsupportedDeclaredCodec => println!(
+            "HE-AAC宣言に対応するコンテナまたは設定情報を確認できません（AACコアだけの成功とは扱いません）"
+        ),
+        DecodeProbe::UnsupportedCodec => {
+            println!("サンプル取得済み。採用中のSymphoniaでコーデックが未対応です")
+        }
+        DecodeProbe::DecodeFailed => println!("サンプル取得済み。音声デコードに失敗しました"),
+        DecodeProbe::NoAudio => {
+            println!("サンプル取得済み。有効な音声フレームを確認できません")
+        }
+        DecodeProbe::Encrypted => println!("暗号化サンプル取得済み。復号・デコードは未実装です"),
+    }
+}
+
+fn output_info(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    const USAGE: &str =
+        "output-info [SAMPLE_RATE]（8000〜192000Hz・既定48000Hz、出力機器の読み取りのみ）";
+    if args == ["output-info", "--help"] {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.len() > 2 {
+        return Err(USAGE.into());
+    }
+    let rate = args
+        .get(1)
+        .map_or(Ok(48_000), |value| value.parse::<u32>())
+        .map_err(|_| "サンプルレートは正の整数Hzで指定してください")?;
+    if !output::PCM_SAMPLE_RATE_RANGE.contains(&rate) {
+        return Err("サンプルレートは8000〜192000Hzで指定してください".into());
+    }
+    let info = output::inspect_default_output(rate)?;
+    println!("現在の既定出力機器: {}", info.name);
+    match info.channels {
+        Some(channels) => println!(
+            "{}Hz / f32 / {}ch: 対応宣言あり（再生時に再確認）",
+            info.sample_rate, channels
+        ),
+        None => println!("{}Hz / f32 / mono・stereo: 対応宣言なし", info.sample_rate),
+    }
+    Ok(())
+}
+
+fn probe_output(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|arg| arg == "--help") && args.len() == 2 {
+        println!(
+            "probe-output [SECONDS]（生成音・1〜10秒・既定2秒）\nprobe-output --mute [SECONDS]（無音・1〜1800秒・既定30秒、Ctrl+Cで中断）"
+        );
+        return Ok(());
+    }
+    let muted = args.get(1).is_some_and(|arg| arg == "--mute");
+    let values = &args[if muted { 2 } else { 1 }..];
+    if values.len() > 1 {
+        return Err("probe-output [--mute] [SECONDS]（--helpで範囲を確認）".into());
+    }
+    let seconds = values
+        .first()
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(if muted { 30 } else { 2 });
+    if muted {
+        if !(1..=1800).contains(&seconds) {
+            return Err("無音の出力診断は1〜1800秒で指定してください".into());
+        }
+        let stop = output::StopToken::default();
+        let cancelled = stop.clone();
+        ctrlc::set_handler(move || cancelled.cancel())?;
+        let summary = output::probe_silent(seconds, stop.clone(), |summary| {
+            eprintln!(
+                "無音出力中: {}フレーム / {}Hz / 不足{}フレーム",
+                summary.frames, summary.sample_rate, summary.underrun_frames
+            );
+        })?;
+        println!(
+            "無音出力{}: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
+            if stop.is_cancelled() {
+                "中断"
+            } else {
+                "完了"
+            },
+            summary.frames,
+            summary.sample_rate,
+            summary.channels,
+            summary.underrun_frames
+        );
+        return Ok(());
+    }
+    let summary = output::probe_tone(seconds)?;
+    println!(
+        "生成音の出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
+        summary.frames, summary.sample_rate, summary.channels, summary.underrun_frames
     );
     Ok(())
 }

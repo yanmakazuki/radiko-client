@@ -58,7 +58,7 @@ Snapshotへwaiting_pcm_segments／waiting_pcm_mediaを固定サイズで追加�
 
 ## 既定出力の読み取り診断（2026年10月22日）
 
-player::output::inspect_default_outputはCPALのdefault_output_deviceとsupported_output_configsだけを読み、ストリームを作成しない。名前は制御文字を除去し256文字へ制限し、指定レートと選択可能なチャンネル数を所有値で返す。compatible_configを実際のOutput::open_with_stopと共用し、f32・1/2ch・レート範囲を維持する。CLIは不正な引数・8000〜192000Hz外のレートを機器への問い合わせ前に拒否し、セッション保存先を開かない。任意機器の選択・OS出力先変更・既存再生の機器追跡は追加しない。
+player::output::inspect_default_outputは、再生と同じselected_output_deviceのsupported_output_configsだけを読み、ストリームを作成しない。selected_output_deviceはOS既定出力の名前と一致する列挙デバイスを返し、一致がなければCPALのdefaultラッパーへ戻る。CPAL 0.16.0はdefaultラッパーではDeviceIsAliveを登録しないため、列挙側を開いて既存の失敗フラグへ接続する。名前は制御文字を除去し256文字へ制限し、指定レートと選択可能なチャンネル数を所有値で返す。compatible_configを実際のOutput::open_with_stopと共用し、f32・1/2ch・レート範囲を維持する。CLIは不正な引数・8000〜192000Hz外のレートを機器への問い合わせ前に拒否し、セッション保存先を開かない。任意機器の選択・OS出力先変更・既存再生の機器追跡は追加しない。
 
 ## 応答番号の計測境界（2026年10月22日）
 
