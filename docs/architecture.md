@@ -1,6 +1,6 @@
 # アーキテクチャ
 
-2026年10月24日時点の構成です。仕様の意味は [機能設計](design.md)、確認の範囲は [検証範囲](validation.md)、日付ごとの手順と数値は [実装状況](implementation.md) にあります。
+2026年10月25日時点の構成です。仕様の意味は [機能設計](design.md)、確認の範囲は [検証範囲](validation.md)、日付ごとの手順と数値は [実装状況](implementation.md) にあります。
 
 画面は状態を直接変えません。通信とデコードの結果は、領域ごとの要求 ID を付けてメインループへ返し、ID が一致するものだけを反映します。キャンセルしたあとに届いた結果も捨てます。
 
@@ -10,36 +10,50 @@
 flowchart LR
     TUI[tui: 入力と描画] --> APP[app: 状態と世代]
     APP --> CAT[catalog: 選択と検索]
-    APP --> RAD[radiko: HTTP と解析]
+    APP --> API[api: HTTP と解析]
     APP --> PLAYER[player: 復号と出力]
     APP --> STORE[storage: セッションと条件]
-    RAD --> DOMAIN[domain: 型と判定]
+    API --> DOMAIN[domain: 型と判定]
     CAT --> DOMAIN
     PLAYER --> DOMAIN
     STORE --> DOMAIN
     APP --> DOMAIN
 ```
 
-`domain` は通信、端末、音声ライブラリに依存しません。外部の XML と JSON は `radiko` の中で検証してからドメインの型にします。`player` はログインをせず、`app` が解決した配信を受け取ります。署名付き URL と認証情報を持つ型は、ログ向けの自動出力を持ちません。
+`domain` は通信、端末、音声ライブラリに依存しません。外部の XML と JSON は `api` の中で検証してからドメインの型にします。`player` はログインをせず、`app` が解決した配信を受け取ります。署名付き URL と認証情報を持つ型は、ログ向けの自動出力を持ちません。
 
 テストでは HTTP とプレイヤーの境界を偽物に差し替えます。通常のテストは radiko へ繋ぎません。
 
+## クレート
+
+ワークスペースは二つです。画面の依存はバイナリだけが持ちます。
+
+| パッケージ | クレート | 役割 |
+| --- | --- | --- |
+| `crates/radiko` | `radiko` | 番組表、認証、再生、保存。Ratatui には依存しない |
+| `crates/radiko-client` | バイナリ `radiko-client` | CLI と TUI。`radiko` を呼ぶ |
+
+ライブラリの説明と、通信しない検索条件の例は `radiko` のクレートドキュメントにあります。よく使う型は `radiko::prelude` です。セッションと検索条件の保存先をまとめる型は `storage::DataDir` です。HTTP と XML・HLS の境界は `api` で、クレート名とモジュール名が重ならないようにしています。番組表の「どれを取るか」は `catalog`、XML の取得と解析は `api::catalog` です。`catalog::CatalogClient` は後者を取得元として再公開しています。
+
 ## ディレクトリ
+
+パスは、ライブラリが `crates/radiko/src/`、CLI と TUI が `crates/radiko-client/src/` です。
 
 | 場所 | 役割 |
 | --- | --- |
-| `src/main.rs` | 引数、終了コード、プローブ系 CLI |
-| `src/tui.rs` と `src/tui/` | キーを操作へ変え、状態を描く。端末の復元。通信とデコードは呼ばない |
-| `src/app.rs` と `src/app/` | メインループが所有する状態。検索、再生、チャプター、認証、名前付き条件のサービス |
-| `src/domain.rs` と `src/domain/search.rs` | 放送枠、放送日、状態、検索条件、チャプター、聴取可否の表示 |
-| `src/catalog.rs` と `src/catalog/search.rs` | 地域から局を選び、最大4並列で取得し、条件を適用する |
-| `src/radiko/` | 制限付き HTTP、会員認証、番組表、配信解決、HLS、チャプター |
-| `src/player/` | AAC 復号、fragmented MP4、PCM の上限、CPAL 出力、再生ワーカー、診断 |
-| `src/storage.rs` と `src/storage/searches.rs` | `session.json` と `searches.json` の原子的な読み書き |
-| `src/programs.rs` `src/play.rs` `src/chapters.rs` `src/searches.rs` | 各 CLI |
-| `tests/` と `tests/fixtures/` | 統合テストと、資格情報を含まない合成データ |
+| `radiko-client` の `main.rs` | 引数、終了コード、プローブ系 CLI |
+| `radiko-client` の `tui.rs` と `tui/` | キーを操作へ変え、状態を描く。端末の復元。通信とデコードは呼ばない |
+| `app.rs` と `app/` | メインループが所有する状態。検索、再生、チャプター、認証、名前付き条件のサービス |
+| `domain.rs` と `domain/search.rs` | 放送枠、放送日、状態、検索条件、チャプター、聴取可否の表示 |
+| `catalog.rs` と `catalog/search.rs` | 地域から局を選び、最大4並列で取得し、条件を適用する |
+| `api.rs` と `api/` | 制限付き HTTP、会員認証、番組表、配信解決、HLS、チャプター |
+| `player/` | AAC 復号、fragmented MP4、PCM の上限、CPAL 出力、再生ワーカー、診断 |
+| `storage.rs` と `storage/searches.rs` | `session.json` と `searches.json` の原子的な読み書き。`DataDir` が同じディレクトリを返す |
+| `programs.rs` `play.rs` `chapters.rs` `searches.rs` | 各 CLI。バイナリ側 |
+| `crates/radiko/tests/` と `crates/radiko-client/tests/` | ライブラリと CLI の統合テスト |
+| `tests/fixtures/` | 資格情報を含まない合成データ |
 
-採用バージョンは `Cargo.toml` と `Cargo.lock` が正です。画面は Ratatui 0.29.0 と Crossterm 0.28.1、出力は CPAL 0.16.0 と rtrb 0.3.2、AAC は `rusty_aac` 1.1.0、コンテナの解析に Symphonia 0.5、HTTP は reqwest 0.12（`rustls-tls`、blocking feature は使わない）、非同期ランタイムは Tokio です。
+採用バージョンは各クレートの `Cargo.toml` と、ワークスペースの `Cargo.lock` が正です。画面は Ratatui 0.29.0 と Crossterm 0.28.1 で、バイナリだけが依存します。出力は CPAL 0.16.0 と rtrb 0.3.2、AAC は `rusty_aac` 1.1.0、コンテナの解析に Symphonia 0.5、HTTP は reqwest 0.12（`rustls-tls`、blocking feature は使わない）、非同期ランタイムは Tokio です。
 
 ## メインループ
 
@@ -147,7 +161,7 @@ DNS は共有の最大4ブロッキングスレッドと、許可4のセマフ�
 
 ## チャプターの対応付け
 
-`radiko::stream::chapters` が番組を解決し、応答の `eventId` と `episodeIntroductionStartAt` を見ます。XML の番組 ID は使いません。チャプター応答の局 ID とイベント ID が要求と違えば失敗です。応答は最大1MiB、イベント ID は ASCII の英数字、ハイフン、アンダースコアで最大128文字です。会員の Cookie とトークンは送りません。
+`api::stream::chapters` が番組を解決し、応答の `eventId` と `episodeIntroductionStartAt` を見ます。XML の番組 ID は使いません。チャプター応答の局 ID とイベント ID が要求と違えば失敗です。応答は最大1MiB、イベント ID は ASCII の英数字、ハイフン、アンダースコアで最大128文字です。会員の Cookie とトークンは送りません。
 
 原点が枠の開始と一致するときだけ `EventBinding` を作り、`Outcome::Aligned` にします。情報がない、原点が違う、枠が一致しないときは `Unresolved` で、補正量は作りません。原点が違う場合はチャプター API も呼びません。`Outcome::Candidates` は参照位置であり、シークの対象ではありません。TUI がジャンプに使うのは `Aligned` だけです。
 

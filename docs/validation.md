@@ -34,25 +34,25 @@
 
 ## 自動テストと明示実行
 
-通常の `cargo test` は、アカウント、radiko、音声の保存を使いません。次は明示的に実行します。
+通常の `cargo test --workspace` は、アカウント、radiko、音声の保存を使いません。次は明示的に実行します。
 
 生成した fragmented AAC を、音量0で実機へ出します。通信とアカウントは使いません。`RADIKO_FRAGMENT_SECONDS` は1〜1800で、省略時は5秒です。実時間は指定秒数に30秒を足したところで打ち切ります。
 
 ```sh
-RADIKO_FRAGMENT_SECONDS=1800 cargo test --locked --lib \
+RADIKO_FRAGMENT_SECONDS=1800 cargo test --workspace --locked -p radiko --lib \
   native_muted_fragmented_aac_reaches_the_explicit_output_limit -- --ignored --nocapture
 ```
 
 取得待ちと先読みの切り分けは、生成 AAC・音量0で約50秒です。
 
 ```sh
-cargo test --lib native_muted_acquisition_gap -- --ignored --nocapture
+cargo test --workspace -p radiko --lib native_muted_acquisition_gap -- --ignored --nocapture
 ```
 
 ローカルの HTTP タイムアウトと再試行は、待受の権限が要るため通常テストから外れています。
 
 ```sh
-cargo test --lib local_mock_http -- --ignored
+cargo test --workspace -p radiko --lib local_mock_http -- --ignored
 ```
 
 検証スクリプトの画面読み取りは、アカウントも音声も使わずに確認できます。

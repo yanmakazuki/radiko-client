@@ -6,39 +6,41 @@ This macOS Rust client provides filtered station and regional/nationwide date-ra
 
 ## Project Structure
 
-- `src/app.rs` and `src/app/search.rs`: main-loop-owned search state, editing, request generations, and bounded cancellable acquisition; `src/tui.rs`: Ratatui search/playback frontend and terminal restoration.
-- `src/app/playback.rs`: bounded TUI playback commands, session resolution, snapshots, and output shutdown.
-- `src/app/chapters.rs`: chapter request generations, bounded acquisition, and origin/slot-bound jump validation; listening permission is rechecked by playback.
-- `src/app/auth.rs`: asynchronous session checks, explicit login/logout jobs, and contract-only snapshots; credential drafts are zeroized and never logged.
-- `src/tui/filters.rs`: local date/scope/classification/keyword editing, validation, and observed-classification display; no I/O.
-- `src/tui/viewport.rs`: global list/page selection and visible row ranges; format only visible rows. `src/tui/failures.rs`: read-only current acquisition failures and malformed-slot provenance. `src/tui/scroll.rs`: bounded wrap-aware help/chapter-summary scrolling. `src/tui/help.rs`: read-only key guide.
-- `src/app/named.rs` and `src/tui/named.rs`: serialized local saved-search operations and browser; recalls populate drafts without fetching.
+The workspace has two crates. `crates/radiko` (`radiko`) is the screen-free library: domain, catalog selection, `api` HTTP/parsing, player, storage, session, and app services. `crates/radiko-client` is the CLI and Ratatui TUI and depends on `radiko`. Shared synthetic assets stay in `tests/fixtures/`.
 
-- `src/domain/search.rs`: validated criteria and startup date reset; `src/storage/searches.rs`: atomic versioned criteria storage; `src/searches.rs`: offline named-search management CLI.
+- `crates/radiko/src/app.rs` and `crates/radiko/src/app/search.rs`: main-loop-owned search state, editing, request generations, and bounded cancellable acquisition; `crates/radiko-client/src/tui.rs`: Ratatui search/playback frontend and terminal restoration.
+- `crates/radiko/src/app/playback.rs`: bounded TUI playback commands, session resolution, snapshots, and output shutdown.
+- `crates/radiko/src/app/chapters.rs`: chapter request generations, bounded acquisition, and origin/slot-bound jump validation; listening permission is rechecked by playback.
+- `crates/radiko/src/app/auth.rs`: asynchronous session checks, explicit login/logout jobs, and contract-only snapshots; credential drafts are zeroized and never logged.
+- `crates/radiko-client/src/tui/filters.rs`: local date/scope/classification/keyword editing, validation, and observed-classification display; no I/O.
+- `crates/radiko-client/src/tui/viewport.rs`: global list/page selection and visible row ranges; format only visible rows. `crates/radiko-client/src/tui/failures.rs`: read-only current acquisition failures and malformed-slot provenance. `crates/radiko-client/src/tui/scroll.rs`: bounded wrap-aware help/chapter-summary scrolling. `crates/radiko-client/src/tui/help.rs`: read-only key guide.
+- `crates/radiko/src/app/named.rs` and `crates/radiko-client/src/tui/named.rs`: serialized local saved-search operations and browser; recalls populate drafts without fetching.
 
-- `src/catalog/search.rs`: pure AND/OR filtering and observed classification aggregation.
+- `crates/radiko/src/domain/search.rs`: validated criteria and startup date reset; `crates/radiko/src/storage/searches.rs`: atomic versioned criteria storage; `crates/radiko-client/src/searches.rs`: offline named-search management CLI.
 
-- `src/chapters.rs`: read-only chapter CLI; `src/radiko/stream/chapters.rs`: metadata identity checks and bounded chapter acquisition.
+- `crates/radiko/src/catalog/search.rs`: pure AND/OR filtering and observed classification aggregation.
 
-- `src/radiko/http/diagnostics.rs`: opt-in bounded request-stage timings for active HLS workers; no URLs, headers, bodies, or audio callback work.
-- `src/player/state.rs`: owned playback snapshots and active playback states; `src/player/diagnostics.rs`: bounded worker-stage wall-clock measurements, independent of the audio callback.
-- `src/play.rs`: continuous playback, switching, and seek CLI; `src/player/seek.rs`: latest-request playback preparation; `src/player/playback.rs`: bounded worker and output control; `src/radiko/stream/playback.rs`: stateful HLS acquisition.
-- `src/programs.rs`: program listing CLI; `src/catalog.rs`: region selection and bounded acquisition; `src/radiko/catalog.rs`: uncached metadata HTTP/XML.
-- `src/main.rs`: CLI arguments and reporting; `src/lib.rs`: library exports.
-- `src/domain.rs`: bounded broadcast-day ranges, slot identity, status, and chapters.
-- `src/radiko/`: authentication, bounded HTTP, and stream probes; `src/radiko.rs`: chapter parsing.
-- `src/player.rs`, `src/player/aac.rs`, and `src/player/output.rs`: decoding probes, stateful AAC/SBR decoding, and bounded CPAL output; `src/session.rs` and `src/storage.rs`: session types and persistence.
-- `tests/`: CLI, domain, and storage integration tests; `tests/fixtures/`: synthetic JSON, XML, and HLS assets.
+- `crates/radiko-client/src/chapters.rs`: read-only chapter CLI; `crates/radiko/src/api/stream/chapters.rs`: metadata identity checks and bounded chapter acquisition.
+
+- `crates/radiko/src/api/http/diagnostics.rs`: opt-in bounded request-stage timings for active HLS workers; no URLs, headers, bodies, or audio callback work.
+- `crates/radiko/src/player/state.rs`: owned playback snapshots and active playback states; `crates/radiko/src/player/diagnostics.rs`: bounded worker-stage wall-clock measurements, independent of the audio callback.
+- `crates/radiko-client/src/play.rs`: continuous playback, switching, and seek CLI; `crates/radiko/src/player/seek.rs`: latest-request playback preparation; `crates/radiko/src/player/playback.rs`: bounded worker and output control; `crates/radiko/src/api/stream/playback.rs`: stateful HLS acquisition.
+- `crates/radiko-client/src/programs.rs`: program listing CLI; `crates/radiko/src/catalog.rs`: region selection and bounded acquisition; `crates/radiko/src/api/catalog.rs`: uncached metadata HTTP/XML.
+- `crates/radiko-client/src/main.rs`: CLI arguments and reporting; `crates/radiko/src/lib.rs`: library exports and `prelude`.
+- `crates/radiko/src/domain.rs`: bounded broadcast-day ranges, slot identity, status, and chapters.
+- `crates/radiko/src/api/`: authentication, bounded HTTP, and stream probes; `crates/radiko/src/api.rs`: chapter parsing.
+- `crates/radiko/src/player.rs`, `crates/radiko/src/player/aac.rs`, and `crates/radiko/src/player/output.rs`: decoding probes, stateful AAC/SBR decoding, and bounded CPAL output; `crates/radiko/src/session.rs` and `crates/radiko/src/storage.rs`: session types, `DataDir`, and persistence.
+- `crates/radiko/tests/` and `crates/radiko-client/tests/`: library and CLI integration tests; `tests/fixtures/`: synthetic JSON, XML, and HLS assets.
 
 ## Build and Development Commands
 
 ```sh
-cargo build
+cargo build --workspace
 cargo run -- --help
 cargo run -- inspect-chapters tests/fixtures/chapters.json 90 0
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
 ```
 
 These build, inspect CLI behavior, check formatting, reject lint warnings, and run tests. For the documented macOS SDK linker failure, prefix Cargo commands with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. Maintain `Cargo.lock`. The macOS Checks workflow runs stable formatting/lints and Rust/Python tests, plus Rust 1.85.0 tests; use `--locked` in CI and keep live probes out of automatic jobs.
@@ -92,7 +94,7 @@ macOS向けのRust製radiko TUIクライアントを開発する。全国の番�
 
 ## 構成と実装ルール
 
-- 単一のCargoプロジェクトで、`radiko`、`catalog`、`player`、`tui`、`app`、`domain`、`storage`の責務を分離する。画面のコードは `src/tui.rs` と `src/tui/` にある。アプリ状態は単一イベントループで更新し、処理領域ごとの要求ID・世代で古い結果を破棄する。
+- ワークスペースはライブラリクレート `radiko`（`crates/radiko`）と、CLI・TUI のバイナリ `radiko-client`（`crates/radiko-client`）に分ける。ライブラリは `api`、`catalog`、`player`、`app`、`domain`、`storage` の責務を分離し、画面の依存を持たない。画面のコードは `crates/radiko-client/src/tui.rs` と `crates/radiko-client/src/tui/` にある。アプリ状態は単一イベントループで更新し、処理領域ごとの要求ID・世代で古い結果を破棄する。
 - 採用技術は設計書に従う。依存ライブラリの対応形式・API・featureは公式資料と実際の採用バージョンで確認する。
 - アプリケーション用の`Cargo.lock`を管理する。
 - 画面から通信・デコード処理を直接実行せず、コマンドと状態通知を介して連携する。
@@ -151,8 +153,8 @@ Cargoプロジェクト作成後は、変更に適したテストと次のチェ
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
 ```
 
 - 通常の自動テストは、実アカウントやradikoへの通信に依存させない。XML・HLSのfixtureとモックを使う。

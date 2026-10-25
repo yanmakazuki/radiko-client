@@ -27,11 +27,32 @@ export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
 ```
 
-通常の `cargo test` はアカウントにも radiko にも繋ぎません。実配信や音声機器を使う確認は [検証範囲](docs/validation.md) に分けてあります。GitHub Actions の Checks は macOS で、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--locked` で実行します。
+通常の `cargo test --workspace` はアカウントにも radiko にも繋ぎません。実配信や音声機器を使う確認は [検証範囲](docs/validation.md) に分けてあります。GitHub Actions の Checks は macOS で、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--workspace --locked` で実行します。
+
+## ライブラリとして使う
+
+画面のない処理はクレート `radiko`（`crates/radiko`）です。TUI と CLI は `crates/radiko-client` がそれを呼びます。Ratatui はライブラリの依存に入りません。
+
+```toml
+radiko = { path = "crates/radiko" }
+```
+
+よく使う型は `radiko::prelude` にあります。保存先は `radiko::storage::DataDir`、どの番組表を取るかは `radiko::catalog`、番組表 XML・認証・HLS・チャプターの通信は `radiko::api`、再生は `radiko::player`、画面向けの状態と世代は `radiko::app` です。
+
+```rust
+use chrono::TimeZone;
+use radiko::domain::search::{Scope, SearchCriteria};
+
+let jst = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+let now = jst.with_ymd_and_hms(2026, 10, 25, 4, 30, 0).unwrap();
+let criteria = SearchCriteria::initial(now).unwrap();
+assert_eq!(criteria.range().start().to_string(), "2026-10-24");
+assert!(matches!(criteria.scope(), Scope::Nationwide));
+```
 
 ## TUI を起動する
 
