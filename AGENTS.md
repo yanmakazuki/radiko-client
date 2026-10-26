@@ -2,7 +2,7 @@
 
 ## Scope and Architecture
 
-This macOS Rust client provides filtered station and regional/nationwide date-range listings, authentication, HLS probes, bounded audio output, saved search CLI, and a search/live/time-free TUI. Chapter jumps require a matching event origin and slot; broader real-device validation remains unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Preserve pure Rust decoding; do not substitute external players or OS decoders automatically.
+This macOS and Linux Rust client provides filtered station and regional/nationwide date-range listings, authentication, HLS probes, bounded audio output, saved search CLI, and a search/live/time-free TUI. Chapter jumps require a matching event origin and slot; broader real-device validation remains unfinished. Read [design.md](docs/design.md) and [architecture.md](docs/architecture.md) before implementation; update both when requirements change. Record dated verification evidence and limitations in [implementation.md](docs/implementation.md). Preserve pure Rust decoding; do not substitute external players or OS decoders automatically.
 
 ## Project Structure
 
@@ -43,7 +43,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 ```
 
-These build, inspect CLI behavior, check formatting, reject lint warnings, and run tests. For the documented macOS SDK linker failure, prefix Cargo commands with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. Maintain `Cargo.lock`. The macOS Checks workflow runs stable formatting/lints and Rust/Python tests, plus Rust 1.85.0 tests; use `--locked` in CI and keep live probes out of automatic jobs.
+These build, inspect CLI behavior, check formatting, reject lint warnings, and run tests. For the documented macOS SDK linker failure, prefix Cargo commands with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. On Linux, install pkg-config and the ALSA development files (`libasound2-dev` on Debian and Ubuntu, `alsa-lib-devel` on Fedora) before building. Maintain `Cargo.lock`. The Checks workflow runs on macos-15 and ubuntu-24.04: stable formatting, lints, and Rust/Python tests, plus Rust 1.85.0 tests. Use `--locked` in CI and keep live probes out of automatic jobs. Linux jobs install `libasound2-dev` and `pkg-config` first.
 
 ## Coding Style and Domain Rules
 
@@ -65,19 +65,19 @@ Never persist passwords or log credentials, cookies, tokens, or signed URLs. Use
 
 ## プロジェクトの目的
 
-macOS向けのRust製radiko TUIクライアントを開発する。全国の番組をジャンル・出演者分類・キーワードで検索し、ライブと過去30日のタイムフリーを再生できることを目指す。
+macOSとLinux向けのRust製radiko TUIクライアントを開発する。全国の番組をジャンル・出演者分類・キーワードで検索し、ライブと過去30日のタイムフリーを再生できることを目指す。Linuxの再生は実機未確認である。
 
 実装前に[設計書](docs/design.md)と[アーキテクチャ設計](docs/architecture.md)を読む。仕様の判断は設計書とユーザーの最新の指示に従い、仕様変更時は設計書とアーキテクチャ設計も整合させる。
 
 ## 現在の状態
 
-2026年10月24日時点の要約は [docs/validation.md](docs/validation.md)、日付とビルドごとの記録は [docs/implementation.md](docs/implementation.md) にある。仕様は [docs/design.md](docs/design.md)、構成は [docs/architecture.md](docs/architecture.md) に合わせる。
+2026年10月26日時点の要約は [docs/validation.md](docs/validation.md)、日付とビルドごとの記録は [docs/implementation.md](docs/implementation.md) にある。仕様は [docs/design.md](docs/design.md)、構成は [docs/architecture.md](docs/architecture.md) に合わせる。
 
 実装を変えるときに維持すること:
 
 - 実配信で確認した連続再生は ADTS の AAC/SBR である。単一 AAC トラックの fragmented MP4 は、生成音声と、ADTS をメモリ内で詰め直した照合まで接続している。実配信の非 ADTS が見つかるまで、Range、複数 run、編集リスト、PS 再構成は足さない。
 - イベント原点が枠の開始と違う実例は確認していない。補正は足さない。
-- 既定出力は、同じ名前の列挙デバイスを開く。自動再開、任意の機器選択、再生中の出力先追跡はしない。
+- 既定出力は、同じ名前の列挙デバイスを開く。Linux では CPAL の ALSA 既定名 `default` を開く。自動再開、任意の機器選択、再生中の出力先追跡はしない。
 - 録音、音声の永続保存、外部プレイヤーや OS デコーダーへの自動切り替えはしない。
 - 検証を書いたら、確認日、対象、手順、結果を implementation.md に足し、validation.md の要約も合わせる。取得できたことだけで再生対応済みにしない。
 
@@ -178,4 +178,4 @@ cargo test --workspace --all-targets --all-features
 
 ## 初期版の範囲
 
-録音、音声の永続保存、ポッドキャスト、通知、再生位置保存、他OS対応は追加しない。ユーザーが範囲を変更した場合は、その指示を反映して設計書を更新する。
+録音、音声の永続保存、ポッドキャスト、通知、再生位置保存、macOS と Linux 以外の OS 対応は追加しない。ユーザーが範囲を変更した場合は、その指示を反映して設計書を更新する。

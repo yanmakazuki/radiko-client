@@ -18,13 +18,20 @@ env:
 
 jobs:
   checks:
-    name: Format, lint, and tests
-    runs-on: macos-15
+    name: Format, lint, and tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install ALSA development files
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Formatting
@@ -37,13 +44,20 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
   msrv:
-    name: Rust 1.85.0
-    runs-on: macos-15
+    name: Rust 1.85.0 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install ALSA development files
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.85.0 --profile minimal
       - name: Rust tests

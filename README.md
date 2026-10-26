@@ -1,6 +1,6 @@
 # radiko-client
 
-macOS のターミナルで使う radiko クライアントです。全国・地域・局の番組を、最大30放送日の範囲でジャンル・出演者分類・キーワードから探し、ライブとタイムフリーを再生します。音声は純 Rust でデコードし、CPAL で出力します。
+macOS と Linux のターミナルで使う radiko クライアントです。全国・地域・局の番組を、最大30放送日の範囲でジャンル・出演者分類・キーワードから探し、ライブとタイムフリーを再生します。音声は純 Rust でデコードし、CPAL で出力します。Linux の再生はまだ実機で確認していません。
 
 | 知りたいこと | 文書 |
 | --- | --- |
@@ -12,12 +12,13 @@ macOS のターミナルで使う radiko クライアントです。全国・地
 
 ## 必要なもの
 
-- macOS
+- macOS または Linux
 - Rust 1.85 以上。依存は `Cargo.lock` に固定する
+- Linux では pkg-config と libasound の開発ファイル。Debian と Ubuntu は `pkg-config` と `libasound2-dev`、Fedora は `pkgconf` と `alsa-lib-devel`
 - 再生には、公式 Web にログインできるダブルプランの保存セッション
 - 番組表の閲覧はログイン不要
 
-この環境では既定の MacOSX27.0 SDK でリンクに失敗することがあります。そのときは Cargo の前に次を付けます。
+macOS では、既定の MacOSX27.0 SDK でリンクに失敗することがあります。そのときは Cargo の前に次を付けます。
 
 ```sh
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
@@ -31,7 +32,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 ```
 
-通常の `cargo test --workspace` はアカウントにも radiko にも繋ぎません。実配信や音声機器を使う確認は [検証範囲](docs/validation.md) に分けてあります。GitHub Actions の Checks は macOS で、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--workspace --locked` で実行します。
+通常の `cargo test --workspace` はアカウントにも radiko にも繋ぎません。実配信や音声機器を使う確認は [検証範囲](docs/validation.md) に分けてあります。GitHub Actions の Checks は macos-15 と ubuntu-24.04 で、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--workspace --locked` で実行します。Linux のジョブは先に `libasound2-dev` と `pkg-config` を入れます。
 
 ## ライブラリとして使う
 
@@ -117,11 +118,15 @@ cargo run -- logout
 
 `login` は端末でメールアドレスとパスワードを聞きます。パスワードは残しません。ログインのあと、セッションの有効性と、エリアフリー・タイムフリー30日の契約フラグを別途確認します。契約フラグがあることと、その番組を再生できることは別です。
 
-保存するのは再利用できるセッションだけです。既定の場所は `directories` のユーザーデータディレクトリで、この環境では次です。
+保存するのは再利用できるセッションだけです。既定の場所は `directories` 6 の `data_local_dir` です。
+
+macOS では次です。
 
 ```text
 ~/Library/Application Support/jp.radiko-client.radiko-client/session.json
 ```
+
+Linux では `$XDG_DATA_HOME/radiko-client/session.json` です。`XDG_DATA_HOME` がなければ `~/.local/share/radiko-client/session.json` です。
 
 検索条件は同じディレクトリの `searches.json` です。`--data-dir DIR` で両方の場所を変えられます。専用のディレクトリを指定してください。Unix ではディレクトリを `0700`、ファイルを `0600` で作ります。中身は平文なので、Git には入れません。
 

@@ -4,6 +4,16 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月26日：Linux を対象に加える
+
+対象を macOS と Linux にした。Windows などそれ以外は初期版の外のままである。出力ホストは CPAL 0.16.0 の既定で、macOS は CoreAudio、Linux は ALSA である。Linux のビルドには pkg-config と libasound の開発ファイルが要る。JACK 機能は有効にしていない。既定の保存先は `directories` 6.0.0 のままで、Linux では `$XDG_DATA_HOME/radiko-client`、未設定なら `~/.local/share/radiko-client` である。macOS の `~/Library/Application Support/jp.radiko-client.radiko-client` は変えていない。
+
+CPAL 0.16.0 の ALSA 実装を確認した。既定デバイスの名前は `default` 固定である。列挙は、開ける `default`、`pipewire`、`pulse`、`jack`、`oss` のあと、カード名の `plughw` である。選択は従来どおり既定と同じ名前の列挙デバイスなので、`default` が開けばその PCM を開く。`POLLERR` は CPAL が `StreamError` にし、プレイヤーは既存の `OutputError::Device` にする。このプロセスのレート変換と、OS デコーダーへの切り替えは足していない。ALSA プラグインが機器側で変換するかは未確認である。
+
+`.github/workflows/checks.yml` の検査を macos-15 と ubuntu-24.04 の両方で実行する。Linux では `libasound2-dev` と `pkg-config` を入れてから、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--locked` で実行する。ランナー名は [GitHub の hosted runners 資料](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) で確認した。checkout は v7 のままである。この変更の GitHub 上の実行はまだ行っていない。Linux の実機、音声出力、端末、radiko 通信は確認していない。macOS の再生結果は Linux の結果にしない。
+
+ローカルの確認は macOS、通常の Rust 1.98.1、`SDKROOT` は MacOSX26.5 である。`cargo fmt --all -- --check`、`cargo clippy --workspace --offline --all-targets --all-features -- -D warnings`、`cargo test --workspace --offline --all-targets --all-features` は 306 件成功、ライブラリの ignored 4 件はそのままである。Rust 1.85 では再ビルドしていない。アカウント、通信、音声出力、TUI の操作確認はしていない。
+
 ## 2026年10月25日：画面以外をライブラリクレートにする
 
 ワークスペースを `crates/radiko`（ライブラリ `radiko`）と `crates/radiko-client`（CLI と TUI）に分けた。HTTP と解析のモジュール名は `api` にし、よく使う型は `radiko::prelude`、セッションと検索条件の保存先は `storage::DataDir` にまとめた。番組表の取得元 `CatalogClient` は `catalog` からも使える。User-Agent の接頭辞と、セッションの保存先名 `jp.radiko-client.radiko-client` は変えていない。画面のキーと描き方は動かしていない。

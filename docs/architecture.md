@@ -1,6 +1,6 @@
 # アーキテクチャ
 
-2026年10月25日時点の構成です。仕様の意味は [機能設計](design.md)、確認の範囲は [検証範囲](validation.md)、日付ごとの手順と数値は [実装状況](implementation.md) にあります。
+2026年10月26日時点の構成です。仕様の意味は [機能設計](design.md)、確認の範囲は [検証範囲](validation.md)、日付ごとの手順と数値は [実装状況](implementation.md) にあります。
 
 画面は状態を直接変えません。通信とデコードの結果は、領域ごとの要求 ID を付けてメインループへ返し、ID が一致するものだけを反映します。キャンセルしたあとに届いた結果も捨てます。
 
@@ -53,7 +53,7 @@ flowchart LR
 | `crates/radiko/tests/` と `crates/radiko-client/tests/` | ライブラリと CLI の統合テスト |
 | `tests/fixtures/` | 資格情報を含まない合成データ |
 
-採用バージョンは各クレートの `Cargo.toml` と、ワークスペースの `Cargo.lock` が正です。画面は Ratatui 0.29.0 と Crossterm 0.28.1 で、バイナリだけが依存します。出力は CPAL 0.16.0 と rtrb 0.3.2、AAC は `rusty_aac` 1.1.0、コンテナの解析に Symphonia 0.5、HTTP は reqwest 0.12（`rustls-tls`、blocking feature は使わない）、非同期ランタイムは Tokio です。
+採用バージョンは各クレートの `Cargo.toml` と、ワークスペースの `Cargo.lock` が正です。画面は Ratatui 0.29.0 と Crossterm 0.28.1 で、バイナリだけが依存します。出力は CPAL 0.16.0 と rtrb 0.3.2、AAC は `rusty_aac` 1.1.0、コンテナの解析に Symphonia 0.5、HTTP は reqwest 0.12（`rustls-tls`、blocking feature は使わない）、非同期ランタイムは Tokio です。CPAL の既定ホストは、macOS では CoreAudio、Linux では ALSA です。Linux のビルドは libasound にリンクします。JACK 機能は有効にしていません。
 
 ## メインループ
 
@@ -141,7 +141,11 @@ MP4 を Symphonia へ渡す前に、`player::mp4_limits` がボックスを深�
 
 ### 既定の出力機器
 
-再生と `output-info` は、その時点の OS 既定出力と同じ名前の列挙デバイスを開きます。名前が一致しなければ CPAL の default ラッパーへ戻ります。CPAL 0.16.0 の default ラッパーは機器が消えた通知を付けず、OS の既定変更へ追従します。列挙デバイスでは、消滅が既存の `OutputError::Device` になります。機器が残ったまま既定だけが変わる場合、開いたストリームは移動しません。
+再生と `output-info` は、その時点の CPAL 既定出力と同じ名前の列挙デバイスを開きます。名前が一致しなければ CPAL の default へ戻ります。
+
+macOS では、CPAL 0.16.0 の default ラッパーは `DeviceIsAlive` を付けず、後の OS 既定変更へ追従する出力ユニットを使います。同じ名前の列挙デバイスでは、消滅が既存の `OutputError::Device` になります。機器が残ったまま既定だけが変わる場合、開いたストリームは移動しません。
+
+Linux では、CPAL 0.16.0 の ALSA ホストが既定の名前を `default` に固定します。列挙の先頭に同じ名前の PCM があれば、それを開きます。列挙は、開ける `default`、`pipewire`、`pulse`、`jack`、`oss` と、カード名の `plughw` です。名前が `default` と違うものは選びません。ALSA が `POLLERR` を返すと CPAL は `StreamError` にし、このプレイヤーは同じ `OutputError::Device` にします。この切断と、`default` プラグインがデスクトップの既定を追うかは、実機では未確認です。
 
 `inspect_default_output` はストリームを作らず、対応構成の宣言だけを読みます。名前は制御文字を除いて256文字までです。
 
@@ -171,7 +175,7 @@ DNS は共有の最大4ブロッキングスレッドと、許可4のセマフ�
 
 ## 保存
 
-`SessionStore` と `SearchStore` は、同じ `--data-dir` の `session.json` と `searches.json` です。どちらもバージョン付き JSON で、一時ファイル経由で原子的に置き、Unix ではディレクトリ `0700`、ファイル `0600` です。セッションは最大16KiB、検索条件は最大128KiB です。未知のフィールド、未対応のバージョン、権限の異常、シンボリックリンクは拒否します。
+`SessionStore` と `SearchStore` は、同じ `--data-dir` の `session.json` と `searches.json` です。どちらもバージョン付き JSON で、一時ファイル経由で原子的に置き、Unix ではディレクトリ `0700`、ファイル `0600` です。セッションは最大16KiB、検索条件は最大128KiB です。未知のフィールド、未対応のバージョン、権限の異常、シンボリックリンクは拒否します。省略時のディレクトリは `directories` 6.0.0 の `data_local_dir` です。macOS は `~/Library/Application Support/jp.radiko-client.radiko-client`、Linux は `$XDG_DATA_HOME/radiko-client`、未設定なら `~/.local/share/radiko-client` です。
 
 検索条件の更新は `searches.lock` を開き、待たない `flock` で読み込みから原子的な書き込みまでを包みます。競合したら失敗を返します。読み込みは、置換の前か後の完全な JSON です。起動用の復元は日付範囲を当日1日へ置き換え、名前付きの呼び出しは保存した範囲を維持します。デシリアライズ時に `Filter` を再構築し、キーワードの小文字化もやり直します。
 

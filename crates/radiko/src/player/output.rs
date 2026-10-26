@@ -69,9 +69,12 @@ fn compatible_config(
         .max_by_key(|config| config.channels())
 }
 
-/// The OS default output, opened as an enumerated device when its name matches.
-/// CPAL 0.16 registers a device-removal callback only for non-default devices and
-/// otherwise uses an output unit that follows later OS default changes.
+/// The enumerated output whose name matches CPAL's current default.
+/// On macOS, CPAL 0.16 names that device after the CoreAudio default and registers
+/// `DeviceIsAlive` only for enumerated devices. The default wrapper follows later OS
+/// default changes and is used only when no enumerated name matches.
+/// On Linux, CPAL 0.16's ALSA host names the default PCM `default`. Enumeration
+/// includes that name when it opens, so this selects the `default` PCM.
 fn selected_output_device() -> Result<cpal::Device, OutputError> {
     let host = cpal::default_host();
     let fallback = host.default_output_device().ok_or(OutputError::NoDevice)?;
