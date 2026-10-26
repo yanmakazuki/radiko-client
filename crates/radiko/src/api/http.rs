@@ -31,6 +31,8 @@ pub(crate) trait Fetch {
         range: Option<(u64, u64)>,
         redirects: bool,
     ) -> Result<Reply, ProbeError>;
+    /// Counts a completed stream-token renewal. The default keeps non-playback clients unchanged.
+    fn note_reauthentication(&self) {}
 }
 pub(crate) struct Reply {
     pub headers: HeaderMap,
@@ -316,6 +318,11 @@ impl Drop for FinishRequest<'_> {
     }
 }
 impl Fetch for Http {
+    fn note_reauthentication(&self) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_reauthentication();
+        }
+    }
     fn get(
         &self,
         mut url: Url,

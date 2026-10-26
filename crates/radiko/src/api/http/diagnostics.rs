@@ -28,6 +28,8 @@ pub struct Snapshot {
     /// These subsets can overlap (for example a connection timeout).
     pub timeouts: u64,
     pub connect_failures: u64,
+    /// Completed stream-token renewals. HTTP 401 retries that fail do not add another renewal.
+    pub reauthentications: u64,
 }
 
 struct State {
@@ -51,6 +53,7 @@ impl Measurements {
                 network_failures: 0,
                 timeouts: 0,
                 connect_failures: 0,
+                reauthentications: 0,
             },
         }))
     }
@@ -83,6 +86,11 @@ impl Measurements {
     pub(crate) fn received(&self, status: u16) {
         if let Ok(mut state) = self.0.lock() {
             state.snapshot.response_status = Some(status);
+        }
+    }
+    pub(crate) fn note_reauthentication(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.snapshot.reauthentications = state.snapshot.reauthentications.saturating_add(1);
         }
     }
     pub(crate) fn failed(&self, timeout: bool, connect: bool) {
@@ -197,5 +205,20 @@ mod tests {
         assert_eq!(idle.headers_max, Duration::from_secs(3));
         assert_eq!(idle.body_max, Duration::from_millis(20));
         assert_eq!(Measurements::new().snapshot().unwrap().attempts, 0);
+    }
+    #[test]
+    fn reauthentication_count_saturates_without_recording_tokens() {
+        let measurements = Measurements::new();
+        assert_eq!(measurements.snapshot().unwrap().reauthentications, 0);
+        measurements.note_reauthentication();
+        measurements.note_reauthentication();
+        assert_eq!(measurements.snapshot().unwrap().reauthentications, 2);
+        {
+            let mut state = measurements.0.lock().unwrap();
+            state.snapshot.reauthentications = u64::MAX;
+        }
+        measurements.note_reauthentication();
+        assert_eq!(measurements.snapshot().unwrap().reauthentications, u64::MAX);
+        assert_eq!(Measurements::new().snapshot().unwrap().reauthentications, 0);
     }
 }
