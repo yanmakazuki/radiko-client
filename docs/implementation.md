@@ -4,6 +4,18 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月26日：ALSA の診断を抑え、同じレートの i16 と i32 を開く
+
+対象は Linux の CPAL 0.16.0 / ALSA である。端末へ出ていた `ALSA lib ...` は、CPAL を呼ぶ前に `snd_lib_error_set_handler` で黙らせる。ハンドラは printf 引数を読まない。失敗の戻り値は日本語のエラーのままである。`RADIKO_ALSA_LOG=1` のときはハンドラを差し替えず、ALSA の既定の stderr を残す。機器の対応構成が取れないとき、Linux では「既定の音声出力機器がありません」にする。
+
+形式は、要求レートを含む mono または stereo の f32、i32、i16 である。優先は f32、次に i32、次に i16 で、同じ形式ならチャンネル数が多い方である。整数は音声コールバックで f32 を ±1.0 にクリップしてから変換する。レート変換は足していない。一致が無いときは、必要なレートと機器の対応範囲をエラーに出す。`output-info` と `probe-output` は採用した形式を表示する。macOS で f32 が採用されるときの `output-info` の成功行は、これまでの `Hz / f32 / ch` のままである。
+
+確認環境は Linux x86_64、Rust 1.99.1、ALSA 1.2.11、`/dev/snd` なしである。`output-info`、`probe-output 1`、`probe-output --mute 1` は終了 1、stderr は「エラー: 既定の音声出力機器がありません」のみで、`ALSA lib` は 0 行だった。同じ `output-info` に `RADIKO_ALSA_LOG=1` を付けると `ALSA lib` は 32 行戻り、日本語のエラーも残った。
+
+PulseAudio 16.1 の `module-null-sink`（`libasound2-plugins` 経由の `default`）では、起動直後のサーバ既定が s16le・2ch・44100Hz でも、`output-info` は `default`、48000Hz / f32 / 2ch、終了 0、`ALSA lib` 0 行だった。プラグインが f32 と 48000Hz を宣言したので、このプロセスは f32 を開いた。レート変換はしていない。続けて `probe-output --mute 3` は 144,000 フレーム、48000Hz、f32、2ch、不足 0、実時間約 5.2 秒、終了 0、`ALSA lib` 0 行だった。その直後の `output-info` も終了 0 だった。ignored の `native_muted_fragmented_aac_reaches_the_explicit_output_limit` は 240,000 フレーム、不足 0、壁時計約 7.2 秒で成功した。`native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` は成功し、`gap_after=4` は不足 0、壁時計約 27.2 秒だった。`gap_after=1` の不足はテストが許す範囲で、0 とはしない。
+
+`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features` は Rust 1.99.1 で成功した。成功は 312 件、ignored は 4 件のままである。Rust 1.85.0 でも同じテストが成功した。fmt と clippy は 1.85.0 では実行していない。アカウント、radiko への通信、音声の保存、実機の再生、耳での確認はない。i16 と i32 だけの機器を開いた再生はしていない。変換と形式選択は単体テストである。macOS はこの環境では再実行していない。PipeWire のデスクトップも未確認である。
+
 ## 2026年10月26日：Linux を対象に加える
 
 対象を macOS と Linux にした。Windows などそれ以外は初期版の外のままである。出力ホストは CPAL 0.16.0 の既定で、macOS は CoreAudio、Linux は ALSA である。Linux のビルドには pkg-config と libasound の開発ファイルが要る。JACK 機能は有効にしていない。既定の保存先は `directories` 6.0.0 のままで、Linux では `$XDG_DATA_HOME/radiko-client`、未設定なら `~/.local/share/radiko-client` である。macOS の `~/Library/Application Support/jp.radiko-client.radiko-client` は変えていない。

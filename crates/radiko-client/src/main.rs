@@ -281,12 +281,12 @@ fn output_info(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let info = output::inspect_default_output(rate)?;
     println!("現在の既定出力機器: {}", info.name);
-    match info.channels {
-        Some(channels) => println!(
-            "{}Hz / f32 / {}ch: 対応宣言あり（再生時に再確認）",
-            info.sample_rate, channels
+    match (info.sample_format, info.channels) {
+        (Some(format), Some(channels)) => println!(
+            "{}Hz / {format} / {channels}ch: 対応宣言あり（再生時に再確認）",
+            info.sample_rate
         ),
-        None => println!("{}Hz / f32 / mono・stereo: 対応宣言なし", info.sample_rate),
+        _ => println!("{}", info.mismatch),
     }
     Ok(())
 }
@@ -317,12 +317,12 @@ fn probe_output(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ctrlc::set_handler(move || cancelled.cancel())?;
         let summary = output::probe_silent(seconds, stop.clone(), |summary| {
             eprintln!(
-                "無音出力中: {}フレーム / {}Hz / 不足{}フレーム",
-                summary.frames, summary.sample_rate, summary.underrun_frames
+                "無音出力中: {}フレーム / {}Hz / {} / 不足{}フレーム",
+                summary.frames, summary.sample_rate, summary.sample_format, summary.underrun_frames
             );
         })?;
         println!(
-            "無音出力{}: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
+            "無音出力{}: {}フレーム / {}Hz / {} / {}ch / バッファ不足: {}フレーム",
             if stop.is_cancelled() {
                 "中断"
             } else {
@@ -330,6 +330,7 @@ fn probe_output(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             },
             summary.frames,
             summary.sample_rate,
+            summary.sample_format,
             summary.channels,
             summary.underrun_frames
         );
@@ -337,8 +338,12 @@ fn probe_output(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let summary = output::probe_tone(seconds)?;
     println!(
-        "生成音の出力完了: {}フレーム / {}Hz / {}ch / バッファ不足: {}フレーム",
-        summary.frames, summary.sample_rate, summary.channels, summary.underrun_frames
+        "生成音の出力完了: {}フレーム / {}Hz / {} / {}ch / バッファ不足: {}フレーム",
+        summary.frames,
+        summary.sample_rate,
+        summary.sample_format,
+        summary.channels,
+        summary.underrun_frames
     );
     Ok(())
 }

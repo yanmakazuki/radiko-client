@@ -21,6 +21,10 @@ pub enum OutputError {
     NoDevice,
     DeviceInfo,
     UnsupportedFormat,
+    IncompatibleOutput {
+        requested_rate: u32,
+        offered: Vec<OfferedOutputFormat>,
+    },
     Device,
     Stalled,
     ProbeTimeout,
@@ -28,45 +32,282 @@ pub enum OutputError {
 }
 impl fmt::Display for OutputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::InvalidPcm => "出力用PCMまたは再生時間が不正です",
-            Self::NoDevice => "既定の音声出力機器がありません",
-            Self::DeviceInfo => "音声出力機器の情報を取得できません",
-            Self::UnsupportedFormat => {
-                "PCMと同じレートのmono/stereo・f32出力に機器が対応していません"
+        match self {
+            Self::InvalidPcm => f.write_str("出力用PCMまたは再生時間が不正です"),
+            Self::NoDevice => f.write_str("既定の音声出力機器がありません"),
+            Self::DeviceInfo => f.write_str("音声出力機器の情報を取得できません"),
+            Self::UnsupportedFormat => f.write_str(
+                "出力中のサンプルレートまたはチャンネル数が、開いた音声と一致しません",
+            ),
+            Self::IncompatibleOutput {
+                requested_rate,
+                offered,
+            } => f.write_str(&incompatible_message(*requested_rate, offered)),
+            Self::Device => f.write_str("音声出力機器の開始・実行に失敗しました"),
+            Self::Stalled => f.write_str(
+                "音声コールバックが進まないため出力を停止しました。スリープ復帰・機器変更後は出力先を確認し、番組を選び直して再生してください",
+            ),
+            Self::ProbeTimeout => {
+                f.write_str("無音出力診断の実時間上限を超えたため停止しました")
             }
-            Self::Device => "音声出力機器の開始・実行に失敗しました",
-            Self::Stalled => {
-                "音声コールバックが進まないため出力を停止しました。スリープ復帰・機器変更後は出力先を確認し、番組を選び直して再生してください"
+            Self::Deadline => {
+                f.write_str("番組終了：放送終了日時に達したため音声を停止しました")
             }
-            Self::ProbeTimeout => "無音出力診断の実時間上限を超えたため停止しました",
-            Self::Deadline => "番組終了：放送終了日時に達したため音声を停止しました",
-        })
+        }
     }
 }
 impl std::error::Error for OutputError {}
 
 pub const PCM_SAMPLE_RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=192_000;
 
+/// Device sample formats this process can open without resampling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSampleFormat {
+    F32,
+    I16,
+    I32,
+}
+impl OutputSampleFormat {
+    fn from_cpal(format: SampleFormat) -> Option<Self> {
+        match format {
+            SampleFormat::F32 => Some(Self::F32),
+            SampleFormat::I16 => Some(Self::I16),
+            SampleFormat::I32 => Some(Self::I32),
+            _ => None,
+        }
+    }
+}
+impl fmt::Display for OutputSampleFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::F32 => "f32",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+        })
+    }
+}
+
+/// One range the device declared. Not a promise that playback will succeed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferedOutputFormat {
+    pub channels: u16,
+    pub min_sample_rate: u32,
+    pub max_sample_rate: u32,
+    pub sample_format: &'static str,
+}
+
 /// Read-time OS capability declaration, not an opened stream or a playback result.
 pub struct OutputDeviceInfo {
     pub name: String,
     pub sample_rate: u32,
     pub channels: Option<u16>,
+    pub sample_format: Option<OutputSampleFormat>,
+    /// Japanese explanation when no f32/i16/i32 mono/stereo range contains `sample_rate`.
+    pub mismatch: String,
 }
 
+fn format_preference(format: SampleFormat) -> Option<u8> {
+    match format {
+        SampleFormat::F32 => Some(0),
+        SampleFormat::I32 => Some(1),
+        SampleFormat::I16 => Some(2),
+        _ => None,
+    }
+}
+
+fn sample_format_label(format: SampleFormat) -> &'static str {
+    match format {
+        SampleFormat::F32 => "f32",
+        SampleFormat::I16 => "i16",
+        SampleFormat::I32 => "i32",
+        SampleFormat::I8 => "i8",
+        SampleFormat::I64 => "i64",
+        SampleFormat::U8 => "u8",
+        SampleFormat::U16 => "u16",
+        SampleFormat::U32 => "u32",
+        SampleFormat::U64 => "u64",
+        SampleFormat::F64 => "f64",
+        _ => "その他",
+    }
+}
+
+/// Same-rate mono or stereo. f32 wins over i32, then i16. More channels win within a format.
 fn compatible_config(
     configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
     rate: u32,
 ) -> Option<cpal::SupportedStreamConfigRange> {
     configs
         .filter(|config| {
-            config.sample_format() == SampleFormat::F32
+            format_preference(config.sample_format()).is_some()
                 && matches!(config.channels(), 1 | 2)
                 && config.min_sample_rate().0 <= rate
                 && config.max_sample_rate().0 >= rate
         })
-        .max_by_key(|config| config.channels())
+        .min_by_key(|config| {
+            (
+                format_preference(config.sample_format()).unwrap_or(u8::MAX),
+                std::cmp::Reverse(config.channels()),
+            )
+        })
+}
+
+fn offered_formats(configs: &[cpal::SupportedStreamConfigRange]) -> Vec<OfferedOutputFormat> {
+    configs
+        .iter()
+        .map(|config| OfferedOutputFormat {
+            channels: config.channels(),
+            min_sample_rate: config.min_sample_rate().0,
+            max_sample_rate: config.max_sample_rate().0,
+            sample_format: sample_format_label(config.sample_format()),
+        })
+        .collect()
+}
+
+fn incompatible_output(
+    requested_rate: u32,
+    configs: &[cpal::SupportedStreamConfigRange],
+) -> OutputError {
+    OutputError::IncompatibleOutput {
+        requested_rate,
+        offered: offered_formats(configs),
+    }
+}
+
+fn incompatible_message(requested_rate: u32, offered: &[OfferedOutputFormat]) -> String {
+    let mut ranges = String::new();
+    if offered.is_empty() {
+        ranges.push_str("なし");
+    }
+    for (index, offer) in offered.iter().enumerate() {
+        if index == 12 {
+            ranges.push_str("、ほか");
+            break;
+        }
+        if index > 0 {
+            ranges.push('、');
+        }
+        if offer.min_sample_rate == offer.max_sample_rate {
+            ranges.push_str(&format!("{}Hz", offer.min_sample_rate));
+        } else {
+            ranges.push_str(&format!(
+                "{}〜{}Hz",
+                offer.min_sample_rate, offer.max_sample_rate
+            ));
+        }
+        ranges.push('・');
+        ranges.push_str(offer.sample_format);
+        ranges.push('・');
+        ranges.push_str(&format!("{}ch", offer.channels));
+    }
+    format!(
+        "必要な形式は{requested_rate}Hzのmonoまたはstereoのf32・i16・i32です。機器の対応範囲: {ranges}"
+    )
+}
+
+fn config_query_error(for_playback: bool) -> OutputError {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = for_playback;
+        OutputError::NoDevice
+    }
+    #[cfg(not(target_os = "linux"))]
+    if for_playback {
+        OutputError::Device
+    } else {
+        OutputError::DeviceInfo
+    }
+}
+
+fn supported_configs(
+    device: &cpal::Device,
+    on_error: OutputError,
+) -> Result<Vec<cpal::SupportedStreamConfigRange>, OutputError> {
+    device
+        .supported_output_configs()
+        .map(|configs| configs.collect())
+        .map_err(|_| on_error)
+}
+
+/// `RADIKO_ALSA_LOG=1` leaves ALSA's own stderr handler in place.
+fn alsa_diagnostics_suppressed(value: Option<&str>) -> bool {
+    value != Some("1")
+}
+
+fn prepare_alsa_errors() {
+    let suppress = alsa_diagnostics_suppressed(std::env::var("RADIKO_ALSA_LOG").ok().as_deref());
+    #[cfg(target_os = "linux")]
+    if suppress {
+        install_silent_alsa_error_handler();
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = suppress;
+}
+
+#[cfg(target_os = "linux")]
+static ALSA_ERROR_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn radiko_install_silent_alsa_error_handler();
+}
+
+#[cfg(target_os = "linux")]
+fn install_silent_alsa_error_handler() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        radiko_install_silent_alsa_error_handler();
+        ALSA_ERROR_HANDLER_INSTALLED.store(true, Ordering::SeqCst);
+    });
+}
+
+fn empty_output_error(rate: u32) -> OutputError {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = rate;
+        OutputError::NoDevice
+    }
+    #[cfg(not(target_os = "linux"))]
+    incompatible_output(rate, &[])
+}
+
+fn open_device_stream<T, F>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut renderer: Renderer,
+    silence: T,
+    encode: F,
+) -> Result<cpal::Stream, OutputError>
+where
+    T: cpal::SizedSample + Send + 'static,
+    F: Fn(f32) -> T + Send + 'static,
+{
+    let channels = usize::from(config.channels);
+    let failed = renderer.state.clone();
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], info| {
+                let timestamp = info.timestamp();
+                let delay = timestamp
+                    .playback
+                    .duration_since(&timestamp.callback)
+                    .unwrap_or_default();
+                let now = Instant::now();
+                renderer.render_samples(
+                    data,
+                    channels,
+                    now.checked_add(delay).unwrap_or(now),
+                    silence,
+                    &encode,
+                );
+            },
+            move |_| {
+                failed.failed.store(true, Ordering::Release);
+            },
+            None,
+        )
+        .map_err(|_| OutputError::Device)
 }
 
 /// The enumerated output whose name matches CPAL's current default.
@@ -76,6 +317,7 @@ fn compatible_config(
 /// On Linux, CPAL 0.16's ALSA host names the default PCM `default`. Enumeration
 /// includes that name when it opens, so this selects the `default` PCM.
 fn selected_output_device() -> Result<cpal::Device, OutputError> {
+    prepare_alsa_errors();
     let host = cpal::default_host();
     let fallback = host.default_output_device().ok_or(OutputError::NoDevice)?;
     let name = fallback.name().map_err(|_| OutputError::DeviceInfo)?;
@@ -96,13 +338,26 @@ pub fn inspect_default_output(sample_rate: u32) -> Result<OutputDeviceInfo, Outp
     let device = selected_output_device()?;
     let name = device.name().map_err(|_| OutputError::DeviceInfo)?;
     let name: String = name.chars().filter(|c| !c.is_control()).take(256).collect();
-    let configs = device
-        .supported_output_configs()
-        .map_err(|_| OutputError::DeviceInfo)?;
+    let configs = supported_configs(&device, config_query_error(false))?;
+    #[cfg(target_os = "linux")]
+    if configs.is_empty() {
+        return Err(OutputError::NoDevice);
+    }
+    let chosen = compatible_config(configs.iter().cloned(), sample_rate);
+    let sample_format = chosen
+        .as_ref()
+        .and_then(|config| OutputSampleFormat::from_cpal(config.sample_format()));
+    let mismatch = if chosen.is_some() {
+        String::new()
+    } else {
+        incompatible_output(sample_rate, &configs).to_string()
+    };
     Ok(OutputDeviceInfo {
         name,
         sample_rate,
-        channels: compatible_config(configs, sample_rate).map(|config| config.channels()),
+        channels: chosen.map(|config| config.channels()),
+        sample_format,
+        mismatch,
     })
 }
 
@@ -149,6 +404,7 @@ pub struct OutputSummary {
     pub underrun_frames: u64,
     pub sample_rate: u32,
     pub channels: u16,
+    pub sample_format: OutputSampleFormat,
 }
 
 struct Renderer {
@@ -158,10 +414,49 @@ struct Renderer {
     rate: u32,
     deadline: Option<Instant>,
 }
+fn encode_f32(sample: f32) -> f32 {
+    sample
+}
+
+fn encode_i16(sample: f32) -> i16 {
+    let clipped = sample.clamp(-1.0, 1.0);
+    (clipped * 32767.0).round().clamp(-32767.0, 32767.0) as i16
+}
+
+fn encode_i32(sample: f32) -> i32 {
+    let clipped = sample.clamp(-1.0, 1.0);
+    if clipped >= 1.0 {
+        return i32::MAX;
+    }
+    if clipped <= -1.0 {
+        return i32::MIN;
+    }
+    let scaled = (clipped * 2147483647.0).round();
+    if scaled >= 2147483647.0 {
+        i32::MAX
+    } else if scaled <= -2147483648.0 {
+        i32::MIN
+    } else {
+        scaled as i32
+    }
+}
+
 impl Renderer {
+    #[cfg(test)]
     fn render(&mut self, data: &mut [f32], channels: usize, now: Instant) {
+        self.render_samples(data, channels, now, 0.0, encode_f32);
+    }
+
+    fn render_samples<T: Copy, F: Fn(f32) -> T>(
+        &mut self,
+        data: &mut [T],
+        channels: usize,
+        now: Instant,
+        silence: T,
+        encode: F,
+    ) {
         self.state.callbacks.fetch_add(1, Ordering::Release);
-        data.fill(0.0);
+        data.fill(silence);
         if self.deadline.is_some_and(|deadline| now >= deadline) {
             self.state.expired.store(true, Ordering::Release);
             self.state.stopped.store(true, Ordering::Release);
@@ -195,10 +490,10 @@ impl Renderer {
             match self.queue.pop() {
                 Ok(frame) => {
                     if channels == 1 {
-                        output[0] = (frame[0] + frame[1]) * 0.5 * gain;
+                        output[0] = encode((frame[0] + frame[1]) * 0.5 * gain);
                     } else {
-                        output[0] = frame[0] * gain;
-                        output[1] = frame[1] * gain;
+                        output[0] = encode(frame[0] * gain);
+                        output[1] = encode(frame[1] * gain);
                     }
                     frames += 1;
                 }
@@ -238,6 +533,7 @@ struct Output {
     producer: Producer<[f32; 2]>,
     state: Arc<State>,
     channels: u16,
+    sample_format: OutputSampleFormat,
 }
 impl Drop for Output {
     fn drop(&mut self) {
@@ -257,44 +553,36 @@ impl Output {
         stop: StopToken,
     ) -> Result<Self, OutputError> {
         let device = selected_output_device()?;
-        let configs = device
-            .supported_output_configs()
-            .map_err(|_| OutputError::Device)?;
-        let supported = compatible_config(configs, rate).ok_or(OutputError::UnsupportedFormat)?;
+        let configs = supported_configs(&device, config_query_error(true))?;
+        if configs.is_empty() {
+            return Err(empty_output_error(rate));
+        }
+        let supported = compatible_config(configs.iter().cloned(), rate)
+            .ok_or_else(|| incompatible_output(rate, &configs))?;
+        let sample_format = OutputSampleFormat::from_cpal(supported.sample_format())
+            .ok_or_else(|| incompatible_output(rate, &configs))?;
         let config = supported.with_sample_rate(SampleRate(rate)).config();
-        let channels = config.channels;
         let (producer, mut renderer) = queue(rate, total, deadline);
         renderer.state.enabled.store(false, Ordering::Release);
         renderer.cancel = stop;
         let state = renderer.state.clone();
-        let failed = state.clone();
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], info| {
-                    let timestamp = info.timestamp();
-                    let delay = timestamp
-                        .playback
-                        .duration_since(&timestamp.callback)
-                        .unwrap_or_default();
-                    let now = Instant::now();
-                    renderer.render(
-                        data,
-                        usize::from(channels),
-                        now.checked_add(delay).unwrap_or(now),
-                    );
-                },
-                move |_| {
-                    failed.failed.store(true, Ordering::Release);
-                },
-                None,
-            )
-            .map_err(|_| OutputError::Device)?;
+        let stream = match sample_format {
+            OutputSampleFormat::F32 => {
+                open_device_stream(&device, &config, renderer, 0.0, encode_f32)?
+            }
+            OutputSampleFormat::I16 => {
+                open_device_stream(&device, &config, renderer, 0, encode_i16)?
+            }
+            OutputSampleFormat::I32 => {
+                open_device_stream(&device, &config, renderer, 0, encode_i32)?
+            }
+        };
         Ok(Self {
             stream,
             producer,
             state,
-            channels,
+            channels: config.channels,
+            sample_format,
         })
     }
     fn check(&self) -> Result<(), OutputError> {
@@ -309,6 +597,7 @@ impl Output {
 }
 
 /// One validated, bounded sample. No resampling or OS decoding is performed.
+/// i16 and i32 devices are converted from f32 in the callback.
 /// `remaining` is the selected live slot's remaining wall-clock time.
 pub fn play_pcm(
     pcm: &DecodedPcm,
@@ -378,6 +667,7 @@ pub fn play_pcm(
                 underrun_frames: output.state.underrun_frames.load(Ordering::Relaxed),
                 sample_rate: rate,
                 channels: output.channels,
+                sample_format: output.sample_format,
             });
         }
         if frames != last_frames {
@@ -492,6 +782,7 @@ impl ContinuousOutput {
             underrun_frames: self.output.state.underrun_frames.load(Ordering::Relaxed),
             sample_rate: self.rate,
             channels: self.output.channels,
+            sample_format: self.output.sample_format,
         }
     }
     pub fn configure(&self, paused: bool, volume: u32) {
@@ -629,7 +920,7 @@ pub fn probe_tone(seconds: u32) -> Result<OutputSummary, OutputError> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn device_inspection_and_playback_require_exact_rate_f32_and_mono_or_stereo() {
+    fn device_inspection_rejects_rates_outside_the_pcm_range_before_opening_hardware() {
         use super::*;
         for rate in [0, 7999, 192001, u32::MAX] {
             assert!(matches!(
@@ -637,39 +928,164 @@ mod tests {
                 Err(OutputError::InvalidPcm)
             ));
         }
-        let config = |channels, low, high, format| {
-            cpal::SupportedStreamConfigRange::new(
-                channels,
-                SampleRate(low),
-                SampleRate(high),
-                cpal::SupportedBufferSize::Unknown,
-                format,
-            )
-        };
-        let candidates = [
-            config(1, 24_000, 48_000, SampleFormat::F32),
-            config(2, 48_000, 48_000, SampleFormat::F32),
-            config(2, 8_000, 192_000, SampleFormat::I16),
-            config(6, 8_000, 192_000, SampleFormat::F32),
-        ];
-        assert_eq!(
-            compatible_config(candidates.into_iter(), 48_000)
-                .unwrap()
-                .channels(),
-            2
-        );
-        assert_eq!(
-            compatible_config(candidates.into_iter(), 24_000)
-                .unwrap()
-                .channels(),
-            1
-        );
-        for rate in [23_999, 48_001, 96_000] {
-            assert!(compatible_config(candidates.into_iter(), rate).is_none());
-        }
     }
 
     use super::*;
+
+    fn range(
+        channels: u16,
+        low: u32,
+        high: u32,
+        format: SampleFormat,
+    ) -> cpal::SupportedStreamConfigRange {
+        cpal::SupportedStreamConfigRange::new(
+            channels,
+            SampleRate(low),
+            SampleRate(high),
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    #[test]
+    fn compatible_config_prefers_f32_then_i32_then_i16_and_stereo_within_a_format() {
+        let mixed = [
+            range(1, 24_000, 48_000, SampleFormat::F32),
+            range(2, 48_000, 48_000, SampleFormat::F32),
+            range(2, 8_000, 192_000, SampleFormat::I16),
+            range(6, 8_000, 192_000, SampleFormat::F32),
+        ];
+        let at_48k = compatible_config(mixed.into_iter(), 48_000).unwrap();
+        assert_eq!(at_48k.sample_format(), SampleFormat::F32);
+        assert_eq!(at_48k.channels(), 2);
+        let at_24k = compatible_config(mixed.into_iter(), 24_000).unwrap();
+        assert_eq!(at_24k.sample_format(), SampleFormat::F32);
+        assert_eq!(at_24k.channels(), 1);
+        let wide_integer = compatible_config(mixed.into_iter(), 96_000).unwrap();
+        assert_eq!(wide_integer.sample_format(), SampleFormat::I16);
+        assert_eq!(wide_integer.channels(), 2);
+        for rate in [7_999, 192_001] {
+            assert!(compatible_config(mixed.into_iter(), rate).is_none());
+        }
+
+        let integers = [
+            range(2, 48_000, 48_000, SampleFormat::I16),
+            range(1, 48_000, 48_000, SampleFormat::I32),
+            range(8, 48_000, 48_000, SampleFormat::I32),
+        ];
+        let chosen = compatible_config(integers.into_iter(), 48_000).unwrap();
+        assert_eq!(chosen.sample_format(), SampleFormat::I32);
+        assert_eq!(chosen.channels(), 1);
+
+        let stereo_i16 = [
+            range(1, 48_000, 48_000, SampleFormat::I16),
+            range(2, 44_100, 48_000, SampleFormat::I16),
+        ];
+        let chosen = compatible_config(stereo_i16.into_iter(), 48_000).unwrap();
+        assert_eq!(chosen.sample_format(), SampleFormat::I16);
+        assert_eq!(chosen.channels(), 2);
+
+        let only_i32 = [range(2, 48_000, 48_000, SampleFormat::I32)];
+        assert_eq!(
+            compatible_config(only_i32.into_iter(), 48_000)
+                .unwrap()
+                .sample_format(),
+            SampleFormat::I32
+        );
+    }
+
+    #[test]
+    fn rate_mismatch_names_the_requested_rate_and_the_device_ranges() {
+        let offered = [
+            range(2, 44_100, 44_100, SampleFormat::F32),
+            range(2, 44_100, 44_100, SampleFormat::I16),
+            range(6, 48_000, 48_000, SampleFormat::F32),
+        ];
+        let text = incompatible_output(48_000, &offered).to_string();
+        assert!(text.contains("48000"), "{text}");
+        assert!(text.contains("44100"), "{text}");
+        assert!(text.contains("f32"), "{text}");
+        assert!(text.contains("i16"), "{text}");
+        assert!(text.contains("2ch"), "{text}");
+        assert!(text.contains("6ch"), "{text}");
+        assert!(text.contains("monoまたはstereo"), "{text}");
+        let empty = incompatible_output(48_000, &[]).to_string();
+        assert!(empty.contains("48000"), "{empty}");
+        assert!(empty.contains("なし"), "{empty}");
+    }
+
+    #[test]
+    fn alsa_library_diagnostics_stay_quiet_unless_the_debug_variable_is_one() {
+        assert!(alsa_diagnostics_suppressed(None));
+        assert!(alsa_diagnostics_suppressed(Some("")));
+        assert!(alsa_diagnostics_suppressed(Some("0")));
+        assert!(alsa_diagnostics_suppressed(Some("true")));
+        assert!(!alsa_diagnostics_suppressed(Some("1")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_installs_the_silent_alsa_error_handler() {
+        install_silent_alsa_error_handler();
+        assert!(ALSA_ERROR_HANDLER_INSTALLED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn integer_samples_clip_scale_after_volume_and_underruns_stay_zero() {
+        assert_eq!(encode_i16(0.0), 0);
+        assert_eq!(encode_i16(1.0), 32_767);
+        assert_eq!(encode_i16(-1.0), -32_767);
+        assert_eq!(encode_i16(1.5), 32_767);
+        assert_eq!(encode_i16(-1.5), -32_767);
+        assert_eq!(encode_i16(0.5), 16_384);
+        assert_eq!(encode_i16(-0.5), -16_384);
+        assert_eq!(encode_i32(0.0), 0);
+        assert_eq!(encode_i32(1.0), i32::MAX);
+        assert_eq!(encode_i32(-1.0), i32::MIN);
+        assert_eq!(encode_i32(2.0), i32::MAX);
+        assert_eq!(encode_i32(-2.0), i32::MIN);
+        assert!(encode_i32(0.5) > 1_000_000_000);
+        assert!(encode_i32(-0.5) < -1_000_000_000);
+
+        let (mut producer, mut renderer) = queue(48_000, 4, None);
+        producer.push([1.0, -1.0]).unwrap();
+        renderer.state.volume.store(50, Ordering::Release);
+        let mut i16_samples = [9i16; 4];
+        renderer.render_samples(&mut i16_samples, 2, Instant::now(), 0, encode_i16);
+        assert_eq!(i16_samples, [encode_i16(0.5), encode_i16(-0.5), 0, 0]);
+        assert_eq!(renderer.state.frames.load(Ordering::Acquire), 1);
+        assert_eq!(renderer.state.underrun_frames.load(Ordering::Relaxed), 1);
+
+        producer.push([2.0, -3.0]).unwrap();
+        renderer.state.volume.store(100, Ordering::Release);
+        renderer.render_samples(&mut i16_samples, 2, Instant::now(), 0, encode_i16);
+        assert_eq!(i16_samples[0], 32_767);
+        assert_eq!(i16_samples[1], -32_767);
+        assert_eq!(i16_samples[2], 0);
+        assert_eq!(i16_samples[3], 0);
+
+        let (mut producer, mut renderer) = queue(48_000, 4, None);
+        producer.push([1.0, 0.0]).unwrap();
+        let mut mono = [9i16; 2];
+        renderer.render_samples(&mut mono, 1, Instant::now(), 0, encode_i16);
+        assert_eq!(mono[0], encode_i16(0.5));
+        assert_eq!(mono[1], 0);
+        assert_eq!(renderer.state.underrun_frames.load(Ordering::Relaxed), 1);
+
+        let (mut producer, mut renderer) = queue(48_000, 2, None);
+        producer.push([1.0, -1.0]).unwrap();
+        renderer.state.volume.store(50, Ordering::Release);
+        let mut i32_samples = [9i32; 4];
+        renderer.render_samples(&mut i32_samples, 2, Instant::now(), 0, encode_i32);
+        assert_eq!(i32_samples, [encode_i32(0.5), encode_i32(-0.5), 0, 0]);
+        assert_eq!(renderer.state.underrun_frames.load(Ordering::Relaxed), 1);
+        producer.push([4.0, -4.0]).unwrap();
+        renderer.state.volume.store(100, Ordering::Release);
+        renderer.render_samples(&mut i32_samples, 2, Instant::now(), 0, encode_i32);
+        assert_eq!(i32_samples[0], i32::MAX);
+        assert_eq!(i32_samples[1], i32::MIN);
+    }
+
     #[test]
     fn silent_probe_pcm_is_bounded_zero_and_invalid_duration_never_opens_hardware() {
         let pcm = silent_pcm();

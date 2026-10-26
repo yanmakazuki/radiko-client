@@ -2904,6 +2904,7 @@ mod tests {
                     underrun_frames: 0,
                     sample_rate: 48000,
                     channels: 2,
+                    sample_format: radiko::player::output::OutputSampleFormat::F32,
                 }),
                 segments: 1,
             });
