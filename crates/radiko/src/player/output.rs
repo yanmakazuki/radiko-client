@@ -173,6 +173,29 @@ fn incompatible_output(
     }
 }
 
+/// Opens only at `rate`. A device range that does not contain `rate` is an error.
+/// This does not substitute another rate from the device.
+fn select_playback_config(
+    configs: &[cpal::SupportedStreamConfigRange],
+    rate: u32,
+) -> Result<(cpal::StreamConfig, OutputSampleFormat), OutputError> {
+    if configs.is_empty() {
+        return Err(empty_output_error(rate));
+    }
+    let supported = compatible_config(configs.iter().cloned(), rate)
+        .ok_or_else(|| incompatible_output(rate, configs))?;
+    let sample_format = OutputSampleFormat::from_cpal(supported.sample_format())
+        .ok_or_else(|| incompatible_output(rate, configs))?;
+    let config = supported
+        .try_with_sample_rate(SampleRate(rate))
+        .ok_or_else(|| incompatible_output(rate, configs))?
+        .config();
+    if config.sample_rate.0 != rate {
+        return Err(incompatible_output(rate, configs));
+    }
+    Ok((config, sample_format))
+}
+
 fn incompatible_message(requested_rate: u32, offered: &[OfferedOutputFormat]) -> String {
     let mut ranges = String::new();
     if offered.is_empty() {
@@ -554,14 +577,7 @@ impl Output {
     ) -> Result<Self, OutputError> {
         let device = selected_output_device()?;
         let configs = supported_configs(&device, config_query_error(true))?;
-        if configs.is_empty() {
-            return Err(empty_output_error(rate));
-        }
-        let supported = compatible_config(configs.iter().cloned(), rate)
-            .ok_or_else(|| incompatible_output(rate, &configs))?;
-        let sample_format = OutputSampleFormat::from_cpal(supported.sample_format())
-            .ok_or_else(|| incompatible_output(rate, &configs))?;
-        let config = supported.with_sample_rate(SampleRate(rate)).config();
+        let (config, sample_format) = select_playback_config(&configs, rate)?;
         let (producer, mut renderer) = queue(rate, total, deadline);
         renderer.state.enabled.store(false, Ordering::Release);
         renderer.cancel = stop;
@@ -1012,6 +1028,53 @@ mod tests {
         let empty = incompatible_output(48_000, &[]).to_string();
         assert!(empty.contains("48000"), "{empty}");
         assert!(empty.contains("なし"), "{empty}");
+    }
+
+    #[test]
+    fn sample_rate_outside_every_device_range_errors_instead_of_opening_at_another_rate() {
+        let only_cd = [
+            range(2, 44_100, 44_100, SampleFormat::F32),
+            range(2, 44_100, 44_100, SampleFormat::I16),
+            range(1, 8_000, 44_100, SampleFormat::I32),
+        ];
+        let error = select_playback_config(&only_cd, 48_000).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("必要な形式は48000Hz"), "{text}");
+        assert!(text.contains("44100Hz"), "{text}");
+        assert!(text.contains("8000〜44100Hz"), "{text}");
+        match error {
+            OutputError::IncompatibleOutput {
+                requested_rate,
+                offered,
+            } => {
+                assert_eq!(requested_rate, 48_000);
+                assert!(offered.iter().all(|offer| {
+                    offer.max_sample_rate < requested_rate || offer.min_sample_rate > requested_rate
+                }));
+            }
+            other => panic!("expected a rate mismatch, got {other}"),
+        }
+
+        let above = [range(2, 96_000, 96_000, SampleFormat::F32)];
+        let error = select_playback_config(&above, 48_000).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("48000"), "{text}");
+        assert!(text.contains("96000"), "{text}");
+        assert!(matches!(
+            error,
+            OutputError::IncompatibleOutput {
+                requested_rate: 48_000,
+                ..
+            }
+        ));
+
+        let opened = select_playback_config(&only_cd, 44_100).unwrap();
+        assert_eq!(opened.0.sample_rate, SampleRate(44_100));
+        let wide = [range(2, 44_100, 96_000, SampleFormat::F32)];
+        let opened = select_playback_config(&wide, 48_000).unwrap();
+        assert_eq!(opened.0.sample_rate.0, 48_000);
+        assert_ne!(opened.0.sample_rate.0, 44_100);
+        assert_ne!(opened.0.sample_rate.0, 96_000);
     }
 
     #[test]

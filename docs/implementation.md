@@ -14,7 +14,7 @@
 
 PulseAudio 16.1 の `module-null-sink`（`libasound2-plugins` 経由の `default`）では、起動直後のサーバ既定が s16le・2ch・44100Hz でも、`output-info` は `default`、48000Hz / f32 / 2ch、終了 0、`ALSA lib` 0 行だった。プラグインが f32 と 48000Hz を宣言したので、このプロセスは f32 を開いた。レート変換はしていない。続けて `probe-output --mute 3` は 144,000 フレーム、48000Hz、f32、2ch、不足 0、実時間約 5.2 秒、終了 0、`ALSA lib` 0 行だった。その直後の `output-info` も終了 0 だった。ignored の `native_muted_fragmented_aac_reaches_the_explicit_output_limit` は 240,000 フレーム、不足 0、壁時計約 7.2 秒で成功した。`native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` は成功し、`gap_after=4` は不足 0、壁時計約 27.2 秒だった。`gap_after=1` の不足はテストが許す範囲で、0 とはしない。
 
-`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features` は Rust 1.99.1 で成功した。成功は 312 件、ignored は 4 件のままである。Rust 1.85.0 でも同じテストが成功した。fmt と clippy は 1.85.0 では実行していない。アカウント、radiko への通信、音声の保存、実機の再生、耳での確認はない。i16 と i32 だけの機器を開いた再生はしていない。変換と形式選択は単体テストである。macOS はこの環境では再実行していない。PipeWire のデスクトップも未確認である。
+`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features` は Rust 1.99.1 で成功した。成功は 312 件、ignored は 4 件のままである。Rust 1.85.0 でも同じテストが成功した。fmt と clippy は 1.85.0 では実行していない。アカウント、radiko への通信、音声の保存、実機の再生、耳での確認はない。i16 と i32 だけの機器を開いた再生はしていない。変換と形式選択は単体テストである。要求レートを含む範囲が一つも無いときは `select_playback_config` がエラーを返し、別のレートでは開かない。44100Hz だけの形式表に 48000Hz を渡すテストで、日本語のエラーに両方の数値が入り、44100Hz の構成は採用されないことを確認した。macOS はこの環境では再実行していない。PipeWire のデスクトップも未確認である。
 
 ## 2026年10月26日：Linux を対象に加える
 
