@@ -4,6 +4,14 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月26日：終了時に HTTP を待たず音声出力を閉じる
+
+終了時、再生サービスの drop は停止トークンを取り消すだけで制御スレッドを切り離していた。音声出力の破棄は再生関数の戻りで行われるが、そのあと準備ワーカーを join する。プロセス終了がその破棄より先だと、機器を閉じる前にスレッドが消える。
+
+再生関数が返った直後、準備ワーカーの join より前に「出力を閉じた」通知を立てる。TUI の `q`、Esc、Ctrl+C と、サービスの drop（SIGINT、SIGTERM、SIGHUP でループを抜けたあとを含む）はその通知を最大1秒待つ。1秒を超えても制御スレッドは join せず切り離し、端末復元は続ける。画面内の停止とログアウトは、従来どおり停止トークンの取り消しだけである。`player/output.rs` は変更していない。
+
+確認環境は Linux、rustc 1.99.1（58cf8f9c3、2026-10-13）。`/dev/snd` はない。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --all-targets --all-features` は 308 件成功、ignored 4 件はそのままである。追加したのは、準備が5秒ブロックしても drop が1.5秒以内に返り疑似出力の破棄フラグが真になることと、`127.0.0.1` で応答しない HTTP の途中でも同じで、その接続が2秒以内に切れることである。`shutdown_signals` も成功した。Rust 1.85 では再ビルドしていない。実機の再生、再生中の `q` のあと `output-info` が 0 になること、`q`、Esc、Ctrl+C、SIGINT、SIGTERM、SIGHUP の疑似端末での復元の再実行、radiko への通信は確認していない。
+
 ## 2026年10月26日：Linux を対象に加える
 
 対象を macOS と Linux にした。Windows などそれ以外は初期版の外のままである。出力ホストは CPAL 0.16.0 の既定で、macOS は CoreAudio、Linux は ALSA である。Linux のビルドには pkg-config と libasound の開発ファイルが要る。JACK 機能は有効にしていない。既定の保存先は `directories` 6.0.0 のままで、Linux では `$XDG_DATA_HOME/radiko-client`、未設定なら `~/.local/share/radiko-client` である。macOS の `~/Library/Application Support/jp.radiko-client.radiko-client` は変えていない。
