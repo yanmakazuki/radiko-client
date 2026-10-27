@@ -59,7 +59,7 @@ impl From<ProbeError> for CatalogError {
             ProbeError::Network => Self::Network,
             ProbeError::Cancelled => Self::Cancelled,
             ProbeError::Http(status) => Self::Http(status),
-            ProbeError::Authentication => Self::Http(401),
+            ProbeError::Authentication | ProbeError::AuthExpired => Self::Http(401),
             ProbeError::Denied => Self::Http(403),
             ProbeError::NotFound => Self::Http(404),
             ProbeError::RateLimited => Self::RateLimited,

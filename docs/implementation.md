@@ -4,6 +4,26 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
+
+対象は `a5b8786` の ignored テスト `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` である。環境は Linux x86_64、Rust 1.99.1、PulseAudio 16.1 の `module-null-sink`（シンク名 `null`、`libasound2-plugins` 経由の ALSA `default`）で、`/dev/snd` はない。ALSA の `null` PCM は使っていない。テストの判定は変えていない。
+
+`cargo +stable test --locked -p radiko --lib native_muted -- --ignored --test-threads=1 --nocapture` を 20 回続けた。`native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` は 20 回成功、0 回失敗である。各回 `gap_after=4` の不足は 0、`gap_after=1` の不足は 334,857〜339,893 フレームで、テストが 0 ではないことを求める側のままである。fragment の 5 秒は各回不足 0 で、1 回あたり約 55.5 秒だった。QA が同じ `a5b8786` で 4 回中 1 回失敗したときのメッセージと値は残っていない。この 20 回は直列で、その失敗は再現していない。実機の再生、耳での確認、radiko への通信はない。
+
+## 2026年10月27日：main の出力変更と再生中の 401 再認証を合わせる
+
+`origin/main` を merge した。main には、ALSA の診断抑制と i16/i32 出力（PR #31）、終了時に HTTP より先に出力を閉じる処理（PR #32）が入っている。コードのコンフリクトはなかった。`OutputSummary` の `sample_format`、終了時に出力を先に閉じる処理、再生中の HTTP 401 の再認証は、いずれも残している。検証文書のコンフリクトは `docs/validation.md` の自動テストの文だけで、10月26日の 308 件・312 件と、再生中 401 の 318 件は両方残した。実装状況は、同じ日の節を新しい記録が前になる順に戻した。
+
+確認は Linux、Rust 1.99.1 と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 327 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 327 件成功、失敗 0、ignored 4 件はそのままである。radiko の実トークン期限切れ、日本からの接続、実機の再生は確認していない。
+
+## 2026年10月26日：再生中の HTTP 401 で配信認証を1回やり直す
+
+再生中のプレイリスト、初期化情報、音声セグメントが HTTP 401 のとき、保存してある会員セッションで `authenticate` を1回やり直し、新しいトークンでその要求を1回取り直す。セグメントと初期化情報は、取り直す前にプレイリストも取り直し、通し番号は成功したバイト列のあとだけ進める。再認証が失敗したときと、取り直しも 401 のときは「認証期限切れ」で停止する。成功した再認証から20秒は、次の 401 で `authenticate` を呼ばず、持っているトークンで1回だけ取り直す。403 と 429 は再認証しない。HTTP 層の再試行対象は変えていない。
+
+TUI は、再認証が完了したとき認証行と再生通知に更新を出し、「認証期限切れ」で止まったとき認証行に「再生側で認証失敗 / a 再確認」を足す。通信診断に残すのは回数だけで、トークンは出さない。
+
+確認は Linux、Rust 1.99.1 である。`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features` は 318 件成功した。ignored 4 件（ローカル待受の HTTP 2 件と、ミュート実機出力 2 件）はそのままである。モックの Fetch で、プレイリスト・セグメント・初期化情報の 401 のあと1回の再認証で継続すること、2回目の 401 と再認証失敗が通し番号を進めずに「認証期限切れ」になること、429・403・503 が再認証しないこと、再認証中の取り消しが次の取得へ進まないこと、20秒以内は再認証しないことを確認した。表示とエラー文字列にトークンは出ていない。Rust 1.85 では再ビルドしていない。radiko の実トークン期限切れ、日本からの接続、90分以上のライブでの復旧は確認していない。アカウントも実通信も使っていない。
+
 ## 2026年10月26日：ALSA の診断を抑え、同じレートの i16 と i32 を開く
 
 対象は Linux の CPAL 0.16.0 / ALSA である。端末へ出ていた `ALSA lib ...` は、CPAL を呼ぶ前に `snd_lib_error_set_handler` で黙らせる。ハンドラは printf 引数を読まない。失敗の戻り値は日本語のエラーのままである。`RADIKO_ALSA_LOG=1` のときはハンドラを差し替えず、ALSA の既定の stderr を残す。機器の対応構成が取れないとき、Linux では「既定の音声出力機器がありません」にする。
@@ -15,6 +35,14 @@
 PulseAudio 16.1 の `module-null-sink`（`libasound2-plugins` 経由の `default`）では、起動直後のサーバ既定が s16le・2ch・44100Hz でも、`output-info` は `default`、48000Hz / f32 / 2ch、終了 0、`ALSA lib` 0 行だった。プラグインが f32 と 48000Hz を宣言したので、このプロセスは f32 を開いた。レート変換はしていない。続けて `probe-output --mute 3` は 144,000 フレーム、48000Hz、f32、2ch、不足 0、実時間約 5.2 秒、終了 0、`ALSA lib` 0 行だった。その直後の `output-info` も終了 0 だった。ignored の `native_muted_fragmented_aac_reaches_the_explicit_output_limit` は 240,000 フレーム、不足 0、壁時計約 7.2 秒で成功した。`native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` は成功し、`gap_after=4` は不足 0、壁時計約 27.2 秒だった。`gap_after=1` の不足はテストが許す範囲で、0 とはしない。
 
 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features` は Rust 1.99.1 で成功した。成功は 313 件、ignored は 4 件のままである。要求レートを含む範囲が一つも無いときは `select_playback_config` がエラーを返し、別のレートでは開かない。44100Hz だけの形式表に 48000Hz を渡すテストで、日本語のエラーに両方の数値が入り、44100Hz の構成は採用されないことを確認した。96000Hz だけの形式表でも 48000Hz は失敗し、範囲に 48000Hz が含まれるときはちょうど 48000Hz で開く。この追記の前の 312 件は Rust 1.85.0 でも成功している。fmt と clippy は 1.85.0 では実行していない。アカウント、radiko への通信、音声の保存、実機の再生、耳での確認はない。i16 と i32 だけの機器を開いた再生はしていない。変換と形式選択は単体テストである。macOS はこの環境では再実行していない。PipeWire のデスクトップも未確認である。
+
+## 2026年10月26日：終了時に HTTP を待たず音声出力を閉じる
+
+終了時、再生サービスの drop は停止トークンを取り消すだけで制御スレッドを切り離していた。音声出力の破棄は再生関数の戻りで行われるが、そのあと準備ワーカーを join する。プロセス終了がその破棄より先だと、機器を閉じる前にスレッドが消える。
+
+再生関数が返った直後、準備ワーカーの join より前に「出力を閉じた」通知を立てる。TUI の `q`、Esc、Ctrl+C と、サービスの drop（SIGINT、SIGTERM、SIGHUP でループを抜けたあとを含む）はその通知を最大1秒待つ。1秒を超えても制御スレッドは join せず切り離し、端末復元は続ける。画面内の停止とログアウトは、従来どおり停止トークンの取り消しだけである。`player/output.rs` は変更していない。
+
+確認環境は Linux、rustc 1.99.1（58cf8f9c3、2026-10-13）。`/dev/snd` はない。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --all-targets --all-features` は 308 件成功、ignored 4 件はそのままである。追加したのは、準備が5秒ブロックしても drop が1.5秒以内に返り疑似出力の破棄フラグが真になることと、`127.0.0.1` で応答しない HTTP の途中でも同じで、その接続が2秒以内に切れることである。`shutdown_signals` も成功した。Rust 1.85 では再ビルドしていない。実機の再生、再生中の `q` のあと `output-info` が 0 になること、`q`、Esc、Ctrl+C、SIGINT、SIGTERM、SIGHUP の疑似端末での復元の再実行、radiko への通信は確認していない。
 
 ## 2026年10月26日：Linux を対象に加える
 

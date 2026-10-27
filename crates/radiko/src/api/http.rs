@@ -31,6 +31,8 @@ pub(crate) trait Fetch {
         range: Option<(u64, u64)>,
         redirects: bool,
     ) -> Result<Reply, ProbeError>;
+    /// Counts a completed stream-token renewal. The default keeps non-playback clients unchanged.
+    fn note_reauthentication(&self) {}
 }
 pub(crate) struct Reply {
     pub headers: HeaderMap,
@@ -315,7 +317,36 @@ impl Drop for FinishRequest<'_> {
         }
     }
 }
+/// One plain HTTP GET for shutdown tests. Production clients stay HTTPS-only.
+#[cfg(test)]
+pub(crate) fn loopback_get(
+    url: &str,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<(), ProbeError> {
+    let mut http = Http::new()?;
+    http.set_cancellation(cancelled);
+    http.client = Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| ProbeError::Network)?;
+    let url = Url::parse(url).map_err(|_| ProbeError::UnsafeUrl)?;
+    let result = http.get_once(&url, &HeaderMap::new(), 64, None, false);
+    drop(http);
+    // The shared current-thread runtime must be polled again or the dropped
+    // connection stays open in the reactor.
+    executor::runtime()?.block_on(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    result.map(|_| ())
+}
 impl Fetch for Http {
+    fn note_reauthentication(&self) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_reauthentication();
+        }
+    }
     fn get(
         &self,
         mut url: Url,

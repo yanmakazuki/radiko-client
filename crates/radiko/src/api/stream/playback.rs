@@ -1,5 +1,6 @@
 //! 状態を保持するHLS取得。URL・ヘッダー・音声データはDebug出力の対象にしない。
 use super::*;
+use crate::api::http::Reply;
 pub use crate::api::http::{RequestMeasurements, RequestSnapshot, RequestStage};
 use std::time::{Duration as Wait, Instant};
 
@@ -151,7 +152,8 @@ pub fn prepare_at_controlled(
                         return Err(ProbeError::InvalidPlaylist.at("シーク先に対応しない配信です"));
                     }
                 }
-                let hls = HlsStream::new(http, url, request.auth.headers, media, codec)?;
+                let mut hls = HlsStream::new(http, url, request.auth.headers, media, codec)?;
+                hls.refresh = Some(playback_refresh(session.token().to_owned()));
                 return Ok(PreparedStream {
                     info: StreamInfo {
                         title: request.program.title,
@@ -267,6 +269,24 @@ fn validate_media(media: &m3u8_rs::MediaPlaylist) -> Result<(), ProbeError> {
     Ok(())
 }
 
+const REAUTH_INTERVAL: Wait = Wait::from_secs(20);
+
+type RefreshFn<F> = Box<dyn FnMut(&F) -> Result<HeaderMap, ProbeError> + Send>;
+
+fn playback_refresh<F: Fetch + 'static>(token: String) -> RefreshFn<F> {
+    Box::new(move |http| {
+        let session = MemberSession::new(token.clone()).map_err(|_| ProbeError::AuthExpired)?;
+        match authenticate(http, &session) {
+            Ok(auth) => Ok(auth.headers),
+            Err(ProbeError::Cancelled) => Err(ProbeError::Cancelled),
+            Err(ProbeError::RateLimited) => Err(ProbeError::RateLimited),
+            Err(ProbeError::Network) => Err(ProbeError::Network),
+            Err(ProbeError::Denied) => Err(ProbeError::Denied),
+            Err(_) => Err(ProbeError::AuthExpired),
+        }
+    })
+}
+
 struct HlsStream<F> {
     http: F,
     url: Url,
@@ -277,6 +297,15 @@ struct HlsStream<F> {
     discontinuity: Option<u64>,
     reload_at: Instant,
     initialization: Option<(Url, std::sync::Arc<[u8]>)>,
+    refresh: Option<RefreshFn<F>>,
+    /// One renewal is enough for the current failure. Cleared after a successful poll.
+    auth_episode: bool,
+    last_reauth: Option<Instant>,
+}
+enum Renew {
+    Unavailable,
+    Refreshed,
+    Reused,
 }
 impl<F: Fetch> HlsStream<F> {
     fn new(
@@ -298,80 +327,24 @@ impl<F: Fetch> HlsStream<F> {
             reload_at: Instant::now(),
             media,
             initialization: None,
+            refresh: None,
+            auth_episode: false,
+            last_reauth: None,
         })
     }
     fn poll(&mut self, now: Instant) -> Result<Next, ProbeError> {
+        let result = self.poll_at(now);
+        if result.is_ok() {
+            self.auth_episode = false;
+        }
+        result
+    }
+    fn poll_at(&mut self, now: Instant) -> Result<Next, ProbeError> {
         if self.next < self.media.media_sequence {
             return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
         }
-        let index = usize::try_from(self.next - self.media.media_sequence)
-            .map_err(|_| ProbeError::InvalidPlaylist)?;
-        if let Some(segment) = self.media.segments.get(index) {
-            let initialization = if let Some(map) = self.media.segments[..=index]
-                .iter()
-                .rev()
-                .find_map(|item| item.map.as_ref())
-            {
-                let url = self.url.join(&map.uri).map_err(|_| ProbeError::UnsafeUrl)?;
-                if self
-                    .initialization
-                    .as_ref()
-                    .is_none_or(|(current, _)| current != &url)
-                {
-                    let reply = self
-                        .http
-                        .get(url.clone(), HeaderMap::new(), TEXT_LIMIT, None, true)
-                        .map_err(|error| error.at("HLS初期化情報取得"))?;
-                    if reply.bytes.is_empty() {
-                        return Err(ProbeError::InvalidPlaylist);
-                    }
-                    self.initialization = Some((url, reply.bytes.into()));
-                }
-                self.initialization.as_ref().map(|(_, bytes)| bytes.clone())
-            } else {
-                self.initialization = None;
-                None
-            };
-            let discontinuity = self.media.segments[..=index]
-                .iter()
-                .filter(|s| s.discontinuity)
-                .count() as u64;
-            let sequence = self
-                .media
-                .discontinuity_sequence
-                .checked_add(discontinuity)
-                .ok_or(ProbeError::InvalidPlaylist)?;
-            let target = self
-                .url
-                .join(&segment.uri)
-                .map_err(|_| ProbeError::UnsafeUrl)?;
-            let bytes = self
-                .http
-                .get(target, HeaderMap::new(), SAMPLE_LIMIT, None, true)
-                .map_err(|error| error.at("HLS音声取得"))?
-                .bytes;
-            if bytes.is_empty() {
-                return Err(ProbeError::InvalidPlaylist);
-            }
-            let reset = self
-                .discontinuity
-                .is_some_and(|previous| previous != sequence);
-            self.discontinuity = Some(sequence);
-            self.next = self
-                .next
-                .checked_add(1)
-                .ok_or(ProbeError::InvalidPlaylist)?;
-            return Ok(Next::Segment(Segment {
-                bytes,
-                initialization,
-                duration: Some(
-                    Wait::try_from_secs_f64(f64::from(segment.duration))
-                        .map_err(|_| ProbeError::InvalidPlaylist)?,
-                ),
-                codec: self.codec.clone(),
-                discontinuity: reset,
-                starts_at: segment_time(&self.media, index),
-            }));
+        if self.current_index()?.is_some() {
+            return self.read_segment(now);
         }
         if self.media.end_list {
             return Ok(Next::End);
@@ -379,16 +352,278 @@ impl<F: Fetch> HlsStream<F> {
         if now < self.reload_at {
             return Ok(Next::Pending(self.reload_at.duration_since(now)));
         }
-        let reply = self
+        let reply = self.fetch_playlist()?;
+        let wait = self.install_playlist(reply, now)?;
+        if self.next < self.media.media_sequence + self.media.segments.len() as u64 {
+            return self.poll(now);
+        }
+        if self.media.end_list {
+            Ok(Next::End)
+        } else {
+            Ok(Next::Pending(wait))
+        }
+    }
+    fn current_index(&self) -> Result<Option<usize>, ProbeError> {
+        if self.next < self.media.media_sequence {
+            return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
+        }
+        let index = usize::try_from(self.next - self.media.media_sequence)
+            .map_err(|_| ProbeError::InvalidPlaylist)?;
+        Ok((index < self.media.segments.len()).then_some(index))
+    }
+    fn read_segment(&mut self, now: Instant) -> Result<Next, ProbeError> {
+        let Some(index) = self.current_index()? else {
+            return Err(ProbeError::InvalidPlaylist);
+        };
+        // Resolve initialization before the media bytes so a plain fetch keeps its old order.
+        let _ = self.initialization_for(index, now)?;
+        let (bytes, index) = self.fetch_segment_bytes(now)?;
+        if bytes.is_empty() {
+            return Err(ProbeError::InvalidPlaylist);
+        }
+        let initialization = self.initialization_for(index, now)?;
+        let duration = self
+            .media
+            .segments
+            .get(index)
+            .ok_or(ProbeError::InvalidPlaylist)?
+            .duration;
+        let discontinuity = self.media.segments[..=index]
+            .iter()
+            .filter(|item| item.discontinuity)
+            .count() as u64;
+        let sequence = self
+            .media
+            .discontinuity_sequence
+            .checked_add(discontinuity)
+            .ok_or(ProbeError::InvalidPlaylist)?;
+        let starts_at = segment_time(&self.media, index);
+        let reset = self
+            .discontinuity
+            .is_some_and(|previous| previous != sequence);
+        let codec = self.codec.clone();
+        self.discontinuity = Some(sequence);
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(ProbeError::InvalidPlaylist)?;
+        Ok(Next::Segment(Segment {
+            bytes,
+            initialization,
+            duration: Some(
+                Wait::try_from_secs_f64(f64::from(duration))
+                    .map_err(|_| ProbeError::InvalidPlaylist)?,
+            ),
+            codec,
+            discontinuity: reset,
+            starts_at,
+        }))
+    }
+    fn initialization_for(
+        &mut self,
+        index: usize,
+        now: Instant,
+    ) -> Result<Option<std::sync::Arc<[u8]>>, ProbeError> {
+        let Some(url) = self.init_url(index)? else {
+            self.initialization = None;
+            return Ok(None);
+        };
+        if self
+            .initialization
+            .as_ref()
+            .is_some_and(|(current, _)| current == &url)
+        {
+            return Ok(self.initialization.as_ref().map(|(_, bytes)| bytes.clone()));
+        }
+        let Some((bytes, fetched)) = self.fetch_init_bytes(url, now)? else {
+            self.initialization = None;
+            return Ok(None);
+        };
+        if bytes.is_empty() {
+            return Err(ProbeError::InvalidPlaylist);
+        }
+        let shared: std::sync::Arc<[u8]> = bytes.into();
+        self.initialization = Some((fetched, shared.clone()));
+        Ok(Some(shared))
+    }
+    fn init_url(&self, index: usize) -> Result<Option<Url>, ProbeError> {
+        let Some(map) = self
+            .media
+            .segments
+            .get(..=index)
+            .ok_or(ProbeError::InvalidPlaylist)?
+            .iter()
+            .rev()
+            .find_map(|item| item.map.as_ref())
+        else {
+            return Ok(None);
+        };
+        self.url
+            .join(&map.uri)
+            .map(Some)
+            .map_err(|_| ProbeError::UnsafeUrl)
+    }
+    fn fetch_init_bytes(
+        &mut self,
+        url: Url,
+        now: Instant,
+    ) -> Result<Option<(Vec<u8>, Url)>, ProbeError> {
+        const STAGE: &str = "HLS初期化情報取得";
+        match self
             .http
-            .get(
-                self.url.clone(),
-                self.headers.clone(),
-                TEXT_LIMIT,
-                None,
-                true,
+            .get(url.clone(), HeaderMap::new(), TEXT_LIMIT, None, true)
+        {
+            Ok(reply) => Ok(Some((reply.bytes, url))),
+            Err(ProbeError::Authentication) => {
+                self.recover_media(STAGE, now)?;
+                let Some(index) = self.current_index()? else {
+                    return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                };
+                let Some(url) = self.init_url(index)? else {
+                    return Ok(None);
+                };
+                match self
+                    .http
+                    .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
+                {
+                    Ok(reply) => Ok(Some((reply.bytes, url))),
+                    Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
+                    Err(error) => Err(error.at(STAGE)),
+                }
+            }
+            Err(error) => Err(error.at(STAGE)),
+        }
+    }
+    fn fetch_segment_bytes(&mut self, now: Instant) -> Result<(Vec<u8>, usize), ProbeError> {
+        const STAGE: &str = "HLS音声取得";
+        let Some(index) = self.current_index()? else {
+            return Err(ProbeError::InvalidPlaylist);
+        };
+        let url = self.segment_url(index)?;
+        match self
+            .http
+            .get(url, HeaderMap::new(), SAMPLE_LIMIT, None, true)
+        {
+            Ok(reply) => Ok((reply.bytes, index)),
+            Err(ProbeError::Authentication) => {
+                self.recover_media(STAGE, now)?;
+                let Some(index) = self.current_index()? else {
+                    return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                };
+                let url = self.segment_url(index)?;
+                match self
+                    .http
+                    .get(url, self.headers.clone(), SAMPLE_LIMIT, None, true)
+                {
+                    Ok(reply) => Ok((reply.bytes, index)),
+                    Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
+                    Err(error) => Err(error.at(STAGE)),
+                }
+            }
+            Err(error) => Err(error.at(STAGE)),
+        }
+    }
+    fn segment_url(&self, index: usize) -> Result<Url, ProbeError> {
+        self.url
+            .join(
+                &self
+                    .media
+                    .segments
+                    .get(index)
+                    .ok_or(ProbeError::InvalidPlaylist)?
+                    .uri,
             )
-            .map_err(|error| error.at("HLS一覧更新"))?;
+            .map_err(|_| ProbeError::UnsafeUrl)
+    }
+    /// HTTP 401 only. 403, 429, and every other status keep the caller's existing error.
+    fn renew(&mut self, stage: &'static str) -> Result<Renew, ProbeError> {
+        if self.refresh.is_none() {
+            return Ok(Renew::Unavailable);
+        }
+        let recent = self
+            .last_reauth
+            .is_some_and(|at| at.elapsed() < REAUTH_INTERVAL);
+        if self.auth_episode || recent {
+            return if self.headers.get("x-radiko-authtoken").is_some() {
+                Ok(Renew::Reused)
+            } else {
+                Err(ProbeError::AuthExpired.at(stage))
+            };
+        }
+        self.reauthenticate(stage)?;
+        Ok(Renew::Refreshed)
+    }
+    fn reauthenticate(&mut self, stage: &'static str) -> Result<(), ProbeError> {
+        let Some(refresh) = self.refresh.as_mut() else {
+            return Err(ProbeError::Authentication.at(stage));
+        };
+        self.auth_episode = true;
+        self.last_reauth = Some(Instant::now());
+        match refresh(&self.http) {
+            Ok(headers) => {
+                if headers.get("x-radiko-authtoken").is_none() {
+                    return Err(ProbeError::AuthExpired.at(stage));
+                }
+                self.headers = headers;
+                self.http.note_reauthentication();
+                Ok(())
+            }
+            Err(ProbeError::Cancelled) => Err(ProbeError::Cancelled.at(stage)),
+            Err(ProbeError::RateLimited) => Err(ProbeError::RateLimited.at(stage)),
+            Err(ProbeError::Network) => Err(ProbeError::Network.at(stage)),
+            Err(ProbeError::Denied) => Err(ProbeError::Denied.at(stage)),
+            Err(_) => Err(ProbeError::AuthExpired.at(stage)),
+        }
+    }
+    fn recover_media(&mut self, stage: &'static str, now: Instant) -> Result<(), ProbeError> {
+        match self.renew(stage)? {
+            Renew::Unavailable => return Err(ProbeError::Authentication.at(stage)),
+            Renew::Refreshed | Renew::Reused => {}
+        }
+        let reply = match self.http.get(
+            self.url.clone(),
+            self.headers.clone(),
+            TEXT_LIMIT,
+            None,
+            true,
+        ) {
+            Ok(reply) => reply,
+            Err(ProbeError::Authentication) => return Err(ProbeError::AuthExpired.at(stage)),
+            Err(error) => return Err(error.at(stage)),
+        };
+        self.install_playlist(reply, now)
+            .map(|_| ())
+            .map_err(|error| match error {
+                ProbeError::At(_, _) => error,
+                other => other.at(stage),
+            })
+    }
+    fn fetch_playlist(&mut self) -> Result<Reply, ProbeError> {
+        const STAGE: &str = "HLS一覧更新";
+        let url = self.url.clone();
+        match self
+            .http
+            .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
+        {
+            Ok(reply) => Ok(reply),
+            Err(ProbeError::Authentication) => match self.renew(STAGE)? {
+                Renew::Unavailable => Err(ProbeError::Authentication.at(STAGE)),
+                Renew::Refreshed | Renew::Reused => {
+                    match self
+                        .http
+                        .get(url, self.headers.clone(), TEXT_LIMIT, None, true)
+                    {
+                        Ok(reply) => Ok(reply),
+                        Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
+                        Err(error) => Err(error.at(STAGE)),
+                    }
+                }
+            },
+            Err(error) => Err(error.at(STAGE)),
+        }
+    }
+    // Sequence numbers, not changing signed URLs, decide which segment is new.
+    fn install_playlist(&mut self, reply: Reply, now: Instant) -> Result<Wait, ProbeError> {
         let Playlist::MediaPlaylist(media) = parse_hls(&reply.bytes)? else {
             return Err(ProbeError::InvalidPlaylist);
         };
@@ -396,7 +631,6 @@ impl<F: Fetch> HlsStream<F> {
         if media.media_sequence < self.media.media_sequence {
             return Err(ProbeError::InvalidPlaylist);
         }
-        // Sequence numbers, not changing signed URLs, decide which segment is new.
         let changed = media.media_sequence != self.media.media_sequence
             || media.segments.len() != self.media.segments.len();
         let wait = Wait::from_secs(media.target_duration).div_f64(if changed { 1.0 } else { 2.0 });
@@ -406,14 +640,7 @@ impl<F: Fetch> HlsStream<F> {
         if self.next < self.media.media_sequence {
             return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
         }
-        if self.next < self.media.media_sequence + self.media.segments.len() as u64 {
-            return self.poll(now);
-        }
-        if self.media.end_list {
-            Ok(Next::End)
-        } else {
-            Ok(Next::Pending(wait))
-        }
+        Ok(wait)
     }
 }
 
@@ -707,5 +934,529 @@ mod tests {
                 &format!("#EXT-X-MEDIA-SEQUENCE:{}", u64::MAX),
             );
         assert!(validate_media(&parsed(overflow.as_bytes())).is_err());
+    }
+
+    use std::cell::Cell;
+    struct Step {
+        path: &'static str,
+        query: Option<&'static str>,
+        token: Option<&'static str>,
+        result: Result<Vec<u8>, ProbeError>,
+    }
+    struct Scripted {
+        steps: RefCell<VecDeque<Step>>,
+        auth_calls: Cell<usize>,
+        notes: Cell<usize>,
+        cancel_auth: Cell<bool>,
+        fail_auth: Cell<bool>,
+    }
+    impl Fetch for Scripted {
+        fn note_reauthentication(&self) {
+            self.notes.set(self.notes.get() + 1);
+        }
+        fn get(
+            &self,
+            url: Url,
+            headers: HeaderMap,
+            limit: usize,
+            range: Option<(u64, u64)>,
+            redirects: bool,
+        ) -> Result<Reply, ProbeError> {
+            let path = url.path();
+            if path.ends_with("/auth1") || path.ends_with("/auth2") {
+                assert!(!redirects);
+                assert!(range.is_none());
+            } else {
+                assert!(redirects);
+                assert!(range.is_none());
+            }
+            let token = headers
+                .get("x-radiko-authtoken")
+                .map(|value| value.to_str().unwrap().to_owned());
+            if let Some(value) = headers.get("x-radiko-authtoken") {
+                assert!(value.is_sensitive());
+            }
+            if path.ends_with("/auth1") {
+                self.auth_calls.set(self.auth_calls.get() + 1);
+                assert_eq!(
+                    headers.get("cookie").and_then(|value| value.to_str().ok()),
+                    Some("radiko_session=synthetic-member")
+                );
+                if self.cancel_auth.get() {
+                    return Err(ProbeError::Cancelled);
+                }
+                if self.fail_auth.get() {
+                    return Err(ProbeError::Authentication);
+                }
+                let mut reply_headers = HeaderMap::new();
+                let mut renewed = HeaderValue::from_static("synthetic-renewed-token");
+                renewed.set_sensitive(true);
+                reply_headers.insert("x-radiko-authtoken", renewed);
+                reply_headers.insert("x-radiko-keyoffset", HeaderValue::from_static("1"));
+                reply_headers.insert("x-radiko-keylength", HeaderValue::from_static("4"));
+                return Ok(Reply {
+                    headers: reply_headers,
+                    bytes: b"OK".to_vec(),
+                    url,
+                });
+            }
+            if path.ends_with("/auth2") {
+                assert_eq!(token.as_deref(), Some("synthetic-renewed-token"));
+                assert!(headers.get("x-radiko-partialkey").is_some());
+                return Ok(Reply {
+                    headers: HeaderMap::new(),
+                    bytes: b"JP13,Tokyo\n".to_vec(),
+                    url,
+                });
+            }
+            let step = self
+                .steps
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected request");
+            assert_eq!(path, step.path);
+            assert_eq!(url.query(), step.query);
+            assert_eq!(token.as_deref(), step.token);
+            assert_eq!(
+                limit,
+                if path.ends_with(".aac") {
+                    SAMPLE_LIMIT
+                } else {
+                    TEXT_LIMIT
+                }
+            );
+            step.result.map(|bytes| Reply {
+                headers: HeaderMap::new(),
+                bytes,
+                url,
+            })
+        }
+    }
+    fn step(
+        path: &'static str,
+        query: Option<&'static str>,
+        token: Option<&'static str>,
+        result: Result<Vec<u8>, ProbeError>,
+    ) -> Step {
+        Step {
+            path,
+            query,
+            token,
+            result,
+        }
+    }
+    fn stamped(first: u64, signature: &str, origin: &str) -> Vec<u8> {
+        format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:{first}\n#EXT-X-PROGRAM-DATE-TIME:{origin}\n#EXTINF:5,\ns{first}.aac?signature={signature}\n"
+        )
+        .into_bytes()
+    }
+    fn authed(initial: &[u8], steps: Vec<Step>) -> HlsStream<Scripted> {
+        let mut headers = HeaderMap::new();
+        let mut expired = HeaderValue::from_static("synthetic-expired-token");
+        expired.set_sensitive(true);
+        headers.insert("x-radiko-authtoken", expired);
+        let mut source = HlsStream::new(
+            Scripted {
+                steps: RefCell::new(steps.into()),
+                auth_calls: Cell::new(0),
+                notes: Cell::new(0),
+                cancel_auth: Cell::new(false),
+                fail_auth: Cell::new(false),
+            },
+            Url::parse("https://radiko.jp/audio/media.m3u8").unwrap(),
+            headers,
+            parsed(initial),
+            Some("mp4a.40.2".into()),
+        )
+        .unwrap();
+        source.refresh = Some(playback_refresh("synthetic-member".into()));
+        source
+    }
+    fn assert_secret_free(error: &ProbeError) {
+        let text = format!("{error} {error:?}");
+        for secret in [
+            "synthetic-renewed-token",
+            "synthetic-expired-token",
+            "synthetic-member",
+            "signature=",
+        ] {
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+    #[test]
+    fn playlist_401_reauthenticates_once_and_keeps_media_time_monotonic() {
+        let mut source = authed(
+            &stamped(10, "old", "2026-10-15T12:00:00+09:00"),
+            vec![
+                step("/audio/s10.aac", Some("signature=old"), None, Ok(vec![10])),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-expired-token"),
+                    Err(ProbeError::Authentication),
+                ),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Ok(stamped(11, "new", "2026-10-15T12:00:05+09:00")),
+                ),
+                step("/audio/s11.aac", Some("signature=new"), None, Ok(vec![11])),
+            ],
+        );
+        let Next::Segment(first) = source.poll(Instant::now()).unwrap() else {
+            panic!("first segment");
+        };
+        let Next::Segment(second) = source.poll(Instant::now()).unwrap() else {
+            panic!("segment after re-auth");
+        };
+        assert_eq!(first.bytes, vec![10]);
+        assert_eq!(second.bytes, vec![11]);
+        assert!(second.starts_at > first.starts_at);
+        assert_eq!(
+            second.starts_at.unwrap() - first.starts_at.unwrap(),
+            Duration::seconds(5)
+        );
+        assert!(!second.discontinuity);
+        assert_eq!(second.duration, Some(Wait::from_secs(5)));
+        assert_eq!(source.next, 12);
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 1);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn segment_401_refreshes_the_signed_url_once_and_does_not_advance_twice() {
+        let mut source = authed(
+            &media(0, 1, false, "old", false),
+            vec![
+                step(
+                    "/audio/s0.aac",
+                    Some("signature=old"),
+                    None,
+                    Err(ProbeError::Authentication),
+                ),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Ok(media(0, 1, true, "new", false)),
+                ),
+                step(
+                    "/audio/s0.aac",
+                    Some("signature=new"),
+                    Some("synthetic-renewed-token"),
+                    Ok(vec![7]),
+                ),
+            ],
+        );
+        let Next::Segment(segment) = source.poll(Instant::now()).unwrap() else {
+            panic!("recovered segment");
+        };
+        assert_eq!(segment.bytes, vec![7]);
+        assert!(!segment.discontinuity);
+        assert_eq!(source.next, 1);
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 1);
+        assert!(matches!(source.poll(Instant::now()).unwrap(), Next::End));
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn a_second_401_after_reauthentication_stops_without_another_auth_or_sequence_advance() {
+        for playlist in [false, true] {
+            let initial = media(0, 1, false, "old", false);
+            let steps = if playlist {
+                vec![
+                    step(
+                        "/audio/media.m3u8",
+                        None,
+                        Some("synthetic-expired-token"),
+                        Err(ProbeError::Authentication),
+                    ),
+                    step(
+                        "/audio/media.m3u8",
+                        None,
+                        Some("synthetic-renewed-token"),
+                        Err(ProbeError::Authentication),
+                    ),
+                ]
+            } else {
+                vec![
+                    step(
+                        "/audio/s0.aac",
+                        Some("signature=old"),
+                        None,
+                        Err(ProbeError::Authentication),
+                    ),
+                    step(
+                        "/audio/media.m3u8",
+                        None,
+                        Some("synthetic-renewed-token"),
+                        Ok(media(0, 1, false, "new", false)),
+                    ),
+                    step(
+                        "/audio/s0.aac",
+                        Some("signature=new"),
+                        Some("synthetic-renewed-token"),
+                        Err(ProbeError::Authentication),
+                    ),
+                ]
+            };
+            let mut source = authed(&initial, steps);
+            if playlist {
+                source.next = 1;
+            }
+            let Err(ProbeError::At(stage, error)) = source.poll(Instant::now()) else {
+                panic!("persistent 401 must stop");
+            };
+            assert_eq!(
+                stage,
+                if playlist {
+                    "HLS一覧更新"
+                } else {
+                    "HLS音声取得"
+                }
+            );
+            assert!(matches!(error.as_ref(), ProbeError::AuthExpired));
+            assert!(error.to_string().contains("認証期限切れ"));
+            assert_secret_free(&ProbeError::At(stage, error));
+            assert_eq!(source.next, u64::from(playlist));
+            assert_eq!(source.http.auth_calls.get(), 1);
+            assert_eq!(source.http.notes.get(), 1);
+            assert!(source.http.steps.borrow().is_empty());
+        }
+    }
+    #[test]
+    fn rate_limit_and_forbidden_do_not_reauthenticate() {
+        for (error, stage, playlist) in [
+            (ProbeError::RateLimited, "HLS音声取得", false),
+            (ProbeError::RateLimited, "HLS一覧更新", true),
+            (ProbeError::Denied, "HLS一覧更新", true),
+            (ProbeError::Http(503), "HLS音声取得", false),
+        ] {
+            let expected = error.to_string();
+            let mut source = authed(
+                &media(0, 1, false, "old", false),
+                vec![step(
+                    if playlist {
+                        "/audio/media.m3u8"
+                    } else {
+                        "/audio/s0.aac"
+                    },
+                    if playlist {
+                        None
+                    } else {
+                        Some("signature=old")
+                    },
+                    if playlist {
+                        Some("synthetic-expired-token")
+                    } else {
+                        None
+                    },
+                    Err(error),
+                )],
+            );
+            if playlist {
+                source.next = 1;
+            }
+            let Err(ProbeError::At(found, inner)) = source.poll(Instant::now()) else {
+                panic!("non-401 must keep the original failure");
+            };
+            assert_eq!(found, stage);
+            assert_eq!(inner.to_string(), expected);
+            assert_eq!(source.http.auth_calls.get(), 0);
+            assert_eq!(source.http.notes.get(), 0);
+            assert_eq!(source.next, u64::from(playlist));
+            assert_secret_free(&ProbeError::At(found, inner));
+        }
+    }
+    #[test]
+    fn failed_reauthentication_stops_once_with_auth_expired() {
+        let mut source = authed(
+            &media(0, 1, false, "old", false),
+            vec![step(
+                "/audio/media.m3u8",
+                None,
+                Some("synthetic-expired-token"),
+                Err(ProbeError::Authentication),
+            )],
+        );
+        source.next = 1;
+        source.http.fail_auth.set(true);
+        let Err(ProbeError::At(stage, error)) = source.poll(Instant::now()) else {
+            panic!("a failed renewal must stop");
+        };
+        assert_eq!(stage, "HLS一覧更新");
+        assert!(matches!(error.as_ref(), ProbeError::AuthExpired));
+        assert!(error.to_string().contains("認証期限切れ"));
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 0);
+        assert_eq!(source.next, 1);
+        assert!(source.http.steps.borrow().is_empty());
+        assert_secret_free(&ProbeError::At(stage, error));
+    }
+    #[test]
+    fn cancellation_during_reauthentication_is_not_retried() {
+        let mut source = authed(
+            &media(0, 1, false, "old", false),
+            vec![step(
+                "/audio/media.m3u8",
+                None,
+                Some("synthetic-expired-token"),
+                Err(ProbeError::Authentication),
+            )],
+        );
+        source.next = 1;
+        source.http.cancel_auth.set(true);
+        let Err(ProbeError::At(stage, error)) = source.poll(Instant::now()) else {
+            panic!("cancelled renewal must stop");
+        };
+        assert_eq!(stage, "HLS一覧更新");
+        assert!(matches!(error.as_ref(), ProbeError::Cancelled));
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 0);
+        assert_eq!(source.next, 1);
+        assert!(source.http.steps.borrow().is_empty());
+        assert_secret_free(&ProbeError::At(stage, error));
+    }
+    #[test]
+    fn a_second_401_inside_the_reauth_interval_does_not_authenticate_again() {
+        let mut source = authed(
+            &stamped(10, "old", "2026-10-15T12:00:00+09:00"),
+            vec![
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-expired-token"),
+                    Err(ProbeError::Authentication),
+                ),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Ok(stamped(11, "new", "2026-10-15T12:00:05+09:00")),
+                ),
+                step("/audio/s11.aac", Some("signature=new"), None, Ok(vec![11])),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Err(ProbeError::Authentication),
+                ),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Err(ProbeError::Authentication),
+                ),
+            ],
+        );
+        source.next = 11;
+        let Next::Segment(segment) = source.poll(Instant::now()).unwrap() else {
+            panic!("first recovery should continue");
+        };
+        assert_eq!(segment.bytes, vec![11]);
+        assert_eq!(source.next, 12);
+        let Err(ProbeError::At(_, error)) = source.poll(source.reload_at) else {
+            panic!("a 401 inside the interval must stop");
+        };
+        assert!(matches!(error.as_ref(), ProbeError::AuthExpired));
+        assert_eq!(source.next, 12);
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 1);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn reauthentication_is_allowed_again_after_the_interval() {
+        let mut source = authed(
+            &media(0, 1, false, "old", false),
+            vec![
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-expired-token"),
+                    Err(ProbeError::Authentication),
+                ),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Ok(media(1, 1, false, "new", false)),
+                ),
+                step("/audio/s1.aac", Some("signature=new"), None, Ok(vec![1])),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Err(ProbeError::Authentication),
+                ),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Ok(media(2, 1, true, "later", false)),
+                ),
+                step("/audio/s2.aac", Some("signature=later"), None, Ok(vec![2])),
+            ],
+        );
+        source.next = 1;
+        assert!(matches!(
+            source.poll(Instant::now()).unwrap(),
+            Next::Segment(_)
+        ));
+        source.last_reauth = Some(
+            Instant::now()
+                .checked_sub(REAUTH_INTERVAL + Wait::from_secs(1))
+                .expect("test clock"),
+        );
+        let due = source.reload_at;
+        let Next::Segment(segment) = source.poll(due).unwrap() else {
+            panic!("a later 401 may renew once more");
+        };
+        assert_eq!(segment.bytes, vec![2]);
+        assert_eq!(source.next, 3);
+        assert_eq!(source.http.auth_calls.get(), 2);
+        assert_eq!(source.http.notes.get(), 2);
+        assert!(matches!(source.poll(Instant::now()).unwrap(), Next::End));
+    }
+    #[test]
+    fn initialization_401_retries_the_same_sequence_with_the_new_token() {
+        let mapped = String::from_utf8(media(0, 1, true, "old", false))
+            .unwrap()
+            .replacen("#EXTINF", "#EXT-X-MAP:URI=\"init.mp4?sig=a\"\n#EXTINF", 1);
+        let refreshed = mapped.replace("signature=old", "signature=new");
+        let mut source = authed(
+            mapped.as_bytes(),
+            vec![
+                step(
+                    "/audio/init.mp4",
+                    Some("sig=a"),
+                    None,
+                    Err(ProbeError::Authentication),
+                ),
+                step(
+                    "/audio/media.m3u8",
+                    None,
+                    Some("synthetic-renewed-token"),
+                    Ok(refreshed.into_bytes()),
+                ),
+                step(
+                    "/audio/init.mp4",
+                    Some("sig=a"),
+                    Some("synthetic-renewed-token"),
+                    Ok(vec![9]),
+                ),
+                step("/audio/s0.aac", Some("signature=new"), None, Ok(vec![4])),
+            ],
+        );
+        let Next::Segment(segment) = source.poll(Instant::now()).unwrap() else {
+            panic!("init recovery");
+        };
+        assert_eq!(segment.initialization.unwrap().as_ref(), &[9]);
+        assert_eq!(segment.bytes, vec![4]);
+        assert_eq!(source.next, 1);
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert!(matches!(source.poll(Instant::now()).unwrap(), Next::End));
+        assert!(source.http.steps.borrow().is_empty());
     }
 }
