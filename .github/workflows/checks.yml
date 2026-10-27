@@ -79,7 +79,7 @@ jobs:
       - name: Install PulseAudio, the ALSA pulse plugin, and build files
         run: |
           sudo apt-get update
-          sudo apt-get install -y pulseaudio pulseaudio-utils libasound2-plugins libasound2-dev pkg-config
+          sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils libasound2-plugins libasound2-dev pkg-config
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Start a PulseAudio null sink
