@@ -37,6 +37,8 @@
 
 通常の `cargo test --workspace` は、アカウント、radiko、音声の保存を使いません。次は明示的に実行します。
 
+`native_muted_*` の 2 件は `#[ignore]` のまま、この通常実行には入りません。音声のデコードから出力までの経路、`output-info` と `probe-output`、その判定スクリプト、または `cpal` などの依存を変えた pull request では、ubuntu-24.04 の別ワークフローが PulseAudio の `module-null-sink` で `output-info`、`probe-output --mute 3`、`cargo test --locked -p radiko --lib native_muted -- --ignored --test-threads=1` を実行します。main への push と定期実行では動きません。必要なときは `workflow_dispatch` で手動かします。ドキュメントだけの変更では動きません。ALSA の `default` は `libasound2-plugins` の pulse プラグイン経由で、その null sink に繋がります。ALSA の `null` PCM は実時間で進まないので、このジョブでは使いません。`RADIKO_FRAGMENT_SECONDS` は付けません。fragment のテストは省略時の 5 秒です。取得待ちの切り分けも同じジョブで走ります。`output-info` と `probe-output` の stderr に `ALSA lib` が 1 行でもあるとき、または表示された不足が 0 でないときは、ジョブが失敗します。取得待ちの `gap_after=1` は、テストが不足の発生を確認する側なので、0 にはしません。
+
 生成した fragmented AAC を、音量0で実機へ出します。通信とアカウントは使いません。`RADIKO_FRAGMENT_SECONDS` は1〜1800で、省略時は5秒です。実時間は指定秒数に30秒を足したところで打ち切ります。
 
 ```sh
@@ -44,13 +46,13 @@ RADIKO_FRAGMENT_SECONDS=1800 cargo test --workspace --locked -p radiko --lib \
   native_muted_fragmented_aac_reaches_the_explicit_output_limit -- --ignored --nocapture
 ```
 
-取得待ちと先読みの切り分けは、生成 AAC・音量0で約50秒です。
+取得待ちと先読みの切り分けは、生成 AAC・音量0で約50秒です。同じテストは上の ubuntu-24.04 ジョブでも走ります。
 
 ```sh
 cargo test --workspace -p radiko --lib native_muted_acquisition_gap -- --ignored --nocapture
 ```
 
-ローカルの HTTP タイムアウトと再試行は、待受の権限が要るため通常テストから外れています。
+ローカルの HTTP タイムアウトと再試行は、待受の権限が要るため通常テストから外れています。上の音声ジョブにも入れません。
 
 ```sh
 cargo test --workspace -p radiko --lib local_mock_http -- --ignored

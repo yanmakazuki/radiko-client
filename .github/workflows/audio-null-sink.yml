@@ -1,0 +1,142 @@
+name: Audio null sink
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/audio-null-sink.yml"
+      - "scripts/check_null_sink_audio.py"
+      - "scripts/test_check_null_sink_audio.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/radiko/Cargo.toml"
+      - "crates/radiko-client/Cargo.toml"
+      - "crates/radiko/build.rs"
+      - "crates/radiko/src/player.rs"
+      - "crates/radiko/src/player/**"
+      - "crates/radiko/src/api/stream.rs"
+      - "crates/radiko/src/api/stream/playback.rs"
+      - "crates/radiko-client/src/main.rs"
+      - "crates/radiko-client/src/play.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  # ubuntu-24.04 only. ALSA's null PCM is not realtime; do not use it.
+  # local_mock_http stays out of this job (issue #12).
+  pulse-null-sink:
+    name: PulseAudio null sink (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install PulseAudio, the ALSA pulse plugin, and build files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils libasound2-plugins libasound2-dev pkg-config
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Start a PulseAudio null sink
+        run: |
+          set -euxo pipefail
+          if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+            export XDG_RUNTIME_DIR="$RUNNER_TEMP/pulse-runtime"
+            mkdir -p "$XDG_RUNTIME_DIR"
+            chmod 700 "$XDG_RUNTIME_DIR"
+            echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          fi
+          pulseaudio -D --exit-idle-time=-1 --load=module-null-sink
+          ready=0
+          for _ in $(seq 1 50); do
+            if pactl info >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          test "$ready" -eq 1
+          pactl info
+          pactl list short sinks
+          sink=$(pactl list short sinks | awk '/null/ { print $2; exit }')
+          test -n "$sink"
+          pactl set-default-sink "$sink"
+      - name: output-info and muted probe
+        run: |
+          set -euo pipefail
+          if ! pactl info >/dev/null 2>&1; then
+            pulseaudio -D --exit-idle-time=-1 --load=module-null-sink
+            sink=$(pactl list short sinks | awk '/null/ { print $2; exit }')
+            pactl set-default-sink "$sink"
+          fi
+          mkdir -p "$RUNNER_TEMP/audio"
+          set +e
+          cargo +stable run --locked -p radiko-client -- output-info \
+            >"$RUNNER_TEMP/audio/output-info.out" \
+            2>"$RUNNER_TEMP/audio/output-info.err"
+          info_status=$?
+          start=$(date +%s%N)
+          cargo +stable run --locked -p radiko-client -- probe-output --mute 3 \
+            >"$RUNNER_TEMP/audio/probe.out" \
+            2>"$RUNNER_TEMP/audio/probe.err"
+          probe_status=$?
+          end=$(date +%s%N)
+          set -e
+          elapsed=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.3f", (e - s) / 1000000000 }')
+          echo "probe_elapsed_s=$elapsed"
+          echo "----- output-info stdout -----"
+          cat "$RUNNER_TEMP/audio/output-info.out"
+          echo "----- output-info stderr -----"
+          cat "$RUNNER_TEMP/audio/output-info.err"
+          echo "----- probe-output stdout -----"
+          cat "$RUNNER_TEMP/audio/probe.out"
+          echo "----- probe-output stderr -----"
+          cat "$RUNNER_TEMP/audio/probe.err"
+          set +e
+          python3 scripts/check_null_sink_audio.py output-info \
+            --status "$info_status" \
+            --stdout "$RUNNER_TEMP/audio/output-info.out" \
+            --stderr "$RUNNER_TEMP/audio/output-info.err"
+          info_check=$?
+          python3 scripts/check_null_sink_audio.py probe \
+            --status "$probe_status" \
+            --stdout "$RUNNER_TEMP/audio/probe.out" \
+            --stderr "$RUNNER_TEMP/audio/probe.err" \
+            --elapsed "$elapsed" \
+            --min-elapsed 2.5
+          probe_check=$?
+          set -e
+          test "$info_check" -eq 0
+          test "$probe_check" -eq 0
+      - name: Ignored native muted tests
+        run: |
+          set -euo pipefail
+          if ! pactl info >/dev/null 2>&1; then
+            pulseaudio -D --exit-idle-time=-1 --load=module-null-sink
+            sink=$(pactl list short sinks | awk '/null/ { print $2; exit }')
+            pactl set-default-sink "$sink"
+          fi
+          mkdir -p "$RUNNER_TEMP/audio"
+          set +e
+          cargo +stable test --locked -p radiko --lib native_muted -- --ignored --test-threads=1 --nocapture \
+            >"$RUNNER_TEMP/audio/native.out" \
+            2>"$RUNNER_TEMP/audio/native.err"
+          status=$?
+          set -e
+          echo "----- native stdout -----"
+          cat "$RUNNER_TEMP/audio/native.out"
+          echo "----- native stderr -----"
+          cat "$RUNNER_TEMP/audio/native.err"
+          python3 scripts/check_null_sink_audio.py native \
+            --status "$status" \
+            --stdout "$RUNNER_TEMP/audio/native.out" \
+            --stderr "$RUNNER_TEMP/audio/native.err"

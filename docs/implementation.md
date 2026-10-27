@@ -4,6 +4,12 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
+
+対象は `a5b8786` の ignored テスト `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` である。環境は Linux x86_64、Rust 1.99.1、PulseAudio 16.1 の `module-null-sink`（シンク名 `null`、`libasound2-plugins` 経由の ALSA `default`）で、`/dev/snd` はない。ALSA の `null` PCM は使っていない。テストの判定は変えていない。
+
+`cargo +stable test --locked -p radiko --lib native_muted -- --ignored --test-threads=1 --nocapture` を 20 回続けた。`native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` は 20 回成功、0 回失敗である。各回 `gap_after=4` の不足は 0、`gap_after=1` の不足は 334,857〜339,893 フレームで、テストが 0 ではないことを求める側のままである。fragment の 5 秒は各回不足 0 で、1 回あたり約 55.5 秒だった。QA が同じ `a5b8786` で 4 回中 1 回失敗したときのメッセージと値は残っていない。この 20 回は直列で、その失敗は再現していない。実機の再生、耳での確認、radiko への通信はない。
+
 ## 2026年10月27日：main の出力変更と再生中の 401 再認証を合わせる
 
 `origin/main` を merge した。main には、ALSA の診断抑制と i16/i32 出力（PR #31）、終了時に HTTP より先に出力を閉じる処理（PR #32）が入っている。コードのコンフリクトはなかった。`OutputSummary` の `sample_format`、終了時に出力を先に閉じる処理、再生中の HTTP 401 の再認証は、いずれも残している。検証文書のコンフリクトは `docs/validation.md` の自動テストの文だけで、10月26日の 308 件・312 件と、再生中 401 の 318 件は両方残した。実装状況は、同じ日の節を新しい記録が前になる順に戻した。
