@@ -21,7 +21,7 @@
 | 取り消しと終了 | HTTP の待ちと本文、AAC のパケット前後、部分データの破棄。SIGINT、SIGTERM、SIGHUP で端末復元 | OS の名前解決と、1パケットの復号呼び出し自体は途中で切れない。SIGKILL と、認証の書き込み中の完了は保証しない |
 | 出力とコーデック | 純 Rust の AAC/SBR と CPAL。既定と同じ名前の機器を開く。MacBook Air Speakers の無音3秒は不足0。Yamaha URX22 A は無音のあと物理切断で機器エラーになり、接ぎ直し後の無音5秒は不足0。JP1〜JP47 の96局のライブ先頭は `mp4a.40.5` の ADTS で SBR。Linux のカードなしでは「既定の音声出力機器がありません」と `ALSA lib` 0 行。PulseAudio の null sink では `default` の f32・48000Hz・2ch で無音3秒、不足0 | TUI 操作中の切断、失敗した再生の自動再開、他の機器は未確認。実配信の非 ADTS と、PS の明示が真になる例は未確認。Linux の実機再生、i16 だけの機器を開いた再生、PipeWire のデスクトップは未確認 |
 
-自動テストは、2026年10月24日の通常 Rust で305件が成功しています。ミュートの実機4件は ignored のままです。fmt と clippy も成功しています。Rust 1.85 での、その日の再ビルドはしていません。それより前の変更では、Rust 1.85.0 のオフラインテストが成功した記録があります。GitHub Actions は、fragmented AAC より前のコミットで成功を確認し、10月24日の `0f419e5` の Checks はこの要約の時点では未確認です。2026年10月26日に ubuntu-24.04 の同じ検査をワークフローへ足しました。その実行と、Linux 上の再生・端末の確認はまだありません。同日の macOS では、通常 Rust 1.98.1 で fmt、clippy、306件が成功し、ignored 4件はそのままです。macOS の再生結果は Linux の結果にしません。同日の別の確認で、Linux の Rust 1.99.1 では fmt、clippy、312件が成功し、ignored 4件はそのままです。カードなしと PulseAudio の null sink の出力確認は [実装状況](implementation.md) の同日の節です。実機の再生ではありません。
+自動テストは、2026年10月24日の通常 Rust で305件が成功しています。ミュートの実機4件は ignored のままです。fmt と clippy も成功しています。Rust 1.85 での、その日の再ビルドはしていません。それより前の変更では、Rust 1.85.0 のオフラインテストが成功した記録があります。GitHub Actions は、fragmented AAC より前のコミットで成功を確認し、10月24日の `0f419e5` の Checks はこの要約の時点では未確認です。2026年10月26日に ubuntu-24.04 の同じ検査をワークフローへ足しました。その実行と、Linux 上の再生・端末の確認はまだありません。同日の macOS では、通常 Rust 1.98.1 で fmt、clippy、306件が成功し、ignored 4件はそのままです。macOS の再生結果は Linux の結果にしません。同日の別の確認で、Linux の Rust 1.99.1 では fmt、clippy、312件が成功し、ignored 4件はそのままです。カードなしと PulseAudio の null sink の出力確認は [実装状況](implementation.md) の同日の節です。実機の再生ではありません。2026年10月27日に、ubuntu-24.04 だけのジョブで、同じ null sink の上の `output-info`、無音 3 秒、`native_muted` 2 件を Checks に加えた。通常の `cargo test` では、この 2 件は ignored のままである。`local_mock_http` はこのジョブに入れていない。その実行の数値は実装状況の同日の節である。
 
 ## まだ確認していないこと
 
@@ -35,22 +35,28 @@
 
 ## 自動テストと明示実行
 
-通常の `cargo test --workspace` は、アカウント、radiko、音声の保存を使いません。次は明示的に実行します。
+通常の `cargo test --workspace` は、アカウント、radiko、音声の保存を使いません。`native_muted_*` の 2 件は `#[ignore]` のままなので、この通常実行には入りません。ubuntu-24.04 の Checks にだけ、PulseAudio の `module-null-sink` を使うジョブがあり、そこで次を実行します。
 
-生成した fragmented AAC を、音量0で実機へ出します。通信とアカウントは使いません。`RADIKO_FRAGMENT_SECONDS` は1〜1800で、省略時は5秒です。実時間は指定秒数に30秒を足したところで打ち切ります。
+- `output-info`
+- `probe-output --mute 3`
+- `cargo test --locked -p radiko --lib native_muted -- --ignored --test-threads=1`
+
+ALSA の `default` は `libasound2-plugins` の pulse プラグイン経由で、その null sink に繋がります。ALSA の `null` PCM は実時間で進まないので、このジョブでは使いません。`RADIKO_FRAGMENT_SECONDS` は付けません。fragment のテストは省略時の 5 秒、取得待ちの切り分けは約 50 秒です。`output-info` と `probe-output` の stderr に `ALSA lib` が 1 行でもあるとき、または表示された不足が 0 でないときは、ジョブが失敗します。取得待ちの `gap_after=1` は、テストが不足の発生を確認する側なので、0 にはしません。
+
+1800 秒の fragment 出力は、上のジョブとは別に明示実行します。通信とアカウントは使いません。`RADIKO_FRAGMENT_SECONDS` は 1〜1800 で、省略時は 5 秒です。実時間は指定秒数に 30 秒を足したところで打ち切ります。
 
 ```sh
 RADIKO_FRAGMENT_SECONDS=1800 cargo test --workspace --locked -p radiko --lib \
   native_muted_fragmented_aac_reaches_the_explicit_output_limit -- --ignored --nocapture
 ```
 
-取得待ちと先読みの切り分けは、生成 AAC・音量0で約50秒です。
+取得待ちと先読みの切り分けだけを明示実行するときは、生成 AAC・音量0で約50秒です。同じテストは上の ubuntu-24.04 ジョブでも走ります。
 
 ```sh
 cargo test --workspace -p radiko --lib native_muted_acquisition_gap -- --ignored --nocapture
 ```
 
-ローカルの HTTP タイムアウトと再試行は、待受の権限が要るため通常テストから外れています。
+ローカルの HTTP タイムアウトと再試行は、待受の権限が要るため通常テストから外れています。上の音声ジョブにも入れません。
 
 ```sh
 cargo test --workspace -p radiko --lib local_mock_http -- --ignored
