@@ -35,8 +35,10 @@ pub(crate) trait Fetch {
     fn note_reauthentication(&self) {}
     /// Counts segments a live playlist skipped while catching up. Other clients ignore it.
     fn note_skipped_segments(&self, _count: u64) {}
-    /// Counts a live `MEDIA-SEQUENCE` rewind. Other clients ignore it.
+    /// Counts a live timeline restart. Other clients ignore it.
     fn note_sequence_reset(&self) {}
+    /// Records whether the latest live restart joined the first playlist segment.
+    fn note_joined_window_head(&self, _at_head: bool) {}
 }
 pub(crate) struct Reply {
     pub headers: HeaderMap,
@@ -359,6 +361,11 @@ impl Fetch for Http {
     fn note_sequence_reset(&self) {
         if let Some(measurements) = &self.diagnostics {
             measurements.note_sequence_reset();
+        }
+    }
+    fn note_joined_window_head(&self, at_head: bool) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_joined_window_head(at_head);
         }
     }
     fn get(

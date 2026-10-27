@@ -368,7 +368,7 @@ impl<F: Fetch> HlsStream<F> {
     fn poll_at(&mut self, now: Instant) -> Result<Next, ProbeError> {
         if self.next < self.media.media_sequence {
             if self.live {
-                self.realign(false)?;
+                self.realign(Self::forward_gap_is_reset(self.next, &self.media))?;
             } else {
                 return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
             }
@@ -660,24 +660,51 @@ impl<F: Fetch> HlsStream<F> {
             return Err(ProbeError::InvalidPlaylist);
         };
         validate_media(&media)?;
-        let rewound = media.media_sequence < self.media.media_sequence;
+        let previous_sequence = self.media.media_sequence;
+        let rewound = media.media_sequence < previous_sequence;
         if rewound && !self.live {
             return Err(ProbeError::InvalidPlaylist);
         }
-        let changed = media.media_sequence != self.media.media_sequence
+        let changed = media.media_sequence != previous_sequence
             || media.segments.len() != self.media.segments.len();
         let wait = Wait::from_secs(media.target_duration).div_f64(if changed { 1.0 } else { 2.0 });
         self.reload_at = now + wait;
         self.media = media;
         self.url = reply.url;
-        if self.live && (rewound || self.next < self.media.media_sequence) {
-            self.realign(rewound)?;
+        if self.live {
+            if let Some(reset) = self.live_realignment(previous_sequence) {
+                self.realign(reset)?;
+            }
         } else if self.next < self.media.media_sequence {
             return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
         }
         Ok(wait)
     }
-    fn realign(&mut self, rewound: bool) -> Result<(), ProbeError> {
+    /// `Some(true)` restarts the timeline. `Some(false)` catches up inside one window.
+    /// `None` keeps the next sequence. A live playlist that only slid back onto that
+    /// sequence, or ends on the one just before it, is `None`.
+    fn live_realignment(&self, previous_sequence: u64) -> Option<bool> {
+        let start = self.media.media_sequence;
+        let len = self.media.segments.len() as u64;
+        let end = start.checked_add(len)?;
+        if start < previous_sequence {
+            let contains_next = start <= self.next && self.next < end;
+            if contains_next || end == self.next {
+                return None;
+            }
+            return Some(true);
+        }
+        if self.next < start {
+            return Some(Self::forward_gap_is_reset(self.next, &self.media));
+        }
+        None
+    }
+    /// The advertised window is the only scale for "the same stream moved on".
+    /// A gap larger than that window is a new timeline, not a count of missed segments.
+    fn forward_gap_is_reset(next: u64, media: &m3u8_rs::MediaPlaylist) -> bool {
+        media.media_sequence.saturating_sub(next) > media.segments.len() as u64
+    }
+    fn realign(&mut self, reset: bool) -> Result<(), ProbeError> {
         let index = live_join_index(&self.media);
         let offset = u64::try_from(index).map_err(|_| ProbeError::InvalidPlaylist)?;
         let target = self
@@ -685,7 +712,7 @@ impl<F: Fetch> HlsStream<F> {
             .media_sequence
             .checked_add(offset)
             .ok_or(ProbeError::InvalidPlaylist)?;
-        let skipped = if rewound {
+        let skipped = if reset {
             offset
         } else {
             target
@@ -695,9 +722,10 @@ impl<F: Fetch> HlsStream<F> {
         if skipped > 0 {
             self.http.note_skipped_segments(skipped);
         }
-        if rewound {
+        if reset {
             self.http.note_sequence_reset();
         }
+        self.http.note_joined_window_head(index == 0);
         self.next = target;
         self.pending_discontinuity = true;
         self.initialization = None;
@@ -1075,15 +1103,52 @@ mod tests {
         assert!(source.http.steps.borrow().is_empty());
     }
     #[test]
-    fn rewound_live_media_sequence_restarts_near_the_playlist_head() {
+    fn live_playlist_one_sequence_older_waits_for_13_without_replaying_11() {
+        let mut source = live_reader(
+            &media(11, 1, false, "a", false),
+            vec![
+                ("/audio/s11.aac", vec![11]),
+                ("/audio/media.m3u8", media(12, 1, false, "b", false)),
+                ("/audio/s12.aac", vec![12]),
+                ("/audio/media.m3u8", media(11, 2, false, "old", false)),
+                ("/audio/media.m3u8", media(13, 2, false, "c", false)),
+                ("/audio/s13.aac", vec![13]),
+                ("/audio/s14.aac", vec![14]),
+            ],
+        );
+        let first = segment(&mut source);
+        assert_eq!(first.bytes, [11]);
+        assert!(!first.discontinuity);
+        let second = segment(&mut source);
+        assert_eq!(second.bytes, [12]);
+        assert!(!second.discontinuity);
+        assert_eq!(source.next, 13);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 13);
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        let reload_at = source.reload_at;
+        let continued = segment_at(&mut source, reload_at);
+        assert_eq!(continued.bytes, [13]);
+        assert!(!continued.discontinuity);
+        let following = segment(&mut source);
+        assert_eq!(following.bytes, [14]);
+        assert!(!following.discontinuity);
+        assert_eq!(source.next, 15);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn nonoverlapping_live_rewind_restarts_as_a_reset() {
         let mut source = live_reader(
             &media(10, 1, false, "a", false),
             vec![
                 ("/audio/s10.aac", vec![10]),
                 ("/audio/media.m3u8", media(3, 1, false, "b", false)),
                 ("/audio/s3.aac", vec![3]),
-                ("/audio/media.m3u8", media(0, 6, false, "c", false)),
-                ("/audio/s3.aac", vec![30]),
             ],
         );
         assert_eq!(segment(&mut source).bytes, [10]);
@@ -1093,13 +1158,42 @@ mod tests {
         assert_eq!(source.http.skipped.get(), 0);
         assert_eq!(source.http.resets.get(), 1);
         assert_eq!(source.next, 4);
-        let reload_at = source.reload_at;
-        let edge = segment_at(&mut source, reload_at);
-        assert_eq!(edge.bytes, [30]);
+        assert!(source.http.steps.borrow().is_empty());
+
+        let mut source = live_reader(
+            &media(30, 1, false, "a", false),
+            vec![
+                ("/audio/s30.aac", vec![30]),
+                ("/audio/media.m3u8", media(0, 6, false, "b", false)),
+                ("/audio/s3.aac", vec![3]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [30]);
+        let edge = segment(&mut source);
+        assert_eq!(edge.bytes, [3]);
         assert!(edge.discontinuity);
         assert_eq!(source.next, 4);
         assert_eq!(source.http.skipped.get(), 3);
-        assert_eq!(source.http.resets.get(), 2);
+        assert_eq!(source.http.resets.get(), 1);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn live_sequence_jump_past_the_playlist_length_resets_without_counting_skipped_segments() {
+        let mut source = live_reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/media.m3u8", media(1_000_000, 3, false, "b", false)),
+                ("/audio/s1000000.aac", vec![7]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [10]);
+        let restarted = segment(&mut source);
+        assert_eq!(restarted.bytes, [7]);
+        assert!(restarted.discontinuity);
+        assert_eq!(source.next, 1_000_001);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 1);
         assert!(source.http.steps.borrow().is_empty());
     }
     #[test]

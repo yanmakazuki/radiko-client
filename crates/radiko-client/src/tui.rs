@@ -290,20 +290,18 @@ impl Screen {
                 self.playback_notice = "配信認証を更新して再生を続けます".into();
             }
         }
+        let at_head = http.is_some_and(|http| http.joined_window_head);
         if let Some((skipped, resets)) = realign {
-            let reset = resets > self.seen_sequence_resets;
             self.seen_sequence_resets = resets;
             self.seen_skipped_segments = skipped;
             if !self.playback_notice.contains("再生停止")
                 && !self.playback_notice.contains("認証期限切れ")
                 && !self.playback_notice.contains("配信認証を更新")
             {
-                self.playback_notice = if reset {
-                    format!(
-                        "配信の通し番号が巻き戻ったため、プレイリストの先頭かライブ端付近から再開しました（飛ばしたセグメントは累計{skipped}）"
-                    )
+                self.playback_notice = if at_head {
+                    format!("配信の先頭に戻りました（飛ばしたセグメントは累計{skipped}）")
                 } else {
-                    format!("ライブの配信窓に追いつきました（飛ばしたセグメントは累計{skipped}）")
+                    format!("ライブ端に追いつきました（飛ばしたセグメントは累計{skipped}）")
                 };
             }
         }
@@ -2513,6 +2511,7 @@ mod tests {
                         reauthentications: 1,
                         skipped_segments: 0,
                         sequence_resets: 0,
+                        joined_window_head: false,
                     }),
                 }),
             }),
@@ -2544,7 +2543,7 @@ mod tests {
         use radiko::player::diagnostics::{Snapshot, Stage};
         let mut screen = screen();
         let now = Utc::now().fixed_offset();
-        let http = |skipped, resets| radiko::api::stream::playback::RequestSnapshot {
+        let http = |skipped, resets, at_head| radiko::api::stream::playback::RequestSnapshot {
             stage: radiko::api::stream::playback::RequestStage::Idle,
             response_status: Some(200),
             elapsed: Duration::ZERO,
@@ -2558,8 +2557,9 @@ mod tests {
             reauthentications: 0,
             skipped_segments: skipped,
             sequence_resets: resets,
+            joined_window_head: at_head,
         };
-        let update = |skipped, resets| radiko::app::playback::Update {
+        let update = |skipped, resets, at_head| radiko::app::playback::Update {
             snapshot: Some(radiko::player::state::PlaybackSnapshot {
                 info: radiko::api::stream::playback::StreamInfo {
                     title: Some("枠".into()),
@@ -2587,15 +2587,15 @@ mod tests {
                     decoded_segments: 2,
                     waiting_pcm_segments: 0,
                     waiting_pcm_media: Duration::ZERO,
-                    http: Some(http(skipped, resets)),
+                    http: Some(http(skipped, resets, at_head)),
                 }),
             }),
             ..radiko::app::playback::Update::default()
         };
-        screen.apply_playback(update(2, 0));
+        screen.apply_playback(update(2, 0, true));
         assert_eq!(
             screen.playback_notice,
-            "ライブの配信窓に追いつきました（飛ばしたセグメントは累計2）"
+            "配信の先頭に戻りました（飛ばしたセグメントは累計2）"
         );
         assert!(screen.pipeline_diagnostics.contains("飛ばしたセグメント2"));
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
@@ -2610,16 +2610,34 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>()
             .replace(' ', "");
-        assert!(shown.contains("追いつきました"), "{shown}");
+        assert!(shown.contains("配信の先頭に戻りました"), "{shown}");
         assert!(shown.contains("飛ばしたセグメント2"), "{shown}");
-        screen.apply_playback(update(2, 1));
+        screen.apply_playback(update(4, 0, false));
         assert_eq!(
             screen.playback_notice,
-            "配信の通し番号が巻き戻ったため、プレイリストの先頭かライブ端付近から再開しました（飛ばしたセグメントは累計2）"
+            "ライブ端に追いつきました（飛ばしたセグメントは累計4）"
+        );
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let shown: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(shown.contains("ライブ端に追いつきました"), "{shown}");
+        assert!(shown.contains("飛ばしたセグメント4"), "{shown}");
+        screen.apply_playback(update(4, 1, true));
+        assert_eq!(
+            screen.playback_notice,
+            "配信の先頭に戻りました（飛ばしたセグメントは累計4）"
         );
         assert!(screen.pipeline_diagnostics.contains("通し番号の巻き戻り1"));
         screen.playback_notice = "配信認証を更新して再生を続けます".into();
-        screen.apply_playback(update(5, 1));
+        screen.apply_playback(update(5, 1, false));
         assert_eq!(screen.playback_notice, "配信認証を更新して再生を続けます");
         assert!(screen.pipeline_diagnostics.contains("飛ばしたセグメント5"));
         screen.apply_playback(radiko::app::playback::Update {
@@ -2627,8 +2645,11 @@ mod tests {
             ..radiko::app::playback::Update::default()
         });
         assert!(screen.playback_notice.is_empty());
-        screen.apply_playback(update(2, 0));
-        assert!(screen.playback_notice.contains("追いつきました"));
+        screen.apply_playback(update(2, 0, false));
+        assert_eq!(
+            screen.playback_notice,
+            "ライブ端に追いつきました（飛ばしたセグメントは累計2）"
+        );
     }
     #[test]
     fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
@@ -2690,6 +2711,7 @@ mod tests {
                     reauthentications: 0,
                     skipped_segments: 0,
                     sequence_resets: 0,
+                    joined_window_head: false,
                 }),
             }),
         });

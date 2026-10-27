@@ -257,6 +257,7 @@ mod tests {
             reauthentications: 0,
             skipped_segments: 0,
             sequence_resets: 0,
+            joined_window_head: false,
         };
         let mut snapshot = Tracker::new(Instant::now()).snapshot(Instant::now());
         snapshot.http = Some(http);

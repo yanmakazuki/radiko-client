@@ -32,8 +32,11 @@ pub struct Snapshot {
     pub reauthentications: u64,
     /// Segments skipped when a live window moved ahead of the player.
     pub skipped_segments: u64,
-    /// Live playlists whose `MEDIA-SEQUENCE` moved backwards.
+    /// Live timeline restarts. A small backward slide is not one of these.
     pub sequence_resets: u64,
+    /// The latest live restart joined the first segment of that playlist.
+    /// False before any restart, and after one that joined nearer the live edge.
+    pub joined_window_head: bool,
 }
 
 struct State {
@@ -60,6 +63,7 @@ impl Measurements {
                 reauthentications: 0,
                 skipped_segments: 0,
                 sequence_resets: 0,
+                joined_window_head: false,
             },
         }))
     }
@@ -110,6 +114,11 @@ impl Measurements {
     pub(crate) fn note_sequence_reset(&self) {
         if let Ok(mut state) = self.0.lock() {
             state.snapshot.sequence_resets = state.snapshot.sequence_resets.saturating_add(1);
+        }
+    }
+    pub(crate) fn note_joined_window_head(&self, at_head: bool) {
+        if let Ok(mut state) = self.0.lock() {
+            state.snapshot.joined_window_head = at_head;
         }
     }
     pub(crate) fn failed(&self, timeout: bool, connect: bool) {
