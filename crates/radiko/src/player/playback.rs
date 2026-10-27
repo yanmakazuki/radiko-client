@@ -532,7 +532,7 @@ fn frame_limit(
     Ok((frames, reason))
 }
 
-trait AudioSink {
+pub(crate) trait AudioSink {
     fn configure(&self, _paused: bool, _volume: u32) {}
     fn enqueue(&mut self, pcm: &DecodedPcm, cursor: &mut usize) -> Result<bool, OutputError>;
     fn accepted(&self) -> u64;
@@ -619,6 +619,47 @@ pub fn play_session(
         stop,
         progress,
         ContinuousOutput::new,
+        Some(controls),
+    )
+}
+/// Test sessions use a stand-in device. Production playback stays on `play_session`.
+#[cfg(test)]
+pub(crate) struct BoxedSink(pub Box<dyn AudioSink + Send>);
+#[cfg(test)]
+impl AudioSink for BoxedSink {
+    fn configure(&self, paused: bool, volume: u32) {
+        self.0.configure(paused, volume);
+    }
+    fn enqueue(&mut self, pcm: &DecodedPcm, cursor: &mut usize) -> Result<bool, OutputError> {
+        self.0.enqueue(pcm, cursor)
+    }
+    fn accepted(&self) -> u64 {
+        self.0.accepted()
+    }
+    fn summary(&self) -> OutputSummary {
+        self.0.summary()
+    }
+    fn poll(&mut self) -> Result<bool, OutputError> {
+        self.0.poll()
+    }
+    fn finish(&mut self) {
+        self.0.finish();
+    }
+}
+#[cfg(test)]
+pub(crate) fn play_idle_with<S: AudioSink>(
+    idle: StreamInfo,
+    stop: StopToken,
+    controls: &mut super::seek::Controller,
+    progress: impl FnMut(Progress),
+    create: impl FnMut(&DecodedPcm, u64, Option<Duration>, StopToken) -> Result<S, OutputError>,
+) -> Result<PlaybackReport, PlaybackError> {
+    play_loop(
+        Initial::<Box<dyn SegmentSource>>::Idle(idle),
+        None,
+        stop,
+        progress,
+        create,
         Some(controls),
     )
 }
@@ -1407,6 +1448,7 @@ mod tests {
                 underrun_frames: 0,
                 sample_rate: self.rate,
                 channels: self.channels,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
             }
         }
         fn poll(&mut self) -> Result<bool, OutputError> {
@@ -1752,6 +1794,7 @@ mod tests {
                     underrun_frames: self.polls * 17,
                     sample_rate: 24_000,
                     channels: 1,
+                    sample_format: crate::player::output::OutputSampleFormat::F32,
                 }
             }
             fn poll(&mut self) -> Result<bool, OutputError> {

@@ -5,6 +5,8 @@ pub mod catalog;
 mod http;
 pub mod stream;
 use crate::domain::{Chapter, ChapterSet};
+#[cfg(test)]
+pub(crate) use http::loopback_get;
 use serde_json::Value;
 use std::{fmt, time::Duration};
 

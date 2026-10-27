@@ -19,9 +19,13 @@ use crate::{
 use chrono::{DateTime, FixedOffset};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type Factory = Arc<
@@ -73,12 +77,36 @@ struct Running {
     stop: StopToken,
     commands: mpsc::SyncSender<Command>,
     handle: thread::JoinHandle<()>,
+    /// Set after the control thread drops its output, before preparation is joined.
+    output_released: Arc<AtomicBool>,
 }
+/// Signals that `play_session` has returned, so the device drop already ran.
+struct OutputRelease(Arc<AtomicBool>);
+impl Drop for OutputRelease {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+#[cfg(test)]
+type TestSink = Arc<
+    dyn Fn(
+            &crate::player::aac::DecodedPcm,
+            u64,
+            Option<Duration>,
+            StopToken,
+        ) -> Result<
+            Box<dyn crate::player::playback::AudioSink + Send>,
+            crate::player::output::OutputError,
+        > + Send
+        + Sync,
+>;
 pub struct Service {
     factory: Factory,
     mailbox: Arc<Mutex<Update>>,
     running: Option<Running>,
     volume: u32,
+    #[cfg(test)]
+    test_sink: Option<TestSink>,
 }
 /// This preflight does not establish listening permission. The stream resolver checks it again.
 pub fn request(
@@ -180,7 +208,24 @@ impl Service {
             mailbox: Arc::new(Mutex::new(Update::default())),
             running: None,
             volume: 25,
+            #[cfg(test)]
+            test_sink: None,
         }
+    }
+    #[cfg(test)]
+    fn with_test_sink(
+        factory: impl Fn(
+            PlaybackRequest,
+            StopToken,
+        ) -> Result<Box<dyn SegmentSource>, playback::PlaybackError>
+        + Send
+        + Sync
+        + 'static,
+        sink: TestSink,
+    ) -> Self {
+        let mut service = Self::with_cancellable_factory(factory);
+        service.test_sink = Some(sink);
+        service
     }
     pub fn select(
         &mut self,
@@ -252,6 +297,10 @@ impl Service {
                     ..Update::default()
                 };
             }
+            #[cfg(test)]
+            let test_sink = self.test_sink.clone();
+            let output_released = Arc::new(AtomicBool::new(false));
+            let released_flag = output_released.clone();
             let handle = thread::spawn(move || {
                 let mut controls = Controller::with_cancellable_reporter(
                     rx,
@@ -263,12 +312,30 @@ impl Service {
                         }
                     },
                 );
-                let result =
-                    playback::play_session(idle, shutdown, &mut controls, move |snapshot| {
-                        if let Ok(mut update) = progress.lock() {
-                            update.snapshot = Some(snapshot);
-                        }
-                    });
+                // Dropped when playback returns, including unwind, and before preparation is joined.
+                let released = OutputRelease(released_flag);
+                let report = move |snapshot| {
+                    if let Ok(mut update) = progress.lock() {
+                        update.snapshot = Some(snapshot);
+                    }
+                };
+                #[cfg(test)]
+                let result = if let Some(create) = test_sink {
+                    playback::play_idle_with(
+                        idle,
+                        shutdown,
+                        &mut controls,
+                        report,
+                        move |pcm, maximum, remaining, stop| {
+                            create(pcm, maximum, remaining, stop).map(playback::BoxedSink)
+                        },
+                    )
+                } else {
+                    playback::play_session(idle, shutdown, &mut controls, report)
+                };
+                #[cfg(not(test))]
+                let result = playback::play_session(idle, shutdown, &mut controls, report);
+                drop(released);
                 if let Ok(mut update) = finished.lock() {
                     update.ended = true;
                     if let Ok(report) = &result {
@@ -286,14 +353,15 @@ impl Service {
                         Err(error) => format!("再生停止: {error}"),
                     });
                 }
-                // Output has already been dropped and ended is published. A new session waits
-                // for this finite HTTP drain without blocking the UI or accumulating workers.
+                // Output is already dropped. Join only so a later session does not accumulate
+                // workers; callers waiting on `output_released` do not wait for this join.
                 controls.finish_preparation();
             });
             self.running = Some(Running {
                 stop,
                 commands,
                 handle,
+                output_released,
             });
         }
         self.command(Command::Volume(self.volume))?;
@@ -330,6 +398,28 @@ impl Service {
             running.stop.cancel();
         }
     }
+    /// Cancel playback and wait until the device has been dropped.
+    /// The wait is at most one second and does not include in-flight HTTP.
+    pub fn release_output(&mut self) {
+        self.stop();
+        self.wait_until_output_released(Duration::from_secs(1));
+    }
+    fn wait_until_output_released(&self, bound: Duration) {
+        let Some(flag) = self
+            .running
+            .as_ref()
+            .map(|running| running.output_released.clone())
+        else {
+            return;
+        };
+        let deadline = Instant::now() + bound;
+        while !flag.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
     pub fn poll(&mut self) -> Update {
         let mut update = self
             .mailbox
@@ -353,7 +443,9 @@ impl Service {
 }
 impl Drop for Service {
     fn drop(&mut self) {
-        self.stop();
+        // Keep the control thread attached until the device is dropped or the bound elapses.
+        // Dropping `running` afterwards detaches it; that drop does not join HTTP.
+        self.release_output();
     }
 }
 
@@ -391,6 +483,7 @@ mod tests {
             handle: thread::spawn(move || {
                 let _ = waiting.recv();
             }),
+            output_released: Arc::new(AtomicBool::new(true)),
         });
         assert!(service.command(Command::Volume(0)).is_err());
         assert_eq!(service.volume, 35);
@@ -410,6 +503,7 @@ mod tests {
             stop: StopToken::default(),
             commands,
             handle: thread::spawn(|| {}),
+            output_released: Arc::new(AtomicBool::new(true)),
         });
         assert!(service.command(Command::Volume(0)).is_err());
         assert_eq!(service.volume, 100);
@@ -460,6 +554,7 @@ mod tests {
                 underrun_frames: 0,
                 sample_rate: 48000,
                 channels: 2,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
             }),
         };
         assert_eq!(
@@ -687,5 +782,278 @@ mod tests {
         drop(service);
         assert!(stop.is_cancelled());
         release.send(()).unwrap();
+    }
+    struct FlagSink {
+        closed: Arc<AtomicBool>,
+        accepted: u64,
+        rate: u32,
+        channels: u16,
+    }
+    impl Drop for FlagSink {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+    impl crate::player::playback::AudioSink for FlagSink {
+        fn enqueue(
+            &mut self,
+            pcm: &crate::player::aac::DecodedPcm,
+            cursor: &mut usize,
+        ) -> Result<bool, crate::player::output::OutputError> {
+            self.accepted = self.accepted.saturating_add(pcm.summary.frames as u64);
+            *cursor = pcm.samples.len();
+            Ok(true)
+        }
+        fn accepted(&self) -> u64 {
+            self.accepted
+        }
+        fn summary(&self) -> crate::player::output::OutputSummary {
+            crate::player::output::OutputSummary {
+                frames: self.accepted,
+                underrun_frames: 0,
+                sample_rate: self.rate,
+                channels: self.channels,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
+            }
+        }
+        fn poll(&mut self) -> Result<bool, crate::player::output::OutputError> {
+            Ok(false)
+        }
+        fn finish(&mut self) {}
+    }
+    fn flag_sink(opened: Arc<AtomicBool>, closed: Arc<AtomicBool>) -> TestSink {
+        Arc::new(move |pcm, _, _, _| {
+            opened.store(true, Ordering::Release);
+            Ok(Box::new(FlagSink {
+                closed: closed.clone(),
+                accepted: 0,
+                rate: pcm.summary.sample_rate,
+                channels: pcm.summary.channels,
+            }))
+        })
+    }
+    fn adts_frames() -> Vec<u8> {
+        use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, write_adts_header};
+        let mut encoder = AacEncoder::new(AacEncoderConfig::default());
+        let samples: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.1).sin() * 0.1).collect();
+        encoder.push_pcm(&samples, 1, 24_000).unwrap();
+        encoder.finish();
+        let packet = encoder.next_packet().unwrap();
+        let mut bytes = write_adts_header(&AdtsHeader {
+            object_type: 2,
+            sample_rate: 24_000,
+            channels: 1,
+            frame_length: packet.data.len() + 7,
+            header_len: 7,
+        });
+        bytes.extend(packet.data);
+        bytes.repeat(40)
+    }
+    fn short_info(program: &Program) -> StreamInfo {
+        StreamInfo {
+            title: Some(program.title.clone()),
+            station: program.key.station_id.clone(),
+            mode: ProbeMode::TimeFree,
+            starts_at: program.key.starts_at,
+            ends_at: program.key.starts_at + chrono::Duration::milliseconds(200),
+            position: Duration::ZERO,
+        }
+    }
+    struct ScriptedSource {
+        info: StreamInfo,
+        bytes: Option<Vec<u8>>,
+        hang_url: Option<String>,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    }
+    impl SegmentSource for ScriptedSource {
+        fn info(&self) -> &StreamInfo {
+            &self.info
+        }
+        fn set_cancellation(&mut self, cancelled: Arc<dyn Fn() -> bool + Send + Sync>) {
+            self.cancelled = cancelled;
+        }
+        fn poll_segment(
+            &mut self,
+        ) -> Result<crate::api::stream::playback::Next, crate::api::stream::ProbeError> {
+            if let Some(bytes) = self.bytes.take() {
+                return Ok(crate::api::stream::playback::Next::Segment(
+                    crate::api::stream::playback::Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: Some("mp4a.40.2".into()),
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    },
+                ));
+            }
+            if let Some(url) = self.hang_url.clone() {
+                let _ = crate::api::loopback_get(&url, self.cancelled.clone());
+                return Err(crate::api::stream::ProbeError::Cancelled);
+            }
+            Ok(crate::api::stream::playback::Next::Pending(
+                Duration::from_millis(50),
+            ))
+        }
+    }
+    #[test]
+    fn dropping_service_closes_output_while_preparation_blocks_for_five_seconds() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let (unblocked_tx, unblocked_rx) = mpsc::channel();
+        let opened = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let p = program();
+        let info = short_info(&p);
+        let bytes = adts_frames();
+        let mut service = Service::with_test_sink(
+            move |_, _| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(Box::new(ScriptedSource {
+                        info: info.clone(),
+                        bytes: Some(bytes.clone()),
+                        hang_url: None,
+                        cancelled: Arc::new(|| false),
+                    }));
+                }
+                blocked_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                unblocked_tx.send(()).unwrap();
+                Err(playback::PlaybackError::LoginRequired)
+            },
+            flag_sink(opened.clone(), closed.clone()),
+        );
+        service.select(&p, p.ends_at).unwrap();
+        until(|| opened.load(Ordering::Acquire));
+        assert!(!closed.load(Ordering::Acquire));
+        service.select(&p, p.ends_at).unwrap();
+        blocked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let began = Instant::now();
+        drop(service);
+        assert!(closed.load(Ordering::Acquire));
+        assert!(began.elapsed() < Duration::from_millis(1500));
+        release_tx.send(()).unwrap();
+        unblocked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    #[test]
+    fn shutdown_during_hanging_http_response_releases_output_within_bound() {
+        use std::{
+            io::{ErrorKind, Read},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (disconnect_tx, disconnect_rx) = mpsc::channel::<Result<Duration, &'static str>>();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            let _ = disconnect_tx.send(Err("client never connected"));
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        let _ = disconnect_tx.send(Err("accept failed"));
+                        return;
+                    }
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let header_deadline = Instant::now() + Duration::from_secs(2);
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                if Instant::now() >= header_deadline {
+                    let _ = disconnect_tx.send(Err("headers never arrived"));
+                    return;
+                }
+                match socket.read(&mut tmp) {
+                    Ok(0) => {
+                        let _ = disconnect_tx.send(Err("closed before headers"));
+                        return;
+                    }
+                    Ok(n) => request.extend_from_slice(&tmp[..n]),
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock
+                            || error.kind() == ErrorKind::TimedOut => {}
+                    Err(_) => {
+                        let _ = disconnect_tx.send(Err("header read failed"));
+                        return;
+                    }
+                }
+            }
+            if accepted_tx.send(()).is_err() {
+                return;
+            }
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let started = Instant::now();
+            let aborted = match socket.read(&mut tmp) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error) => {
+                    error.kind() != ErrorKind::WouldBlock && error.kind() != ErrorKind::TimedOut
+                }
+            };
+            let _ = disconnect_tx.send(if aborted {
+                Ok(started.elapsed())
+            } else {
+                Err("hung response was not aborted")
+            });
+        });
+        let opened = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let p = program();
+        let info = short_info(&p);
+        let bytes = adts_frames();
+        let url = format!("http://{address}/hang");
+        let mut service = Service::with_test_sink(
+            move |_, _| {
+                Ok(Box::new(ScriptedSource {
+                    info: info.clone(),
+                    bytes: Some(bytes.clone()),
+                    hang_url: Some(url.clone()),
+                    cancelled: Arc::new(|| false),
+                }))
+            },
+            flag_sink(opened.clone(), closed.clone()),
+        );
+        service.select(&p, p.ends_at).unwrap();
+        let ready = Instant::now() + Duration::from_secs(3);
+        let mut accepted = false;
+        while !opened.load(Ordering::Acquire) || !accepted {
+            assert!(
+                Instant::now() < ready,
+                "output or hanging request did not start"
+            );
+            if accepted_rx.try_recv().is_ok() {
+                accepted = true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!closed.load(Ordering::Acquire));
+        let began = Instant::now();
+        drop(service);
+        assert!(closed.load(Ordering::Acquire));
+        assert!(began.elapsed() < Duration::from_millis(1500));
+        let disconnected = disconnect_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let elapsed = disconnected.expect("in-flight response was not cancelled");
+        assert!(elapsed < Duration::from_secs(2));
+        server.join().unwrap();
     }
 }

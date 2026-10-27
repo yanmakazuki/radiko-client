@@ -398,3 +398,57 @@ fn tui_help_and_nonterminal_rejection_do_not_start_network_or_write_preferences(
     );
     assert!(!directory.exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_output_commands_hide_alsa_diagnostics_and_name_a_missing_device() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("asound.conf");
+    fs::write(
+        &config,
+        "pcm.!default {\n    type hw\n    card MissingRadikoCard\n}\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["output-info"],
+        vec!["probe-output", "1"],
+        vec!["probe-output", "--mute", "1"],
+    ] {
+        let quiet = Command::new(env!("CARGO_BIN_EXE_radiko-client"))
+            .args(&args)
+            .env_remove("RADIKO_ALSA_LOG")
+            .env("ALSA_CONFIG_PATH", &config)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&quiet.stderr);
+        let stdout = String::from_utf8_lossy(&quiet.stdout);
+        assert!(
+            !stderr.contains("ALSA lib") && !stdout.contains("ALSA lib"),
+            "{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !quiet.status.success(),
+            "{args:?} stdout={stdout} stderr={stderr}"
+        );
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            combined.contains("既定の音声出力機器がありません"),
+            "{args:?} {combined}"
+        );
+    }
+    let verbose = Command::new(env!("CARGO_BIN_EXE_radiko-client"))
+        .args(["output-info"])
+        .env("RADIKO_ALSA_LOG", "1")
+        .env("ALSA_CONFIG_PATH", &config)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&verbose.stderr);
+    assert!(
+        stderr.contains("ALSA lib"),
+        "debug env should restore ALSA diagnostics:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("既定の音声出力機器がありません"),
+        "{stderr}"
+    );
+}
