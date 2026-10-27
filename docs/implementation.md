@@ -16,6 +16,14 @@ PulseAudio 16.1 の `module-null-sink`（`libasound2-plugins` 経由の `default
 
 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features` は Rust 1.99.1 で成功した。成功は 313 件、ignored は 4 件のままである。要求レートを含む範囲が一つも無いときは `select_playback_config` がエラーを返し、別のレートでは開かない。44100Hz だけの形式表に 48000Hz を渡すテストで、日本語のエラーに両方の数値が入り、44100Hz の構成は採用されないことを確認した。96000Hz だけの形式表でも 48000Hz は失敗し、範囲に 48000Hz が含まれるときはちょうど 48000Hz で開く。この追記の前の 312 件は Rust 1.85.0 でも成功している。fmt と clippy は 1.85.0 では実行していない。アカウント、radiko への通信、音声の保存、実機の再生、耳での確認はない。i16 と i32 だけの機器を開いた再生はしていない。変換と形式選択は単体テストである。macOS はこの環境では再実行していない。PipeWire のデスクトップも未確認である。
 
+## 2026年10月26日：終了時に HTTP を待たず音声出力を閉じる
+
+終了時、再生サービスの drop は停止トークンを取り消すだけで制御スレッドを切り離していた。音声出力の破棄は再生関数の戻りで行われるが、そのあと準備ワーカーを join する。プロセス終了がその破棄より先だと、機器を閉じる前にスレッドが消える。
+
+再生関数が返った直後、準備ワーカーの join より前に「出力を閉じた」通知を立てる。TUI の `q`、Esc、Ctrl+C と、サービスの drop（SIGINT、SIGTERM、SIGHUP でループを抜けたあとを含む）はその通知を最大1秒待つ。1秒を超えても制御スレッドは join せず切り離し、端末復元は続ける。画面内の停止とログアウトは、従来どおり停止トークンの取り消しだけである。`player/output.rs` は変更していない。
+
+確認環境は Linux、rustc 1.99.1（58cf8f9c3、2026-10-13）。`/dev/snd` はない。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --all-targets --all-features` は 308 件成功、ignored 4 件はそのままである。追加したのは、準備が5秒ブロックしても drop が1.5秒以内に返り疑似出力の破棄フラグが真になることと、`127.0.0.1` で応答しない HTTP の途中でも同じで、その接続が2秒以内に切れることである。`shutdown_signals` も成功した。Rust 1.85 では再ビルドしていない。実機の再生、再生中の `q` のあと `output-info` が 0 になること、`q`、Esc、Ctrl+C、SIGINT、SIGTERM、SIGHUP の疑似端末での復元の再実行、radiko への通信は確認していない。
+
 ## 2026年10月26日：Linux を対象に加える
 
 対象を macOS と Linux にした。Windows などそれ以外は初期版の外のままである。出力ホストは CPAL 0.16.0 の既定で、macOS は CoreAudio、Linux は ALSA である。Linux のビルドには pkg-config と libasound の開発ファイルが要る。JACK 機能は有効にしていない。既定の保存先は `directories` 6.0.0 のままで、Linux では `$XDG_DATA_HOME/radiko-client`、未設定なら `~/.local/share/radiko-client` である。macOS の `~/Library/Application Support/jp.radiko-client.radiko-client` は変えていない。

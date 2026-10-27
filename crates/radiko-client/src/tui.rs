@@ -1545,7 +1545,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                             &mut chapters,
                         )?;
                         if should_quit {
-                            player.stop();
+                            player.release_output();
                             let deadline = std::time::Instant::now() + Duration::from_millis(200);
                             while named_service.writing() && std::time::Instant::now() < deadline {
                                 if let Some(event) = named_service.poll().await {
@@ -1566,7 +1566,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                 }
                 tick.tick().await;
             }
-            player.stop();
+            player.release_output();
             let logout_deadline = std::time::Instant::now() + Duration::from_millis(200);
             while logout.busy() && std::time::Instant::now() < logout_deadline {
                 if let Some(event) = logout.poll().await {
