@@ -4,6 +4,22 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月27日：配信窓の追いつきを main の標準出力変更へ合わせる
+
+`origin/main`（#42、標準出力の `BrokenPipe`）を merge commit で取り込んだ。衝突は `docs/implementation.md` と `docs/validation.md` だけで、同日の二つの節と自動テストの文は両方残した。コードのコンフリクトはなかった。追いつきで足した CLI の表示は、新しい `println!` ではない。再生中の状態は stderr の通信診断のままで、標準出力の行は `stdout_ln!` のままである。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 338 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 338 件成功、失敗 0、ignored 4 件はそのままである。実配信で窓が先に進む再生は確認していない。
+
+## 2026年10月27日：標準出力の BrokenPipe を終了コード 141 で戻す
+
+対象は `radiko-client` の CLI である。Rust は SIGPIPE を無視するため、`println!` が閉じたパイプへ書くと `failed printing to stdout: Broken pipe (os error 32)` でパニックし、終了コード 101 になる。`programs --areas JP13 | head -1` で再現する。
+
+選んだ方法は、標準出力の行を `stdout.rs` の `stdout_ln!` に集め、`ErrorKind::BrokenPipe` のときは stderr に足さず終了コード 141（128+SIGPIPE）で戻すことである。SIGPIPE を `unsafe` で既定に戻す方法は採らない。書き込みエラーを返すと、再生や取得の Drop が走り、終了コードをこちらで決められる。stderr の `eprintln!` と、ログインプロンプトの `eprint!` はそのままである。コード中の標準出力向け `println!` は CLI から外した。`print!` で標準出力へ書く箇所はなかった。テストと `build.rs` の `println!` は Cargo とテスト診断のままである。`stations` というサブコマンドはなく、局の表示は `programs` である。番組表の取得中にパイプが閉じたら、既存の取り消しフラグで残りの取得を止める。画面の TUI 本体は crossterm が端末へ書く。`tui --help` だけをこの行出力に含めた。
+
+確認環境は Linux x86_64、Rust 1.99.1、音声デバイスなしである。`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features` は 332 件成功、失敗 0、ignored 4 件のままである。統合テスト `sigpipe` は、読み口を閉じたパイプと bash の `| head -1` を、ヘルプと `login`、`session`、`logout`、`probe-live`、`probe-timefree`、`play-live`、`play-timefree`、`output-info`、`probe-output`、`play-sample`、`programs`、`tui --help`、`searches`、`chapters`、`inspect-chapters` に対して実行する。標準出力へ書くコマンドは、閉じたパイプで終了 141、panic なし、stderr に新たなエラーなしである。書く前に失敗するコマンドは終了 1 のままである。読み切ったときの `--help`、`searches show` / `restore` の JSON、`inspect-chapters` の全文は終了 0 で欠けるところはない。`output-info` と `probe-output` は機器がないため終了 1、stderr は「エラー: 既定の音声出力機器がありません」だけである。
+
+同じデバッグビルドで `programs --areas JP13 | head -1` を実行した。終了コードは 141、panic はなく、stdout の1行目は `BAYFM78 (BAYFM78) / 放送日 2026-10-27 / 日本時間（実行時点の状態）` だった。stderr は進捗2行（局一覧 1/1、番組表 1/15）だけで、「エラー:」は出ていない。取得はそこで止めた。アカウントは使っていない。音声の保存もない。macOS はこの環境では実行していない。同じテストは `#![cfg(unix)]` なので、GitHub Actions の macos-15 でも走る。Rust 1.85.0（4d91de4e4、2025-02-17）の `cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 332 件成功、失敗 0、ignored 4 件のままである。fmt と clippy は 1.85.0 では実行していない。
+
 ## 2026年10月27日：ライブの配信窓から遅れても再生を続ける
 
 ライブで、次の通し番号が新しいプレイリストに無いときは止めない。再開位置は、終端から target duration の3倍以内に始まるセグメントのうち最も古いものである。窓全体がその範囲なら先頭の `MEDIA-SEQUENCE` になる。飛ばした通し番号の個数は通信診断の「飛ばしたセグメント」と、TUI の再生通知に出す。CLI の状態表示は同じ通信診断の行である。再開したセグメントは不連続としてデコーダーを作り直す。`MEDIA-SEQUENCE` が小さくなったライブは、配信のリセットとして同じ位置から再開し、回数を「通し番号の巻き戻り」に足す。リセットで捨てた古い番号は飛ばした個数に入れない。タイムフリーの欠落と巻き戻りは失敗のままである。再認証、終了時に出力を先に閉じること、サンプル形式の選択は変えていない。

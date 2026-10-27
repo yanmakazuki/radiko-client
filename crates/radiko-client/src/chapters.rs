@@ -1,4 +1,5 @@
 //! 公式チャプターの取得・一覧表示CLI。参考位置の表示に限定し、ジャンプ再生は行わない。
+use crate::stdout::stdout_ln;
 use chrono::FixedOffset;
 use radiko::api::stream::{
     self,
@@ -8,13 +9,13 @@ use radiko::api::stream::{
 const USAGE: &str = "chapters STATION YYYYMMDDHHmmss（日本時間、取得・一覧表示のみ）";
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args == ["--help"] {
-        println!("{USAGE}");
+        stdout_ln!("{USAGE}");
         return Ok(());
     }
     let (station, cursor) = request(args)?;
     let report = chapters::inspect(station, cursor)?;
     let jst = FixedOffset::east_opt(9 * 3600).ok_or("日本時間を構成できません")?;
-    println!(
+    stdout_ln!(
         "{} / {} / {}–{}（日本時間）",
         report.title.as_deref().unwrap_or("番組名未取得"),
         report.station,
@@ -29,22 +30,22 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     let aligned = matches!(&report.outcome, Outcome::Aligned(_, _));
     match report.outcome {
-        Outcome::Unresolved(issue) => println!("{}（取得・位置補正を省略）", issue.label()),
-        Outcome::Unavailable => println!("チャプター未提供（生成待ちの場合があります）"),
+        Outcome::Unresolved(issue) => stdout_ln!("{}（取得・位置補正を省略）", issue.label()),
+        Outcome::Unavailable => stdout_ln!("チャプター未提供（生成待ちの場合があります）"),
         Outcome::Candidates(set) | Outcome::Aligned(set, _) => {
             if aligned {
-                println!("放送枠・イベント原点一致（このCLIは閲覧のみ）");
+                stdout_ln!("放送枠・イベント原点一致（このCLIは閲覧のみ）");
             } else {
-                println!("メタデータ一致・音声位置未検証（閲覧のみ）");
+                stdout_ln!("メタデータ一致・音声位置未検証（閲覧のみ）");
             }
-            println!(
+            stdout_ln!(
                 "{}件 / 楽曲除外{}件 / 不正位置等{}件",
                 set.chapters.len(),
                 set.music_count,
                 set.invalid_count
             );
             for (index, chapter) in set.chapters.iter().enumerate() {
-                println!(
+                stdout_ln!(
                     "{}: {:.3}–{:.3}秒 {}",
                     index + 1,
                     chapter.start.as_secs_f64(),

@@ -9,6 +9,7 @@ mod picker;
 mod scroll;
 mod seek;
 mod viewport;
+use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use radiko::{
@@ -1514,7 +1515,7 @@ async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(
 }
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if args == ["--help"] {
-        println!("{USAGE}");
+        stdout_ln!("{USAGE}");
         return Ok(());
     }
     if args
