@@ -2247,7 +2247,7 @@ mod tests {
         assert!(matches!(error, ProbeError::WindowLost));
         assert_eq!(
             error.to_string(),
-            "通信が途切れている間に、この部分が配信窓から外れました。番組を選び直すと再生できます"
+            "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください"
         );
         assert_eq!(error.to_string(), ProbeError::WINDOW_LOST);
         assert!(

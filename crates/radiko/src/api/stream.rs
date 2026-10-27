@@ -110,7 +110,7 @@ impl fmt::Display for ProbeError {
 impl std::error::Error for ProbeError {}
 impl ProbeError {
     pub(crate) const WINDOW_LOST: &'static str =
-        "通信が途切れている間に、この部分が配信窓から外れました。番組を選び直すと再生できます";
+        "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
     fn at(self, stage: &'static str) -> Self {
         Self::At(stage, Box::new(self))
     }
