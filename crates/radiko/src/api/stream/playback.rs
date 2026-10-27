@@ -315,6 +315,8 @@ struct HlsStream<F> {
     media: m3u8_rs::MediaPlaylist,
     codec: Option<String>,
     next: u64,
+    /// Sequence of the segment most recently returned. Used to recognize a slightly older live window.
+    last_played: Option<u64>,
     /// Live windows catch up instead of stopping when the next sequence leaves the playlist.
     live: bool,
     discontinuity: Option<u64>,
@@ -347,6 +349,7 @@ impl<F: Fetch> HlsStream<F> {
             headers,
             codec,
             next,
+            last_played: None,
             live: false,
             discontinuity: None,
             pending_discontinuity: false,
@@ -435,6 +438,7 @@ impl<F: Fetch> HlsStream<F> {
         self.pending_discontinuity = false;
         let codec = self.codec.clone();
         self.discontinuity = Some(sequence);
+        self.last_played = Some(self.next);
         self.next = self
             .next
             .checked_add(1)
@@ -681,15 +685,13 @@ impl<F: Fetch> HlsStream<F> {
         Ok(wait)
     }
     /// `Some(true)` restarts the timeline. `Some(false)` catches up inside one window.
-    /// `None` keeps the next sequence. A live playlist that only slid back onto that
-    /// sequence, or ends on the one just before it, is `None`.
+    /// `None` keeps the next sequence. A live playlist that is only slightly older is `None`.
     fn live_realignment(&self, previous_sequence: u64) -> Option<bool> {
         let start = self.media.media_sequence;
         let len = self.media.segments.len() as u64;
         let end = start.checked_add(len)?;
         if start < previous_sequence {
-            let contains_next = start <= self.next && self.next < end;
-            if contains_next || end == self.next {
+            if self.rewind_is_stale(start, end, len) {
                 return None;
             }
             return Some(true);
@@ -698,6 +700,22 @@ impl<F: Fetch> HlsStream<F> {
             return Some(Self::forward_gap_is_reset(self.next, &self.media));
         }
         None
+    }
+    /// A backward playlist is stale when its tail is at most one window behind the last
+    /// played sequence, or when the window still covers that sequence. Anything older is a restart.
+    fn rewind_is_stale(&self, start: u64, end: u64, len: u64) -> bool {
+        let contains_next = start <= self.next && self.next < end;
+        if contains_next || end == self.next {
+            return true;
+        }
+        let Some(last_played) = self.last_played else {
+            return false;
+        };
+        let tail = end.saturating_sub(1);
+        if start < last_played && end > last_played {
+            return true;
+        }
+        last_played >= tail && last_played - tail <= len
     }
     /// The advertised window is the only scale for "the same stream moved on".
     /// A gap larger than that window is a new timeline, not a count of missed segments.
@@ -1139,6 +1157,104 @@ mod tests {
         assert_eq!(source.next, 15);
         assert_eq!(source.http.skipped.get(), 0);
         assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn one_segment_window_one_older_waits_and_then_continues() {
+        let mut source = live_reader(
+            &media(12, 1, false, "a", false),
+            vec![
+                ("/audio/s12.aac", vec![12]),
+                ("/audio/media.m3u8", media(11, 1, false, "old", false)),
+                ("/audio/media.m3u8", media(13, 1, false, "next", false)),
+                ("/audio/s13.aac", vec![13]),
+            ],
+        );
+        let played = segment(&mut source);
+        assert_eq!(played.bytes, [12]);
+        assert!(!played.discontinuity);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 13);
+        assert_eq!(source.last_played, Some(12));
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        let reload_at = source.reload_at;
+        let continued = segment_at(&mut source, reload_at);
+        assert_eq!(continued.bytes, [13]);
+        assert!(!continued.discontinuity);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn six_segment_window_slid_back_by_one_does_not_replay_or_reset() {
+        let mut source = live_reader(
+            &media(12, 6, false, "a", false),
+            vec![
+                ("/audio/s12.aac", vec![12]),
+                ("/audio/s13.aac", vec![13]),
+                ("/audio/s14.aac", vec![14]),
+                ("/audio/s15.aac", vec![15]),
+                ("/audio/s16.aac", vec![16]),
+                ("/audio/s17.aac", vec![17]),
+                ("/audio/media.m3u8", media(11, 6, false, "old", false)),
+                ("/audio/media.m3u8", media(18, 1, false, "next", false)),
+                ("/audio/s18.aac", vec![18]),
+            ],
+        );
+        for n in 12u8..=17 {
+            let played = segment(&mut source);
+            assert_eq!(played.bytes, [n]);
+            assert!(!played.discontinuity);
+        }
+        assert_eq!(source.next, 18);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 18);
+        assert_eq!(source.last_played, Some(17));
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        let reload_at = source.reload_at;
+        let continued = segment_at(&mut source, reload_at);
+        assert_eq!(continued.bytes, [18]);
+        assert!(!continued.discontinuity);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn stale_tail_exactly_one_window_behind_is_ignored_and_one_older_resets() {
+        let mut source = live_reader(
+            &media(17, 1, false, "a", false),
+            vec![
+                ("/audio/s17.aac", vec![17]),
+                ("/audio/media.m3u8", media(6, 6, false, "edge", false)),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [17]);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 18);
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+
+        let mut source = live_reader(
+            &media(17, 1, false, "a", false),
+            vec![
+                ("/audio/s17.aac", vec![17]),
+                ("/audio/media.m3u8", media(5, 6, false, "older", false)),
+                ("/audio/s8.aac", vec![8]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [17]);
+        let restarted = segment(&mut source);
+        assert_eq!(restarted.bytes, [8]);
+        assert!(restarted.discontinuity);
+        assert_eq!(source.http.resets.get(), 1);
+        assert_eq!(source.next, 9);
         assert!(source.http.steps.borrow().is_empty());
     }
     #[test]
