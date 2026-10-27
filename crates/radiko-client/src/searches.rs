@@ -1,4 +1,5 @@
 //! 保存した検索条件を管理するオフラインCLI。番組取得や認証通信は行わない。
+use crate::stdout::stdout_ln;
 use chrono::Utc;
 use radiko::{
     domain::search::SearchCriteria,
@@ -12,7 +13,7 @@ fn snapshot(value: &SearchCriteria) -> serde_json::Value {
 }
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if args == ["--help"] {
-        println!("{USAGE}");
+        stdout_ln!("{USAGE}");
         return Ok(());
     }
     let valid = match args.first().map(String::as_str) {
@@ -44,7 +45,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     match args[0].as_str() {
         "list" => {
             for name in store.load()?.named.keys() {
-                println!("{name}");
+                stdout_ln!("{name}");
             }
         }
         "show" => {
@@ -53,7 +54,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                 .named
                 .remove(&args[1])
                 .ok_or(Error::NotFound)?;
-            println!("{}", serde_json::to_string_pretty(&snapshot(&value))?);
+            stdout_ln!("{}", serde_json::to_string_pretty(&snapshot(&value))?);
         }
         "restore" => {
             let criteria = match store.load() {
@@ -66,15 +67,15 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                     SearchCriteria::initial(now)?
                 }
             };
-            println!("{}", serde_json::to_string_pretty(&snapshot(&criteria))?);
+            stdout_ln!("{}", serde_json::to_string_pretty(&snapshot(&criteria))?);
         }
         "save" => {
             store.save_named(&args[1], criteria.ok_or(USAGE)?)?;
-            println!("名前付き検索条件を保存しました");
+            stdout_ln!("名前付き検索条件を保存しました");
         }
         "delete" => {
             store.delete_named(&args[1])?;
-            println!("名前付き検索条件を削除しました");
+            stdout_ln!("名前付き検索条件を削除しました");
         }
         _ => return Err(USAGE.into()),
     }

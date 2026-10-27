@@ -1377,6 +1377,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "ctrlc",
+ "libc",
  "radiko",
  "ratatui",
  "rpassword",

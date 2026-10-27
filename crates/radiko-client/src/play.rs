@@ -1,4 +1,5 @@
 //! 連続再生CLIの操作と通知。認証確認、割り込み、対話コマンドを再生処理へ接続する。
+use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
 use radiko::player::seek::{Command, Controller, PlaybackRequest};
 use radiko::{
@@ -195,7 +196,7 @@ fn check_preparation(stop: &StopToken) -> Result<(), playback::PlaybackError> {
 }
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() == 2 && args[1] == "--help" {
-        println!("{USAGE}");
+        stdout_ln!("{USAGE}");
         return Ok(());
     }
     let request = request(args, Utc::now().fixed_offset())?;
@@ -216,7 +217,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     let membership = MemberClient::new_cancellable(Arc::new(move || auth_stop.is_cancelled()))
         .and_then(|client| client.check(&session));
     if stop.is_cancelled() {
-        println!("中断しました");
+        stdout_ln!("中断しました");
         return Ok(());
     }
     let membership = membership?;
@@ -232,13 +233,13 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         Arc::new(move || initial_stop.is_cancelled()),
     );
     if stop.is_cancelled() {
-        println!("中断しました");
+        stdout_ln!("中断しました");
         return Ok(());
     }
     let source = prepared?;
     let info = source.info();
     let jst = FixedOffset::east_opt(9 * 3600).ok_or("日本時間を構成できません")?;
-    println!(
+    stdout_ln!(
         "{} / {} / {:?} / {}–{}（日本時間） / Ctrl+Cで停止",
         info.title.as_deref().unwrap_or("番組名未取得"),
         info.station,
@@ -299,7 +300,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     } else {
         playback::play(source, request.seconds, stop, progress)?
     };
-    println!(
+    stdout_ln!(
         "{}",
         match report.reason {
             EndReason::ProgramEnd => "番組終了",
@@ -308,7 +309,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         }
     );
     if let Some(output) = report.output {
-        println!(
+        stdout_ln!(
             "出力: {}フレーム / {}Hz / {}ch / {}セグメント / バッファ不足: {}フレーム",
             output.frames,
             output.sample_rate,
