@@ -81,6 +81,7 @@ mod tests {
             underrun_frames: 240,
             sample_rate: 48000,
             channels: 2,
+            sample_format: crate::player::output::OutputSampleFormat::F32,
         };
         let text = output_diagnostics(Some(&output), 3);
         assert!(text.contains("1.5秒"));
@@ -113,6 +114,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
             underrun_frames: 7,
+            sample_format: crate::player::output::OutputSampleFormat::F32,
         }
     }
     #[test]

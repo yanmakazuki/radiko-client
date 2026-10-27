@@ -14,7 +14,7 @@ use radiko::{
         search::{Filter, Scope, SearchCriteria},
     },
     player::{
-        output::OutputSummary,
+        output::{OutputSampleFormat, OutputSummary},
         state::{PlaybackSnapshot, PlaybackState},
     },
 };
@@ -73,6 +73,7 @@ fn draft_edit_cancel_and_stale_results_never_change_committed_data_or_playback()
             underrun_frames: 0,
             sample_rate: 48000,
             channels: 2,
+            sample_format: OutputSampleFormat::F32,
         }),
         segments: 1,
     });
