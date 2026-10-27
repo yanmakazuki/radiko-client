@@ -57,8 +57,18 @@ impl Snapshot {
                 } else {
                     String::new()
                 };
+                let skipped = if http.skipped_segments > 0 {
+                    format!(" / 飛ばしたセグメント{}", http.skipped_segments)
+                } else {
+                    String::new()
+                };
+                let resets = if http.sequence_resets > 0 {
+                    format!(" / 通し番号の巻き戻り{}", http.sequence_resets)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "通信診断 {stage}{:.0}ms / 応答max{:.0}ms / 本文max{:.0}ms / 試行{}・再試行待ち{} / 通信失敗{}・期限{}・接続{} / HTTP{response}{renewal}",
+                    "通信診断 {stage}{:.0}ms / 応答max{:.0}ms / 本文max{:.0}ms / 試行{}・再試行待ち{} / 通信失敗{}・期限{}・接続{} / HTTP{response}{renewal}{skipped}{resets}",
                     http.elapsed.as_secs_f64() * 1000.0,
                     http.headers_max.as_secs_f64() * 1000.0,
                     http.body_max.as_secs_f64() * 1000.0,
@@ -245,6 +255,8 @@ mod tests {
             timeouts: 0,
             connect_failures: 0,
             reauthentications: 0,
+            skipped_segments: 0,
+            sequence_resets: 0,
         };
         let mut snapshot = Tracker::new(Instant::now()).snapshot(Instant::now());
         snapshot.http = Some(http);
@@ -252,6 +264,15 @@ mod tests {
         http.reauthentications = 1;
         snapshot.http = Some(http);
         assert!(snapshot.http_label().contains("再認証1"));
-        assert!(!snapshot.http_label().contains("token"));
+        assert!(!snapshot.http_label().contains("飛ばしたセグメント"));
+        assert!(!snapshot.http_label().contains("巻き戻り"));
+        http.skipped_segments = 4;
+        http.sequence_resets = 1;
+        snapshot.http = Some(http);
+        let label = snapshot.http_label();
+        assert!(label.contains("再認証1"));
+        assert!(label.contains("飛ばしたセグメント4"));
+        assert!(label.contains("通し番号の巻き戻り1"));
+        assert!(!label.contains("token"));
     }
 }

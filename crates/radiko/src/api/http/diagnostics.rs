@@ -30,6 +30,10 @@ pub struct Snapshot {
     pub connect_failures: u64,
     /// Completed stream-token renewals. HTTP 401 retries that fail do not add another renewal.
     pub reauthentications: u64,
+    /// Segments skipped when a live window moved ahead of the player.
+    pub skipped_segments: u64,
+    /// Live playlists whose `MEDIA-SEQUENCE` moved backwards.
+    pub sequence_resets: u64,
 }
 
 struct State {
@@ -54,6 +58,8 @@ impl Measurements {
                 timeouts: 0,
                 connect_failures: 0,
                 reauthentications: 0,
+                skipped_segments: 0,
+                sequence_resets: 0,
             },
         }))
     }
@@ -91,6 +97,19 @@ impl Measurements {
     pub(crate) fn note_reauthentication(&self) {
         if let Ok(mut state) = self.0.lock() {
             state.snapshot.reauthentications = state.snapshot.reauthentications.saturating_add(1);
+        }
+    }
+    pub(crate) fn note_skipped_segments(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.0.lock() {
+            state.snapshot.skipped_segments = state.snapshot.skipped_segments.saturating_add(count);
+        }
+    }
+    pub(crate) fn note_sequence_reset(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.snapshot.sequence_resets = state.snapshot.sequence_resets.saturating_add(1);
         }
     }
     pub(crate) fn failed(&self, timeout: bool, connect: bool) {
@@ -220,5 +239,28 @@ mod tests {
         measurements.note_reauthentication();
         assert_eq!(measurements.snapshot().unwrap().reauthentications, u64::MAX);
         assert_eq!(Measurements::new().snapshot().unwrap().reauthentications, 0);
+    }
+    #[test]
+    fn skipped_segments_and_sequence_resets_saturate_without_recording_targets() {
+        let measurements = Measurements::new();
+        measurements.note_skipped_segments(0);
+        measurements.note_skipped_segments(2);
+        measurements.note_sequence_reset();
+        let snapshot = measurements.snapshot().unwrap();
+        assert_eq!(snapshot.skipped_segments, 2);
+        assert_eq!(snapshot.sequence_resets, 1);
+        {
+            let mut state = measurements.0.lock().unwrap();
+            state.snapshot.skipped_segments = u64::MAX;
+            state.snapshot.sequence_resets = u64::MAX;
+        }
+        measurements.note_skipped_segments(3);
+        measurements.note_sequence_reset();
+        let snapshot = measurements.snapshot().unwrap();
+        assert_eq!(snapshot.skipped_segments, u64::MAX);
+        assert_eq!(snapshot.sequence_resets, u64::MAX);
+        let text = format!("{snapshot:?}");
+        assert!(!text.contains("http"));
+        assert!(!text.contains("token"));
     }
 }

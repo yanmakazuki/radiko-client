@@ -33,6 +33,10 @@ pub(crate) trait Fetch {
     ) -> Result<Reply, ProbeError>;
     /// Counts a completed stream-token renewal. The default keeps non-playback clients unchanged.
     fn note_reauthentication(&self) {}
+    /// Counts segments a live playlist skipped while catching up. Other clients ignore it.
+    fn note_skipped_segments(&self, _count: u64) {}
+    /// Counts a live `MEDIA-SEQUENCE` rewind. Other clients ignore it.
+    fn note_sequence_reset(&self) {}
 }
 pub(crate) struct Reply {
     pub headers: HeaderMap,
@@ -345,6 +349,16 @@ impl Fetch for Http {
     fn note_reauthentication(&self) {
         if let Some(measurements) = &self.diagnostics {
             measurements.note_reauthentication();
+        }
+    }
+    fn note_skipped_segments(&self, count: u64) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_skipped_segments(count);
+        }
+    }
+    fn note_sequence_reset(&self) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_sequence_reset();
         }
     }
     fn get(
