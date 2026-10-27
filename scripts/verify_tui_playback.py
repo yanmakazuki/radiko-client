@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit macOS network/audio verification; always muted, never an ordinary test.
+"""Network and audio verification for macOS and Linux; always muted, never an ordinary test.
 
 Only target identifiers and diagnostics are printed. Schedule content, terminal state, and audio
 stay in memory. A private binary copy survives rebuilding target/debug during a run.
@@ -33,6 +33,15 @@ def report(**values):
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def require_no_alsa_noise(text):
+    """Fail closed when ALSA diagnostics are mixed into the projected screen.
+
+    The library line is not copied into the error. Playback stays failed either way.
+    """
+    if 'ALSA lib' in text:
+        raise RuntimeError('ALSA lib noise on screen')
 
 
 class Terminal:
@@ -127,7 +136,9 @@ class Terminal:
             elif values[0] == 2: self.grid[self.row] = [' '] * self.columns
 
     def screen(self):
-        return '\n'.join(''.join(line) for line in self.grid)
+        text = '\n'.join(''.join(line) for line in self.grid)
+        require_no_alsa_noise(text)
+        return text
 
     def frame_matches_size(self):
         return self.grid[-1][0] == '└' and self.grid[-1][-1] == '┘'
@@ -292,6 +303,7 @@ def device_check(terminal, proc, master, station, selected, ends_at, wait):
             terminal.pump(0.2)
             text = terminal.screen()
             require(proc.poll() is None, 'TUI exited during device verification')
+            require_no_alsa_noise(text)
             saw_error |= '再生停止:' in text
             saw_inactive |= '再生中: なし' in text
             if time.monotonic() - last_report >= 10:
@@ -350,6 +362,7 @@ def sleep_check(terminal, proc, master, station, selected, ends_at, wait):
         terminal.pump(0.2)
         text = terminal.screen()
         require(proc.poll() is None, 'TUI exited during sleep verification')
+        require_no_alsa_noise(text)
         error_observed |= failure_diagnostics(text)['notice_visible']
         inactive_observed |= '再生中: なし' in text
         if select.select([sys.stdin], [], [], 0)[0]:
@@ -364,6 +377,7 @@ def sleep_check(terminal, proc, master, station, selected, ends_at, wait):
     require(acknowledged, 'wake acknowledgment timed out')
     terminal.pump(5)
     text = terminal.screen()
+    require_no_alsa_noise(text)
     error_observed |= failure_diagnostics(text)['notice_visible']
     inactive_observed |= '再生中: なし' in text
     result = dict(operator_acknowledged=True, playback_error_observed=error_observed,
@@ -552,11 +566,13 @@ def verify(args, directory):
                 terminal.pump()
                 text = terminal.screen()
                 require(proc.poll() is None, 'TUI exited early (code=%s)' % proc.returncode)
+                require_no_alsa_noise(text)
                 if check_playback:
                     require_playback_alive(text, last_output)
                 if predicate(text):
                     return text
             text = terminal.screen()
+            require_no_alsa_noise(text)
             report(phase='ui_wait_timeout', check=check,
                    inactive_visible='再生中: なし' in text,
                    stop_notice_visible='停止しました' in text,
@@ -602,10 +618,12 @@ def verify(args, directory):
                 terminal.pump(1)
                 text = terminal.screen()
                 require(proc.poll() is None, 'TUI exited while paused')
+                require_no_alsa_noise(text)
                 if not ('Paused' in text and target_matches(text, args.station, selected, ends_at, expected_mode)):
                     # Drain a possibly incomplete draw before classifying a state change.
                     terminal.pump(0.5)
                     text = terminal.screen()
+                    require_no_alsa_noise(text)
                     if not ('Paused' in text and target_matches(text, args.station, selected, ends_at, expected_mode)):
                         report(phase='paused_state_changed', paused_seconds=round(time.monotonic()-paused_at, 1),
                                paused_visible='Paused' in text, playing_visible='Playing' in text,
@@ -654,6 +672,7 @@ def verify(args, directory):
             terminal.pump(1)
             text = terminal.screen()
             require(proc.poll() is None, 'TUI exited early (code=%s)' % proc.returncode)
+            require_no_alsa_noise(text)
             require_playback_alive(text, last_output, underruns)
             if observation := underruns.observe(text):
                 report(phase='underrun_observed', **observation)
@@ -758,6 +777,7 @@ def verify(args, directory):
                 terminal.pump(0.2)
                 require(proc.poll() is None, 'TUI exited after program end')
                 current = terminal.screen()
+                require_no_alsa_noise(current)
                 require(natural_end_visible(current),
                         'playback auto-advanced after program end')
                 if args.timefree_end:

@@ -14,7 +14,7 @@ import tempfile
 import signal
 from pathlib import Path
 
-from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, device_check, number, select_program, failure_observation, check_timefree_end, UnderrunObservations, output_has_started, require_playback_alive
+from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, device_check, number, select_program, failure_observation, check_timefree_end, UnderrunObservations, output_has_started, require_playback_alive, require_no_alsa_noise
 
 
 class TerminalTests(unittest.TestCase):
@@ -506,6 +506,72 @@ else:
                 proc.wait()
             os.close(master)
             os.close(slave)
+
+
+CLEAN_SCREEN_FIXTURE = """\
+再生中: [TBS / TimeFree] title
+10/06 12:00〜10/06 13:00 JST / Playing / 音量0% / 位置1.0秒
+今回の出力 1.0秒 / 不足 0フレーム
+"""
+
+ALSA_SCREEN_FIXTURE = CLEAN_SCREEN_FIXTURE + "ALSA lib pcm.c:1:(snd_pcm_open) synthetic-secret\n"
+
+
+class AlsaScreenTests(unittest.TestCase):
+    def test_screen_fixture_without_alsa_lib_keeps_the_existing_success(self):
+        require_no_alsa_noise(CLEAN_SCREEN_FIXTURE)
+        start = datetime.datetime.fromisoformat('2026-10-06T12:00:00+09:00')
+        end = start + datetime.timedelta(hours=1)
+        self.assertTrue(output_has_started(CLEAN_SCREEN_FIXTURE, 'TBS', start, end, 'TimeFree'))
+        terminal = Terminal(-1)
+        terminal.feed(CLEAN_SCREEN_FIXTURE.encode())
+        self.assertIn('今回の出力 1.0秒', terminal.screen())
+
+    def test_screen_fixture_containing_alsa_lib_fails_and_hides_the_library_line(self):
+        with self.assertRaisesRegex(RuntimeError, 'ALSA lib noise on screen') as raised:
+            require_no_alsa_noise(ALSA_SCREEN_FIXTURE)
+        self.assertNotIn('synthetic-secret', str(raised.exception))
+        terminal = Terminal(-1)
+        terminal.feed(ALSA_SCREEN_FIXTURE.encode())
+        with self.assertRaisesRegex(RuntimeError, 'ALSA lib noise on screen'):
+            terminal.screen()
+
+    def test_help_names_macos_and_linux(self):
+        script = Path(__file__).with_name('verify_tui_playback.py')
+        result = subprocess.run([sys.executable, str(script), '--help'],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('Network and audio verification for macOS and Linux', result.stdout)
+        self.assertNotIn('Explicit macOS network/audio verification', result.stdout)
+
+    def test_projected_alsa_lib_line_fails_the_playback_script(self):
+        script = Path(__file__).with_name('verify_tui_playback.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'synthetic-client'
+            binary.write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+if 'programs' in sys.argv:
+    print(json.dumps({'programs':[{'starts_at':'2026-10-06T12:00:00+09:00','ends_at':'2026-10-06T13:00:00+09:00'}]}))
+else:
+    os.write(1, b'ALSA lib pcm.c:1:(snd_pcm_open) synthetic-secret\\n')
+    time.sleep(30)
+''')
+            binary.chmod(0o700)
+            session = root / 'synthetic-session.json'
+            session.write_text('{}')
+            session.chmod(0o600)
+            proc = subprocess.run(
+                [sys.executable, str(script), '--binary', str(binary), '--session-file', str(session),
+                 '--station', 'TBS', '--date', '20261006', '--start', '20261006120000', '--seconds', '1'],
+                capture_output=True, env=dict(os.environ, TMPDIR=directory), timeout=20)
+            self.assertEqual(proc.returncode, 1, proc.stderr.decode())
+            events = [json.loads(line) for line in proc.stdout.splitlines()]
+            self.assertEqual(events[-1]['phase'], 'failed')
+            self.assertEqual(events[-1]['check'], 'ALSA lib noise on screen')
+            self.assertNotIn(b'synthetic-secret', proc.stdout)
+            self.assertNotIn(b'synthetic-secret', proc.stderr)
+            self.assertEqual(list(root.glob('radiko-tui-verification-*')), [])
 
 
 if __name__ == '__main__':

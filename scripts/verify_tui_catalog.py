@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Explicit nationwide TUI load check. No account, audio, or metadata persistence."""
+"""Explicit nationwide TUI load check. No account, audio, or metadata persistence.
+
+peak_child_rss_bytes is bytes. Linux ru_maxrss is KiB and is multiplied by 1024.
+macOS ru_maxrss is already bytes and is reported unchanged.
+"""
 import argparse
 import datetime
 import fcntl
@@ -14,11 +18,19 @@ import signal
 import statistics
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
 
 from verify_tui_playback import Terminal, report, require, wait_exit
+
+
+def child_maxrss_bytes(ru_maxrss, platform):
+    """Return ru_maxrss in bytes. Linux reports KiB; darwin reports bytes."""
+    if platform == 'linux':
+        return ru_maxrss * 1024
+    return ru_maxrss
 
 
 def verify(args, directory):
@@ -115,7 +127,8 @@ def verify(args, directory):
                acquisition_seconds=round(completed_after, 2),
                visible_failure_examples=examples[:5],
                area_failures=int(missing[1]), schedule_failures=int(missing[2]), invalid_programs=int(missing[3]),
-               peak_child_rss_bytes=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+               peak_child_rss_bytes=child_maxrss_bytes(
+                   resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, sys.platform),
                help_checks=len(latencies), help_median_ms=round(statistics.median(latencies)*1000, 1),
                help_max_ms=round(max(latencies)*1000, 1), terminal_restored=True,
                exit_code=proc.returncode, binary_sha256=digest, rows=args.rows, columns=args.columns)
