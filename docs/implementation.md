@@ -4,6 +4,16 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月27日：ProbeError の表示とローカル HTTP テスト
+
+`ProbeError` の `Display` は、`At` と `Http` を外側で処理したあとの内側の `match` に `unreachable!` があった。同じ列挙を一段の網羅的な `match` にし、各バリアントの文言は変えていない。新しいバリアントを足すと、表示と `to_string` のテストの両方がコンパイルできなくなる。表示からパニックする経路はない。
+
+ローカル HTTP のテストは `#[ignore]` を外し、通常の `cargo test` に入れた。待受は `127.0.0.1` の空いているポートだけである。本番のクライアントは HTTPS 専用のままで、信頼するホストの判定も変えていない。テスト用の取得だけが、その待受へパスとクエリを写してから、本番と同じ状態コードの変換と再試行予算（`get_once` と `retry_get`）を使う。
+
+`local_mock_http` は4件である。これまでのタイムアウトと再試行の2件に加え、401・403・429 を再試行せず対応するエラーにすること、プレイリストの 401 のあと `authenticate` を1回通して同じ枠の次のセグメントまで続くことを、ローカルの HTTP サーバーで確認する。後者は、期限切れのトークンで 401、会員セッションで auth1 と auth2、新しいトークンでプレイリストの取り直し、までを1本の TCP 上の HTTP で行う。トークンは合成値で、エラー文言には出さない。
+
+Linux x86_64、Rust 1.99.1 で `cargo +stable test --locked -p radiko --lib local_mock_http -- --test-threads=8` を20回続け、各回4件成功、0件失敗、1回あたり約0.51秒だった。応答しない接続の待ちは250msが2回で、404 のクライアント期限は2秒だが応答はすぐ返る。ポート衝突や待ちによる失敗は出ていない。`native_muted` の2件は ignored のままである。ワークフローは変えていない。radiko への通信、実トークンの期限切れ、音声の保存、耳での確認はない。
+
 ## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
 
 対象は `a5b8786` の ignored テスト `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` である。環境は Linux x86_64、Rust 1.99.1、PulseAudio 16.1 の `module-null-sink`（シンク名 `null`、`libasound2-plugins` 経由の ALSA `default`）で、`/dev/snd` はない。ALSA の `null` PCM は使っていない。テストの判定は変えていない。

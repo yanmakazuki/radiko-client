@@ -62,43 +62,45 @@ impl fmt::Display for ProbeError {
         match self {
             Self::At(stage, error) => write!(f, "{stage}: {error}"),
             Self::Http(status) => write!(f, "配信サーバーがHTTP {status}を返しました"),
-            other => f.write_str(match other {
-                Self::InvalidPosition => {
-                    "シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
-                }
-                Self::InvalidInput => "局IDまたは日時が不正です（日時は日本時間のYYYYMMDDHHmmss）",
-                Self::Cancelled => "配信取得を取り消しました",
-                Self::Network => "配信の検証中に通信に失敗しました",
-                Self::Authentication => {
-                    "配信認証が拒否されました。sessionで会員認証を確認してください"
-                }
-                Self::AuthExpired => {
-                    "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
-                }
-                Self::Denied => {
-                    "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）"
-                }
-                Self::NotFound => "対象の番組または配信が見つかりません",
-                Self::RateLimited => "アクセス制限中です。時間をおいて再実行してください",
-                Self::TooLarge => "応答または音声サンプルのサイズ上限を超えました",
-                Self::UnsafeUrl => "未対応の配信先またはリダイレクトです",
-                Self::InvalidAuth => "配信認証の応答が想定形式と異なります",
-                Self::OutsideJapan => "国内エリアを確認できませんでした",
-                Self::InvalidXml => "局または配信設定XMLの形式が不正です",
-                Self::InvalidProgram => "指定時刻と番組の放送枠を対応付けできません",
-                Self::Upcoming => "放送前のため配信取得できません",
-                Self::StillOnAir => "放送中のためタイムフリーの検証対象外です",
-                Self::Expired => "タイムフリーの候補期限を過ぎています",
-                Self::ContractRequired => {
-                    "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）"
-                }
-                Self::AvailabilityUnknown => "番組の配信条件が未確認のため取得を中止しました",
-                Self::Unavailable => "番組情報でタイムフリー配信対象外とされています",
-                Self::InvalidPlaylist => "HLSプレイリストまたはサンプルの構造が不正・未対応です",
-                Self::NoEndpoint => "対象モードと地域に対応する配信先がありません",
-                Self::Http(_) => unreachable!(),
-                Self::At(..) => unreachable!(),
-            }),
+            Self::InvalidPosition => {
+                f.write_str("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください")
+            }
+            Self::InvalidInput => {
+                f.write_str("局IDまたは日時が不正です（日時は日本時間のYYYYMMDDHHmmss）")
+            }
+            Self::Cancelled => f.write_str("配信取得を取り消しました"),
+            Self::Network => f.write_str("配信の検証中に通信に失敗しました"),
+            Self::Authentication => {
+                f.write_str("配信認証が拒否されました。sessionで会員認証を確認してください")
+            }
+            Self::AuthExpired => f.write_str(
+                "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください",
+            ),
+            Self::Denied => f.write_str(
+                "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）",
+            ),
+            Self::NotFound => f.write_str("対象の番組または配信が見つかりません"),
+            Self::RateLimited => f.write_str("アクセス制限中です。時間をおいて再実行してください"),
+            Self::TooLarge => f.write_str("応答または音声サンプルのサイズ上限を超えました"),
+            Self::UnsafeUrl => f.write_str("未対応の配信先またはリダイレクトです"),
+            Self::InvalidAuth => f.write_str("配信認証の応答が想定形式と異なります"),
+            Self::OutsideJapan => f.write_str("国内エリアを確認できませんでした"),
+            Self::InvalidXml => f.write_str("局または配信設定XMLの形式が不正です"),
+            Self::InvalidProgram => f.write_str("指定時刻と番組の放送枠を対応付けできません"),
+            Self::Upcoming => f.write_str("放送前のため配信取得できません"),
+            Self::StillOnAir => f.write_str("放送中のためタイムフリーの検証対象外です"),
+            Self::Expired => f.write_str("タイムフリーの候補期限を過ぎています"),
+            Self::ContractRequired => f.write_str(
+                "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）",
+            ),
+            Self::AvailabilityUnknown => {
+                f.write_str("番組の配信条件が未確認のため取得を中止しました")
+            }
+            Self::Unavailable => f.write_str("番組情報でタイムフリー配信対象外とされています"),
+            Self::InvalidPlaylist => {
+                f.write_str("HLSプレイリストまたはサンプルの構造が不正・未対応です")
+            }
+            Self::NoEndpoint => f.write_str("対象モードと地域に対応する配信先がありません"),
         }
     }
 }
@@ -935,6 +937,90 @@ mod tests {
     use super::super::http::Reply;
     use super::*;
     use std::{cell::RefCell, collections::VecDeque};
+
+    fn expected_probe_error(error: &ProbeError) -> String {
+        match error {
+            ProbeError::At(stage, inner) => format!("{stage}: {}", expected_probe_error(inner)),
+            ProbeError::Http(status) => format!("配信サーバーがHTTP {status}を返しました"),
+            ProbeError::InvalidPosition => {
+                "シーク位置は番組冒頭以上・放送枠末尾未満で指定してください".into()
+            }
+            ProbeError::InvalidInput => {
+                "局IDまたは日時が不正です（日時は日本時間のYYYYMMDDHHmmss）".into()
+            }
+            ProbeError::Cancelled => "配信取得を取り消しました".into(),
+            ProbeError::Network => "配信の検証中に通信に失敗しました".into(),
+            ProbeError::Authentication => {
+                "配信認証が拒否されました。sessionで会員認証を確認してください".into()
+            }
+            ProbeError::AuthExpired => {
+                "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
+                    .into()
+            }
+            ProbeError::Denied => {
+                "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）".into()
+            }
+            ProbeError::NotFound => "対象の番組または配信が見つかりません".into(),
+            ProbeError::RateLimited => "アクセス制限中です。時間をおいて再実行してください".into(),
+            ProbeError::TooLarge => "応答または音声サンプルのサイズ上限を超えました".into(),
+            ProbeError::UnsafeUrl => "未対応の配信先またはリダイレクトです".into(),
+            ProbeError::InvalidAuth => "配信認証の応答が想定形式と異なります".into(),
+            ProbeError::OutsideJapan => "国内エリアを確認できませんでした".into(),
+            ProbeError::InvalidXml => "局または配信設定XMLの形式が不正です".into(),
+            ProbeError::InvalidProgram => "指定時刻と番組の放送枠を対応付けできません".into(),
+            ProbeError::Upcoming => "放送前のため配信取得できません".into(),
+            ProbeError::StillOnAir => "放送中のためタイムフリーの検証対象外です".into(),
+            ProbeError::Expired => "タイムフリーの候補期限を過ぎています".into(),
+            ProbeError::ContractRequired => {
+                "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）".into()
+            }
+            ProbeError::AvailabilityUnknown => "番組の配信条件が未確認のため取得を中止しました".into(),
+            ProbeError::Unavailable => "番組情報でタイムフリー配信対象外とされています".into(),
+            ProbeError::InvalidPlaylist => {
+                "HLSプレイリストまたはサンプルの構造が不正・未対応です".into()
+            }
+            ProbeError::NoEndpoint => "対象モードと地域に対応する配信先がありません".into(),
+        }
+    }
+    #[test]
+    fn probe_error_display_covers_every_variant_without_panicking() {
+        let samples = [
+            ProbeError::At(
+                "外側",
+                Box::new(ProbeError::At("内側", Box::new(ProbeError::Http(503)))),
+            ),
+            ProbeError::InvalidInput,
+            ProbeError::InvalidPosition,
+            ProbeError::Network,
+            ProbeError::Cancelled,
+            ProbeError::Http(401),
+            ProbeError::Authentication,
+            ProbeError::AuthExpired,
+            ProbeError::Denied,
+            ProbeError::NotFound,
+            ProbeError::RateLimited,
+            ProbeError::TooLarge,
+            ProbeError::UnsafeUrl,
+            ProbeError::InvalidAuth,
+            ProbeError::OutsideJapan,
+            ProbeError::InvalidXml,
+            ProbeError::InvalidProgram,
+            ProbeError::Upcoming,
+            ProbeError::StillOnAir,
+            ProbeError::Expired,
+            ProbeError::ContractRequired,
+            ProbeError::AvailabilityUnknown,
+            ProbeError::Unavailable,
+            ProbeError::InvalidPlaylist,
+            ProbeError::NoEndpoint,
+        ];
+        for error in samples {
+            let text = error.to_string();
+            assert_eq!(text, expected_probe_error(&error));
+            assert!(!text.is_empty());
+            assert!(!text.contains("unreachable"));
+        }
+    }
 
     struct Step {
         path: &'static str,
