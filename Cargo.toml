@@ -2,3 +2,7 @@
 resolver = "3"
 members = ["crates/radiko", "crates/radiko-client"]
 default-members = ["crates/radiko", "crates/radiko-client"]
+
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/yanmakazuki/radiko-client"
