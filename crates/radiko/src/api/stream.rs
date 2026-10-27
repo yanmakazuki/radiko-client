@@ -55,6 +55,8 @@ pub enum ProbeError {
     AvailabilityUnknown,
     Unavailable,
     InvalidPlaylist,
+    /// Time-free playback missed segments while the network was down. Not a malformed playlist.
+    WindowLost,
     NoEndpoint,
     ReconnectGaveUp,
 }
@@ -96,6 +98,7 @@ impl fmt::Display for ProbeError {
                 Self::AvailabilityUnknown => "番組の配信条件が未確認のため取得を中止しました",
                 Self::Unavailable => "番組情報でタイムフリー配信対象外とされています",
                 Self::InvalidPlaylist => "HLSプレイリストまたはサンプルの構造が不正・未対応です",
+                Self::WindowLost => Self::WINDOW_LOST,
                 Self::NoEndpoint => "対象モードと地域に対応する配信先がありません",
                 Self::ReconnectGaveUp => crate::reconnect::GAVE_UP,
                 Self::Http(_) => unreachable!(),
@@ -106,6 +109,8 @@ impl fmt::Display for ProbeError {
 }
 impl std::error::Error for ProbeError {}
 impl ProbeError {
+    pub(crate) const WINDOW_LOST: &'static str =
+        "通信が途切れている間に、この部分が配信窓から外れました。番組を選び直すと再生できます";
     fn at(self, stage: &'static str) -> Self {
         Self::At(stage, Box::new(self))
     }

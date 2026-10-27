@@ -387,7 +387,7 @@ impl<F: Fetch> HlsStream<F> {
             if self.live {
                 self.realign(Self::forward_gap_is_reset(self.next, &self.media))?;
             } else {
-                return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
+                return Err(ProbeError::WindowLost);
             }
         }
         if self.current_index()?.is_some() {
@@ -412,7 +412,11 @@ impl<F: Fetch> HlsStream<F> {
     }
     fn current_index(&self) -> Result<Option<usize>, ProbeError> {
         if self.next < self.media.media_sequence {
-            return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
+            return Err(if self.live {
+                ProbeError::InvalidPlaylist
+            } else {
+                ProbeError::WindowLost
+            });
         }
         let index = usize::try_from(self.next - self.media.media_sequence)
             .map_err(|_| ProbeError::InvalidPlaylist)?;
@@ -729,7 +733,7 @@ impl<F: Fetch> HlsStream<F> {
                 self.realign(reset)?;
             }
         } else if self.next < self.media.media_sequence {
-            return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
+            return Err(ProbeError::WindowLost);
         }
         Ok(wait)
     }
@@ -1129,7 +1133,14 @@ mod tests {
                 source.poll(Instant::now()).unwrap(),
                 Next::Segment(_)
             ));
-            assert!(source.poll(Instant::now()).is_err());
+            let error = expect_err(source.poll(Instant::now()));
+            if first < 10 {
+                assert!(matches!(error, ProbeError::InvalidPlaylist));
+            } else {
+                assert!(matches!(error, ProbeError::WindowLost));
+                assert_eq!(error.to_string(), ProbeError::WINDOW_LOST);
+            }
+            assert_eq!(source.next, 11);
             assert_eq!(source.http.skipped.get(), 0);
             assert_eq!(source.http.resets.get(), 0);
             assert!(source.http.steps.borrow().is_empty());
@@ -2208,12 +2219,45 @@ mod tests {
             false,
         );
         let error = expect_err(lost.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::WindowLost));
+        assert_eq!(error.to_string(), ProbeError::WINDOW_LOST);
+        assert!(!matches!(error, ProbeError::InvalidPlaylist));
         assert!(
-            error
+            !error
                 .to_string()
-                .contains("未取得セグメントが配信窓から消失")
+                .contains("HLSプレイリストまたはサンプルの構造が不正")
         );
         assert_eq!(lost.next, 11);
         assert_eq!(lost.http.skipped.get(), 0);
+    }
+    #[test]
+    fn timefree_lost_window_is_window_lost_and_does_not_skip_ahead() {
+        let mut source = reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![1]),
+                ("/audio/media.m3u8", media(12, 1, false, "b", false)),
+            ],
+        );
+        assert!(matches!(
+            source.poll(Instant::now()).unwrap(),
+            Next::Segment(_)
+        ));
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::WindowLost));
+        assert_eq!(
+            error.to_string(),
+            "通信が途切れている間に、この部分が配信窓から外れました。番組を選び直すと再生できます"
+        );
+        assert_eq!(error.to_string(), ProbeError::WINDOW_LOST);
+        assert!(
+            !error
+                .to_string()
+                .contains("HLSプレイリストまたはサンプルの構造が不正・未対応です")
+        );
+        assert_eq!(source.next, 11);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
     }
 }
