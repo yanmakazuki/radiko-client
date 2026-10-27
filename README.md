@@ -32,7 +32,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 ```
 
-通常の `cargo test --workspace` はアカウントにも radiko にも繋ぎません。実配信や音声機器を使う確認は [検証範囲](docs/validation.md) に分けてあります。GitHub Actions の Checks は macos-15 と ubuntu-24.04 で、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--workspace --locked` で実行します。Linux のジョブは先に `libasound2-dev` と `pkg-config` を入れます。ubuntu-24.04 だけ、それに加えて PulseAudio の null sink で `output-info`、`probe-output --mute 3`、ignored の `native_muted` 2 件を実行します。
+通常の `cargo test --workspace` はアカウントにも radiko にも繋ぎません。実配信や音声機器を使う確認は [検証範囲](docs/validation.md) に分けてあります。GitHub Actions の Checks は macos-15 と ubuntu-24.04 で、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--workspace --locked` で実行します。Linux のジョブは先に `libasound2-dev` と `pkg-config` を入れます。音声の経路を変えた pull request では、それとは別の ubuntu-24.04 ワークフローが PulseAudio の null sink で `output-info`、`probe-output --mute 3`、ignored の `native_muted` 2 件を実行します。
 
 ## ライブラリとして使う
 

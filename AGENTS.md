@@ -43,7 +43,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 ```
 
-These build, inspect CLI behavior, check formatting, reject lint warnings, and run tests. For the documented macOS SDK linker failure, prefix Cargo commands with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. On Linux, install pkg-config and the ALSA development files (`libasound2-dev` on Debian and Ubuntu, `alsa-lib-devel` on Fedora) before building. Maintain `Cargo.lock`. The Checks workflow runs on macos-15 and ubuntu-24.04: stable formatting, lints, and Rust/Python tests, plus Rust 1.85.0 tests. Use `--locked` in CI and keep live probes out of automatic jobs. Linux jobs install `libasound2-dev` and `pkg-config` first. An additional ubuntu-24.04 job runs the ignored `native_muted` output tests against a PulseAudio null sink.
+These build, inspect CLI behavior, check formatting, reject lint warnings, and run tests. For the documented macOS SDK linker failure, prefix Cargo commands with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. On Linux, install pkg-config and the ALSA development files (`libasound2-dev` on Debian and Ubuntu, `alsa-lib-devel` on Fedora) before building. Maintain `Cargo.lock`. The Checks workflow runs on macos-15 and ubuntu-24.04: stable formatting, lints, and Rust/Python tests, plus Rust 1.85.0 tests. Use `--locked` in CI and keep live probes out of automatic jobs. Linux jobs install `libasound2-dev` and `pkg-config` first. A separate workflow runs the ignored `native_muted` output tests against a PulseAudio null sink only for pull requests that change the audio path.
 
 ## Coding Style and Domain Rules
 
