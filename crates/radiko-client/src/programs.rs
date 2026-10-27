@@ -1,4 +1,5 @@
 //! 番組一覧CLIの条件解析と表示。取得件数と絞り込み後の件数、取得失敗を区別する。
+use crate::stdout::{self, stdout_ln};
 use chrono::{DateTime, FixedOffset, Utc};
 use radiko::catalog::search::{Filter, ObservedClassifications};
 use radiko::{
@@ -11,6 +12,7 @@ use radiko::{
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const USAGE: &str = "programs STATION [START [END]] [--json] / programs (--areas JP13,JP14 | --all) [START [END]] [--json] [--genre IDS] [--personality IDS] [--keyword TEXT] [--genre-unclassified] [--personality-unclassified] [--classifications]（START・END: YYYYMMDD、両端を含む最大30放送日）";
 struct Request {
@@ -218,7 +220,7 @@ fn restored_request(
 }
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if args == ["--help"] {
-        println!(
+        stdout_ln!(
             "{USAGE}\nprograms --saved NAME [--json] [--classifications] / programs --restore [--json] [--classifications]"
         );
         return Ok(());
@@ -270,14 +272,14 @@ fn print_station_day(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let list = catalog::list_programs(station, request.day)?;
     if request.json {
-        println!(
+        stdout_ln!(
             "{}",
             serde_json::to_string_pretty(&snapshot(&list, now, &request.filter)?)?
         );
     } else {
         print_list(&list, now, &request.filter)?;
         if request.classifications {
-            print_classifications(&ObservedClassifications::collect(&list.programs));
+            print_classifications(&ObservedClassifications::collect(&list.programs))?;
         }
     }
     if list.invalid_count > 0 {
@@ -291,6 +293,7 @@ fn acquire_range(
     now: DateTime<FixedOffset>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = catalog::CatalogClient::new()?;
+    let cancel = AtomicBool::new(false);
     let mut display_error = None;
     let mut on_progress = |progress: radiko::catalog::Progress<'_>| {
         eprintln!(
@@ -302,29 +305,42 @@ fn acquire_range(
             progress.target,
             progress.day.map(|day| day.to_string()).unwrap_or_default()
         );
-        if !request.json {
+        if !request.json && display_error.is_none() {
             if let Some(list) = progress.list {
                 if let Err(error) = print_list(list, now, &request.filter) {
+                    if stdout::is_closed(error.as_ref()) {
+                        cancel.store(true, Ordering::Release);
+                    }
                     display_error = Some(error);
                 }
             }
         }
     };
-    let report = if let Some(station) = &request.station {
-        radiko::catalog::acquire_stations(
+    let fetched = if let Some(station) = &request.station {
+        radiko::catalog::acquire_stations_controlled(
             &client,
             std::slice::from_ref(station),
             &request.range,
+            &cancel,
             &mut on_progress,
-        )?
+        )
     } else {
-        radiko::catalog::acquire_range(&client, &request.areas, &request.range, &mut on_progress)?
+        radiko::catalog::acquire_range_controlled(
+            &client,
+            &request.areas,
+            &request.range,
+            &cancel,
+            &mut on_progress,
+        )
     };
-    if let Some(error) = display_error {
-        return Err(error);
+    match display_error {
+        Some(error) if stdout::is_closed(error.as_ref()) => return Err(error),
+        Some(error) if fetched.is_ok() => return Err(error),
+        _ => {}
     }
+    let report = fetched?;
     if request.json {
-        println!(
+        stdout_ln!(
             "{}",
             serde_json::to_string_pretty(&report_snapshot(
                 &report,
@@ -334,7 +350,7 @@ fn acquire_range(
             )?)?
         );
     } else {
-        println!(
+        stdout_ln!(
             "{} / 放送日 {}〜{} / 局一覧成功: {}/{}地域 / 番組表成功: {}/{}局・日",
             if report.complete() {
                 "取得完了"
@@ -366,7 +382,7 @@ fn acquire_range(
     if !request.json && request.classifications {
         print_classifications(&ObservedClassifications::collect(
             report.lists.iter().flat_map(|list| &list.programs),
-        ));
+        ))?;
     }
     if !report.complete() {
         return Err("取得結果に欠落があります。同じコマンドの再実行で全件を再取得できます".into());
@@ -377,20 +393,24 @@ fn acquire_range(
 fn observed_snapshot(observed: &ObservedClassifications) -> Value {
     json!({"scope":"observed_in_current_acquisition", "program_genres":classes(&observed.program_genres), "personality_genres":classes(&observed.personality_genres), "unclassified_programs":observed.unclassified_programs, "unclassified_personalities":observed.unclassified_personalities})
 }
-fn print_classifications(observed: &ObservedClassifications) {
-    println!("今回の取得範囲で観測した分類（全分類を保証しません）");
+fn print_classifications(
+    observed: &ObservedClassifications,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stdout_ln!("今回の取得範囲で観測した分類（全分類を保証しません）");
     for (label, items) in [
         ("番組ジャンル", &observed.program_genres),
         ("出演者分類", &observed.personality_genres),
     ] {
         for class in items {
-            println!("{}: {} / {}", label, class.id, class.name);
+            stdout_ln!("{}: {} / {}", label, class.id, class.name);
         }
     }
-    println!(
+    stdout_ln!(
         "未分類: 番組ジャンル{}枠 / 出演者分類{}枠",
-        observed.unclassified_programs, observed.unclassified_personalities
+        observed.unclassified_programs,
+        observed.unclassified_personalities
     );
+    Ok(())
 }
 
 fn report_snapshot(
@@ -426,29 +446,31 @@ fn print_list(
     filter: &Filter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let value = snapshot(list, now, filter)?;
-    println!(
+    stdout_ln!(
         "{} ({}) / 放送日 {} / 日本時間（実行時点の状態）",
-        list.station_name, list.station_id, list.broadcast_day
+        list.station_name,
+        list.station_id,
+        list.broadcast_day
     );
     for item in value["programs"]
         .as_array()
         .ok_or("一覧の生成に失敗しました")?
     {
-        println!(
+        stdout_ln!(
             "{}–{} [{}] {}",
             item["starts_at"].as_str().unwrap_or_default(),
             item["ends_at"].as_str().unwrap_or_default(),
             item["status_label"].as_str().unwrap_or_default(),
             item["title"].as_str().unwrap_or_default()
         );
-        println!(
+        stdout_ln!(
             "  出演: {} / 番組ジャンル: {} / 出演者分類: {}",
             item["performer"].as_str().unwrap_or_default(),
             labels(item["program_genres"].as_array()),
             labels(item["personality_genres"].as_array())
         );
     }
-    println!(
+    stdout_ln!(
         "一致{}件 / 取得{}件 / 不正・日付不一致: {}件 / 重複: {}件 / 全件: 再生可否未確認",
         value["matched_program_count"],
         list.programs.len(),
