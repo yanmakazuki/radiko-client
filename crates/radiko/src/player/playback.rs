@@ -1448,6 +1448,7 @@ mod tests {
                 underrun_frames: 0,
                 sample_rate: self.rate,
                 channels: self.channels,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
             }
         }
         fn poll(&mut self) -> Result<bool, OutputError> {
@@ -1793,6 +1794,7 @@ mod tests {
                     underrun_frames: self.polls * 17,
                     sample_rate: 24_000,
                     channels: 1,
+                    sample_format: crate::player::output::OutputSampleFormat::F32,
                 }
             }
             fn poll(&mut self) -> Result<bool, OutputError> {

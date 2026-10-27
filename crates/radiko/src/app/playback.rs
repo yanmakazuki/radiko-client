@@ -554,6 +554,7 @@ mod tests {
                 underrun_frames: 0,
                 sample_rate: 48000,
                 channels: 2,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
             }),
         };
         assert_eq!(
@@ -812,6 +813,7 @@ mod tests {
                 underrun_frames: 0,
                 sample_rate: self.rate,
                 channels: self.channels,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
             }
         }
         fn poll(&mut self) -> Result<bool, crate::player::output::OutputError> {
