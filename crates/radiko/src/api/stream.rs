@@ -38,6 +38,7 @@ pub enum ProbeError {
     Cancelled,
     Http(u16),
     Authentication,
+    AuthExpired,
     Denied,
     NotFound,
     RateLimited,
@@ -70,6 +71,9 @@ impl fmt::Display for ProbeError {
                 Self::Network => "配信の検証中に通信に失敗しました",
                 Self::Authentication => {
                     "配信認証が拒否されました。sessionで会員認証を確認してください"
+                }
+                Self::AuthExpired => {
+                    "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
                 }
                 Self::Denied => {
                     "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）"

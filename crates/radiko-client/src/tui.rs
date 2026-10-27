@@ -113,6 +113,7 @@ struct Screen {
     chapter_notice: String,
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
+    seen_reauthentications: u64,
     playback_diagnostics: String,
     pipeline_diagnostics: String,
     volume: u32,
@@ -153,6 +154,7 @@ impl Screen {
             chapter_notice: String::new(),
             playback_action: None,
             playback_notice: String::new(),
+            seen_reauthentications: 0,
             playback_diagnostics: String::new(),
             pipeline_diagnostics: String::new(),
             volume: 25,
@@ -228,6 +230,7 @@ impl Screen {
             self.playback_diagnostics.clear();
             self.pipeline_diagnostics.clear();
             self.playback_notice.clear();
+            self.seen_reauthentications = 0;
         }
         if let Some(snapshot) = &update.snapshot {
             self.pipeline_diagnostics = snapshot
@@ -246,6 +249,13 @@ impl Screen {
             self.playback_diagnostics =
                 format!("直近通知（終了時未集計）: {}", self.playback_diagnostics);
         }
+        let renewed = update
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.pipeline.as_ref())
+            .and_then(|pipeline| pipeline.http)
+            .map(|http| http.reauthentications)
+            .filter(|count| *count > self.seen_reauthentications);
         if update.ended {
             if !self.pipeline_diagnostics.is_empty() {
                 self.pipeline_diagnostics = self
@@ -258,6 +268,14 @@ impl Screen {
             self.app.playback = None;
         } else if let Some(snapshot) = update.snapshot {
             self.app.playback = Some(snapshot);
+        }
+        if let Some(count) = renewed {
+            self.seen_reauthentications = count;
+            if !self.playback_notice.contains("再生停止")
+                && !self.playback_notice.contains("認証期限切れ")
+            {
+                self.playback_notice = "配信認証を更新して再生を続けます".into();
+            }
         }
         if let Some(notice) = update.notice {
             self.playback_notice = notice;
@@ -1103,6 +1121,16 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
         panes[2],
     );
 }
+fn auth_header_line(screen: &Screen) -> String {
+    let summary = screen.app.authentication.status.summary();
+    if screen.playback_notice.contains("認証期限切れ") {
+        format!("{summary} / 再生側で認証失敗 / a 再確認")
+    } else if screen.playback_notice.contains("配信認証を更新") {
+        format!("{summary} / 配信認証を更新して継続")
+    } else {
+        summary.to_owned()
+    }
+}
 fn draw_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, area: Rect) {
     let scope = match screen.app.committed.scope() {
         Scope::Nationwide => "全国".into(),
@@ -1131,7 +1159,7 @@ fn draw_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, a
             filter.personality_genres(),
             filter.unclassified_personality()
         ),
-        screen.app.authentication.status.summary(),
+        auth_header_line(screen),
         screen.app.authentication.status.detail()
     );
     frame.render_widget(
@@ -2370,6 +2398,116 @@ mod tests {
         assert_eq!(screen.input.as_deref(), Some("a"));
     }
     #[test]
+    fn playback_auth_failure_and_renewal_show_in_the_header() {
+        use radiko::player::diagnostics::{Snapshot, Stage};
+        let mut screen = screen();
+        screen.app.authentication.status =
+            radiko::app::auth::Status::Verified(radiko::session::Membership {
+                area_free: Some(true),
+                time_free_30: Some(false),
+            });
+        let expired = format!(
+            "再生停止: {}",
+            radiko::player::playback::PlaybackError::Source(radiko::api::stream::ProbeError::At(
+                "HLS一覧更新",
+                Box::new(radiko::api::stream::ProbeError::AuthExpired),
+            ))
+        );
+        assert!(expired.contains("認証期限切れ"));
+        assert!(!expired.contains("synthetic"));
+        screen.playback_notice = expired;
+        let now = Utc::now().fixed_offset();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let text = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            let mut shown = String::new();
+            for row in buffer.content.chunks(usize::from(buffer.area.width)) {
+                let mut x = 0;
+                while x < row.len() {
+                    let symbol = row[x].symbol();
+                    shown.push_str(symbol);
+                    x += ratatui::text::Span::raw(symbol).width().max(1);
+                }
+            }
+            shown
+        };
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let shown = text(&terminal).replace(' ', "");
+        assert!(shown.contains("再生側で認証失敗"), "{shown}");
+        assert!(shown.contains("a再確認"), "{shown}");
+        assert!(shown.contains("認証期限切れ"), "{shown}");
+        assert!(shown.contains("ログイン確認済み"), "{shown}");
+        let info = radiko::api::stream::playback::StreamInfo {
+            title: Some("枠".into()),
+            station: "TBS".into(),
+            mode: radiko::api::stream::ProbeMode::Live,
+            starts_at: now,
+            ends_at: now + chrono::Duration::hours(1),
+            position: Duration::ZERO,
+        };
+        screen.playback_notice.clear();
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(radiko::player::state::PlaybackSnapshot {
+                info,
+                state: PlaybackState::Playing,
+                pending: None,
+                volume: 25,
+                position: None,
+                output: None,
+                segments: 1,
+                pipeline: Some(Snapshot {
+                    stage: Stage::Acquisition,
+                    elapsed: Duration::from_millis(1),
+                    acquisition_max: Duration::ZERO,
+                    acquisition_max_pcm_start: Duration::ZERO,
+                    acquisition_max_pcm_min: Duration::ZERO,
+                    decode_max: Duration::ZERO,
+                    decode_last: Duration::ZERO,
+                    media_last: Duration::ZERO,
+                    decoded_segments: 1,
+                    waiting_pcm_segments: 0,
+                    waiting_pcm_media: Duration::ZERO,
+                    http: Some(radiko::api::stream::playback::RequestSnapshot {
+                        stage: radiko::api::stream::playback::RequestStage::Idle,
+                        response_status: Some(200),
+                        elapsed: Duration::ZERO,
+                        headers_max: Duration::ZERO,
+                        body_max: Duration::ZERO,
+                        attempts: 2,
+                        retry_waits: 0,
+                        network_failures: 0,
+                        timeouts: 0,
+                        connect_failures: 0,
+                        reauthentications: 1,
+                    }),
+                }),
+            }),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(screen.playback_notice, "配信認証を更新して再生を続けます");
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let shown = text(&terminal).replace(' ', "");
+        assert!(shown.contains("配信認証を更新して継続"), "{shown}");
+        assert!(shown.contains("再認証1"), "{shown}");
+        screen.apply_playback(radiko::app::playback::Update {
+            notice: Some(
+                "再生停止: HLS音声取得: 認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
+                    .into(),
+            ),
+            ..radiko::app::playback::Update::default()
+        });
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let shown = text(&terminal).replace(' ', "");
+        assert!(shown.contains("再生側で認証失敗"), "{shown}");
+        assert!(!shown.contains("配信認証を更新して継続"), "{shown}");
+    }
+    #[test]
     fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
         use radiko::player::diagnostics::{Snapshot, Stage};
         let mut screen = screen();
@@ -2426,6 +2564,7 @@ mod tests {
                     network_failures: 2,
                     timeouts: 1,
                     connect_failures: 1,
+                    reauthentications: 0,
                 }),
             }),
         });

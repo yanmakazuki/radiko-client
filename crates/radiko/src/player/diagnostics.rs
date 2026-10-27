@@ -48,9 +48,17 @@ impl Snapshot {
                     RequestStage::Body => "本文受信",
                     RequestStage::RetryWait => "再試行待ち",
                 };
-                let response = http.response_status.map(|status| status.to_string()).unwrap_or_else(|| "未取得".into());
+                let response = http
+                    .response_status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "未取得".into());
+                let renewal = if http.reauthentications > 0 {
+                    format!(" / 再認証{}", http.reauthentications)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "通信診断 {stage}{:.0}ms / 応答max{:.0}ms / 本文max{:.0}ms / 試行{}・再試行待ち{} / 通信失敗{}・期限{}・接続{} / HTTP{response}",
+                    "通信診断 {stage}{:.0}ms / 応答max{:.0}ms / 本文max{:.0}ms / 試行{}・再試行待ち{} / 通信失敗{}・期限{}・接続{} / HTTP{response}{renewal}",
                     http.elapsed.as_secs_f64() * 1000.0,
                     http.headers_max.as_secs_f64() * 1000.0,
                     http.body_max.as_secs_f64() * 1000.0,
@@ -222,5 +230,28 @@ mod tests {
             Duration::from_secs(3)
         );
         assert_eq!(Tracker::new(now).snapshot(now).decoded_segments, 0);
+    }
+    #[test]
+    fn http_label_mentions_reauthentication_only_after_one_completes() {
+        let mut http = crate::api::stream::playback::RequestSnapshot {
+            stage: crate::api::stream::playback::RequestStage::Idle,
+            response_status: Some(200),
+            elapsed: Duration::ZERO,
+            headers_max: Duration::ZERO,
+            body_max: Duration::ZERO,
+            attempts: 1,
+            retry_waits: 0,
+            network_failures: 0,
+            timeouts: 0,
+            connect_failures: 0,
+            reauthentications: 0,
+        };
+        let mut snapshot = Tracker::new(Instant::now()).snapshot(Instant::now());
+        snapshot.http = Some(http);
+        assert!(!snapshot.http_label().contains("再認証"));
+        http.reauthentications = 1;
+        snapshot.http = Some(http);
+        assert!(snapshot.http_label().contains("再認証1"));
+        assert!(!snapshot.http_label().contains("token"));
     }
 }
