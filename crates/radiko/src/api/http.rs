@@ -491,6 +491,7 @@ pub(crate) mod local_http {
         }
     }
     fn read_request(socket: &mut std::net::TcpStream) -> LocalRequest {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut bytes = Vec::new();
         let mut chunk = [0; 1024];
         loop {
@@ -503,7 +504,19 @@ pub(crate) mod local_http {
             match socket.read(&mut chunk) {
                 Ok(0) => panic!("local http client closed before headers"),
                 Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    // macOS keeps an accepted socket nonblocking. Wait for the request.
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "local http request did not arrive"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
                 Err(error) => panic!("local http read: {error}"),
             }
         }
@@ -640,6 +653,52 @@ pub(crate) mod local_http {
 mod tests {
     use super::local_http::{LocalHttp, LocalReply, LoopbackFetch};
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+    };
+
+    /// macOS inherits `O_NONBLOCK` onto accepted sockets. Linux does not.
+    fn accept_blocking(listener: &TcpListener, deadline: std::time::Instant) -> TcpStream {
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "local client never connected"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("local mock accept: {error}"),
+            }
+        };
+        socket.set_nonblocking(false).expect("blocking socket");
+        socket
+    }
+    fn read_some(socket: &mut TcpStream, deadline: std::time::Instant) {
+        let mut request = [0; 1024];
+        loop {
+            match socket.read(&mut request) {
+                Ok(0) => panic!("local mock closed before request"),
+                Ok(_) => return,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "local request did not arrive"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("local mock read: {error}"),
+            }
+        }
+    }
     #[test]
     fn local_mock_http_maps_401_403_and_429_without_retrying() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -689,11 +748,6 @@ mod tests {
     }
     #[test]
     fn local_mock_http_retry_discards_partial_body_and_keeps_numeric_diagnostics() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            thread,
-        };
         for partial in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -701,21 +755,11 @@ mod tests {
             let server = thread::spawn(move || {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
                 for attempt in 0..2 {
-                    let mut socket = loop {
-                        match listener.accept() {
-                            Ok((socket, _)) => break socket,
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                assert!(std::time::Instant::now() < deadline);
-                                thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(error) => panic!("local mock accept: {error}"),
-                        }
-                    };
+                    let mut socket = accept_blocking(&listener, deadline);
                     socket
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
-                    let mut request = [0; 1024];
-                    assert!(socket.read(&mut request).unwrap() > 0);
+                    read_some(&mut socket, deadline);
                     let response: &[u8] = if attempt == 1 {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
                     } else if partial {
@@ -766,12 +810,7 @@ mod tests {
 
     #[test]
     fn local_mock_http_retains_header_body_timeout_and_404_diagnostics() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            sync::mpsc,
-            thread,
-        };
+        use std::sync::mpsc;
         for status in [None, Some(200), Some(404)] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -779,24 +818,11 @@ mod tests {
             let (release, wait) = mpsc::channel();
             let server = thread::spawn(move || {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                let mut socket = loop {
-                    match listener.accept() {
-                        Ok((socket, _)) => break socket,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "local client never connected"
-                            );
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => panic!("local mock accept: {error}"),
-                    }
-                };
+                let mut socket = accept_blocking(&listener, deadline);
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                let mut request = [0; 1024];
-                assert!(socket.read(&mut request).unwrap() > 0);
+                read_some(&mut socket, deadline);
                 if status == Some(200) {
                     socket
                         .write_all(

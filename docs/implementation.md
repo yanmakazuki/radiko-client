@@ -16,6 +16,8 @@ Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e
 
 同じ Rust 1.99.1 で `cargo +stable test --locked -p radiko --lib local_mock_http -- --test-threads=8` を20回続け、各回4件成功、0件失敗、1回あたり約0.51秒だった。応答しない接続の待ちは250msが2回で、404 のクライアント期限は2秒だが応答はすぐ返る。ポート衝突や待ちによる失敗は出ていない。ワークフローは変えていない。radiko への通信、実トークンの期限切れ、音声の保存、耳での確認はない。
 
+そのあとの GitHub Actions では、ubuntu-24.04 と Rust 1.85.0 の macos-15 は成功し、stable の macos-15 だけが既存2件で失敗した。macOS は非ブロッキングの待受から受け取ったソケットも非ブロッキングのままなので、要求が届く前の `read` が `WouldBlock`（`EAGAIN`）になる。Linux は受け取ったソケットがブロッキングなので、同じテストはそこで待っていた。受け取ったソケットをブロッキングに戻し、`WouldBlock` と `Interrupted` は期限まで読み直すようにした。別ジョブには分けていない。
+
 ## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
 
 対象は `a5b8786` の ignored テスト `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` である。環境は Linux x86_64、Rust 1.99.1、PulseAudio 16.1 の `module-null-sink`（シンク名 `null`、`libasound2-plugins` 経由の ALSA `default`）で、`/dev/snd` はない。ALSA の `null` PCM は使っていない。テストの判定は変えていない。
