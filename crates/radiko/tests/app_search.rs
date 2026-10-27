@@ -76,6 +76,7 @@ fn draft_edit_cancel_and_stale_results_never_change_committed_data_or_playback()
             sample_format: OutputSampleFormat::F32,
         }),
         segments: 1,
+        reconnecting_for: None,
     });
     app.begin_edit();
     app.edit_keyword(Some("入力中".into())).unwrap();

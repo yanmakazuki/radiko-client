@@ -56,6 +56,7 @@ pub enum ProbeError {
     Unavailable,
     InvalidPlaylist,
     NoEndpoint,
+    ReconnectGaveUp,
 }
 impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,6 +97,7 @@ impl fmt::Display for ProbeError {
                 Self::Unavailable => "番組情報でタイムフリー配信対象外とされています",
                 Self::InvalidPlaylist => "HLSプレイリストまたはサンプルの構造が不正・未対応です",
                 Self::NoEndpoint => "対象モードと地域に対応する配信先がありません",
+                Self::ReconnectGaveUp => crate::reconnect::GAVE_UP,
                 Self::Http(_) => unreachable!(),
                 Self::At(..) => unreachable!(),
             }),

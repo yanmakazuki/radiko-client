@@ -2,6 +2,7 @@
 use super::*;
 use crate::api::http::Reply;
 pub use crate::api::http::{RequestMeasurements, RequestSnapshot, RequestStage};
+use crate::reconnect::{BACKOFF_MAX, BACKOFF_START, LIMIT as RECONNECT_LIMIT};
 use std::time::{Duration as Wait, Instant};
 
 #[derive(Clone, Debug)]
@@ -293,6 +294,7 @@ fn live_join_index(media: &m3u8_rs::MediaPlaylist) -> usize {
 const REAUTH_INTERVAL: Wait = Wait::from_secs(20);
 
 type RefreshFn<F> = Box<dyn FnMut(&F) -> Result<HeaderMap, ProbeError> + Send>;
+type RetrySleeper = Box<dyn FnMut(Wait) -> Result<(), ProbeError> + Send>;
 
 fn playback_refresh<F: Fetch + 'static>(token: String) -> RefreshFn<F> {
     Box::new(move |http| {
@@ -327,6 +329,11 @@ struct HlsStream<F> {
     /// One renewal is enough for the current failure. Cleared after a successful poll.
     auth_episode: bool,
     last_reauth: Option<Instant>,
+    /// Grows while a played stream is retrying a transport failure. Reset when a segment is returned.
+    backoff: Wait,
+    reconnect_waited: Wait,
+    /// Tests advance this instead of sleeping. Production leaves it empty and sleeps.
+    sleeper: Option<RetrySleeper>,
 }
 enum Renew {
     Unavailable,
@@ -359,12 +366,19 @@ impl<F: Fetch> HlsStream<F> {
             refresh: None,
             auth_episode: false,
             last_reauth: None,
+            backoff: BACKOFF_START,
+            reconnect_waited: Wait::ZERO,
+            sleeper: None,
         })
     }
     fn poll(&mut self, now: Instant) -> Result<Next, ProbeError> {
         let result = self.poll_at(now);
         if result.is_ok() {
             self.auth_episode = false;
+        }
+        if matches!(result, Ok(Next::Segment(_))) {
+            self.backoff = BACKOFF_START;
+            self.reconnect_waited = Wait::ZERO;
         }
         result
     }
@@ -505,58 +519,84 @@ impl<F: Fetch> HlsStream<F> {
         now: Instant,
     ) -> Result<Option<(Vec<u8>, Url)>, ProbeError> {
         const STAGE: &str = "HLS初期化情報取得";
-        match self
-            .http
-            .get(url.clone(), HeaderMap::new(), TEXT_LIMIT, None, true)
-        {
-            Ok(reply) => Ok(Some((reply.bytes, url))),
-            Err(ProbeError::Authentication) => {
-                self.recover_media(STAGE, now)?;
-                let Some(index) = self.current_index()? else {
-                    return Err(ProbeError::InvalidPlaylist.at(STAGE));
-                };
-                let Some(url) = self.init_url(index)? else {
-                    return Ok(None);
-                };
-                match self
-                    .http
-                    .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
-                {
-                    Ok(reply) => Ok(Some((reply.bytes, url))),
-                    Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
-                    Err(error) => Err(error.at(STAGE)),
+        let mut url = url;
+        loop {
+            match self
+                .http
+                .get(url.clone(), HeaderMap::new(), TEXT_LIMIT, None, true)
+            {
+                Ok(reply) => return Ok(Some((reply.bytes, url))),
+                Err(ProbeError::Authentication) => {
+                    self.recover_media(STAGE, now)?;
+                    let Some(index) = self.current_index()? else {
+                        return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                    };
+                    let Some(url) = self.init_url(index)? else {
+                        return Ok(None);
+                    };
+                    return match self.http.get(
+                        url.clone(),
+                        self.headers.clone(),
+                        TEXT_LIMIT,
+                        None,
+                        true,
+                    ) {
+                        Ok(reply) => Ok(Some((reply.bytes, url))),
+                        Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
+                        Err(error) => Err(error.at(STAGE)),
+                    };
                 }
+                Err(error) if self.can_retry(&error) => {
+                    self.wait_backoff()?;
+                    let reply = self.fetch_playlist()?;
+                    self.install_playlist(reply, now)?;
+                    let Some(index) = self.current_index()? else {
+                        return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                    };
+                    let Some(next) = self.init_url(index)? else {
+                        self.initialization = None;
+                        return Ok(None);
+                    };
+                    url = next;
+                }
+                Err(error) => return Err(error.at(STAGE)),
             }
-            Err(error) => Err(error.at(STAGE)),
         }
     }
     fn fetch_segment_bytes(&mut self, now: Instant) -> Result<(Vec<u8>, usize), ProbeError> {
         const STAGE: &str = "HLS音声取得";
-        let Some(index) = self.current_index()? else {
-            return Err(ProbeError::InvalidPlaylist);
-        };
-        let url = self.segment_url(index)?;
-        match self
-            .http
-            .get(url, HeaderMap::new(), SAMPLE_LIMIT, None, true)
-        {
-            Ok(reply) => Ok((reply.bytes, index)),
-            Err(ProbeError::Authentication) => {
-                self.recover_media(STAGE, now)?;
-                let Some(index) = self.current_index()? else {
-                    return Err(ProbeError::InvalidPlaylist.at(STAGE));
-                };
-                let url = self.segment_url(index)?;
-                match self
-                    .http
-                    .get(url, self.headers.clone(), SAMPLE_LIMIT, None, true)
-                {
-                    Ok(reply) => Ok((reply.bytes, index)),
-                    Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
-                    Err(error) => Err(error.at(STAGE)),
+        loop {
+            let Some(index) = self.current_index()? else {
+                return Err(ProbeError::InvalidPlaylist);
+            };
+            let url = self.segment_url(index)?;
+            match self
+                .http
+                .get(url, HeaderMap::new(), SAMPLE_LIMIT, None, true)
+            {
+                Ok(reply) => return Ok((reply.bytes, index)),
+                Err(ProbeError::Authentication) => {
+                    self.recover_media(STAGE, now)?;
+                    let Some(index) = self.current_index()? else {
+                        return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                    };
+                    let url = self.segment_url(index)?;
+                    return match self
+                        .http
+                        .get(url, self.headers.clone(), SAMPLE_LIMIT, None, true)
+                    {
+                        Ok(reply) => Ok((reply.bytes, index)),
+                        Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
+                        Err(error) => Err(error.at(STAGE)),
+                    };
                 }
+                Err(error) if self.can_retry(&error) => {
+                    self.wait_backoff()?;
+                    let reply = self.fetch_playlist()?;
+                    self.install_playlist(reply, now)?;
+                }
+                Err(error) => return Err(error.at(STAGE)),
             }
-            Err(error) => Err(error.at(STAGE)),
         }
     }
     fn segment_url(&self, index: usize) -> Result<Url, ProbeError> {
@@ -637,25 +677,34 @@ impl<F: Fetch> HlsStream<F> {
     fn fetch_playlist(&mut self) -> Result<Reply, ProbeError> {
         const STAGE: &str = "HLS一覧更新";
         let url = self.url.clone();
-        match self
-            .http
-            .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
-        {
-            Ok(reply) => Ok(reply),
-            Err(ProbeError::Authentication) => match self.renew(STAGE)? {
-                Renew::Unavailable => Err(ProbeError::Authentication.at(STAGE)),
-                Renew::Refreshed | Renew::Reused => {
-                    match self
-                        .http
-                        .get(url, self.headers.clone(), TEXT_LIMIT, None, true)
-                    {
-                        Ok(reply) => Ok(reply),
-                        Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
-                        Err(error) => Err(error.at(STAGE)),
+        loop {
+            match self
+                .http
+                .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
+            {
+                Ok(reply) => return Ok(reply),
+                Err(ProbeError::Authentication) => match self.renew(STAGE)? {
+                    Renew::Unavailable => return Err(ProbeError::Authentication.at(STAGE)),
+                    Renew::Refreshed | Renew::Reused => {
+                        match self.http.get(
+                            url.clone(),
+                            self.headers.clone(),
+                            TEXT_LIMIT,
+                            None,
+                            true,
+                        ) {
+                            Ok(reply) => return Ok(reply),
+                            Err(ProbeError::Authentication) => {
+                                return Err(ProbeError::AuthExpired.at(STAGE));
+                            }
+                            Err(error) if self.can_retry(&error) => self.wait_backoff()?,
+                            Err(error) => return Err(error.at(STAGE)),
+                        }
                     }
-                }
-            },
-            Err(error) => Err(error.at(STAGE)),
+                },
+                Err(error) if self.can_retry(&error) => self.wait_backoff()?,
+                Err(error) => return Err(error.at(STAGE)),
+            }
         }
     }
     // Sequence numbers, not changing signed URLs, decide which segment is new.
@@ -748,6 +797,53 @@ impl<F: Fetch> HlsStream<F> {
         self.pending_discontinuity = true;
         self.initialization = None;
         Ok(())
+    }
+    /// Startup failures stay immediate. A segment already handed to the player may be retried.
+    fn can_retry(&self, error: &ProbeError) -> bool {
+        self.last_played.is_some() && retryable_transport(error)
+    }
+    fn wait_backoff(&mut self) -> Result<(), ProbeError> {
+        if self.http.cancelled() {
+            return Err(ProbeError::Cancelled);
+        }
+        if self.reconnect_waited >= RECONNECT_LIMIT || self.backoff.is_zero() {
+            return Err(ProbeError::ReconnectGaveUp);
+        }
+        let room = RECONNECT_LIMIT - self.reconnect_waited;
+        let step = self.backoff.min(BACKOFF_MAX).min(room);
+        if step.is_zero() {
+            return Err(ProbeError::ReconnectGaveUp);
+        }
+        if let Some(sleeper) = self.sleeper.as_mut() {
+            sleeper(step)?;
+        } else {
+            self.sleep_interruptible(step)?;
+        }
+        self.reconnect_waited = self.reconnect_waited.saturating_add(step);
+        self.backoff = self.backoff.saturating_mul(2).min(BACKOFF_MAX);
+        Ok(())
+    }
+    fn sleep_interruptible(&self, delay: Wait) -> Result<(), ProbeError> {
+        let end = Instant::now() + delay;
+        while Instant::now() < end {
+            if self.http.cancelled() {
+                return Err(ProbeError::Cancelled);
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(Wait::from_millis(10)));
+        }
+        if self.http.cancelled() {
+            return Err(ProbeError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
+fn retryable_transport(error: &ProbeError) -> bool {
+    match error {
+        ProbeError::At(_, inner) => retryable_transport(inner),
+        ProbeError::Network | ProbeError::Http(408) | ProbeError::Http(500..=599) => true,
+        _ => false,
     }
 }
 
@@ -1852,5 +1948,272 @@ mod tests {
         assert_eq!(source.http.auth_calls.get(), 1);
         assert!(matches!(source.poll(Instant::now()).unwrap(), Next::End));
         assert!(source.http.steps.borrow().is_empty());
+    }
+
+    struct OutageFetch {
+        waited: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        until: Wait,
+        playlist: Vec<u8>,
+        authentication: bool,
+        cancel: bool,
+        calls: Cell<usize>,
+        audio: RefCell<Vec<String>>,
+        skipped: Cell<u64>,
+        resets: Cell<u64>,
+        at_head: Cell<bool>,
+    }
+    impl Fetch for OutageFetch {
+        fn note_skipped_segments(&self, count: u64) {
+            self.skipped.set(self.skipped.get().saturating_add(count));
+        }
+        fn note_sequence_reset(&self) {
+            self.resets.set(self.resets.get() + 1);
+        }
+        fn note_joined_window_head(&self, at_head: bool) {
+            self.at_head.set(at_head);
+        }
+        fn cancelled(&self) -> bool {
+            self.cancel
+        }
+        fn get(
+            &self,
+            url: Url,
+            _: HeaderMap,
+            _: usize,
+            _: Option<(u64, u64)>,
+            _: bool,
+        ) -> Result<Reply, ProbeError> {
+            if url.path().ends_with(".aac") {
+                self.audio.borrow_mut().push(url.path().to_owned());
+                return Ok(Reply {
+                    headers: HeaderMap::new(),
+                    bytes: vec![1],
+                    url,
+                });
+            }
+            self.calls.set(self.calls.get() + 1);
+            if self.authentication {
+                return Err(ProbeError::Authentication);
+            }
+            let waited = Wait::from_millis(self.waited.load(std::sync::atomic::Ordering::Relaxed));
+            if waited < self.until {
+                return Err(ProbeError::Network);
+            }
+            Ok(Reply {
+                headers: HeaderMap::new(),
+                bytes: self.playlist.clone(),
+                url,
+            })
+        }
+    }
+    fn outage(
+        live: bool,
+        until: Wait,
+        playlist: Vec<u8>,
+        authentication: bool,
+        cancel: bool,
+    ) -> HlsStream<OutageFetch> {
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = waited.clone();
+        let mut source = HlsStream::new(
+            OutageFetch {
+                waited,
+                until,
+                playlist,
+                authentication,
+                cancel,
+                calls: Cell::new(0),
+                audio: RefCell::new(Vec::new()),
+                skipped: Cell::new(0),
+                resets: Cell::new(0),
+                at_head: Cell::new(false),
+            },
+            Url::parse("https://radiko.jp/audio/media.m3u8").unwrap(),
+            HeaderMap::new(),
+            parsed(&media(10, 1, false, "a", false)),
+            Some("mp4a.40.2".into()),
+        )
+        .unwrap();
+        source.live = live;
+        source.sleeper = Some(Box::new(move |step| {
+            clock.fetch_add(
+                u64::try_from(step.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(())
+        }));
+        let Next::Segment(first) = source.poll(Instant::now()).unwrap() else {
+            panic!("the first segment is already in the playlist");
+        };
+        assert_eq!(first.bytes, vec![1]);
+        assert!(!first.discontinuity);
+        source
+    }
+    fn next_segment<F: Fetch>(source: &mut HlsStream<F>) -> Segment {
+        match source.poll(Instant::now()) {
+            Ok(Next::Segment(segment)) => segment,
+            Ok(Next::Pending(_)) => panic!("expected a segment, playlist reload is still waiting"),
+            Ok(Next::End) => panic!("expected a segment, playlist ended"),
+            Err(error) => panic!("expected a segment, got {error}"),
+        }
+    }
+    fn expect_err(result: Result<Next, ProbeError>) -> ProbeError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected a playlist error"),
+        }
+    }
+    fn waited(source: &HlsStream<OutageFetch>) -> Wait {
+        Wait::from_millis(
+            source
+                .http
+                .waited
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    #[test]
+    fn live_outage_of_twenty_seconds_rejoins_the_window_head_with_the_cumulative_skip() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(20),
+            media(13, 3, false, "b", false),
+            false,
+            false,
+        );
+        let segment = next_segment(&mut source);
+        assert_eq!(segment.bytes, vec![1]);
+        assert!(segment.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert!(source.http.at_head.get());
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(waited(&source) >= Wait::from_secs(20));
+        assert!(waited(&source) < crate::reconnect::LIMIT);
+        assert_eq!(source.next, 14);
+        let audio = source.http.audio.borrow().clone();
+        assert!(audio.iter().any(|path| path.ends_with("/s10.aac")));
+        assert!(audio.iter().any(|path| path.ends_with("/s13.aac")));
+        assert!(
+            audio
+                .iter()
+                .all(|path| !path.ends_with("/s11.aac") && !path.ends_with("/s12.aac"))
+        );
+    }
+    #[test]
+    fn live_outage_of_ninety_seconds_rejoins_near_the_live_edge() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(90),
+            media(13, 6, false, "b", false),
+            false,
+            false,
+        );
+        let segment = next_segment(&mut source);
+        assert!(segment.discontinuity);
+        assert_eq!(source.http.skipped.get(), 5);
+        assert!(!source.http.at_head.get());
+        assert_eq!(source.next, 17);
+        assert!(waited(&source) >= Wait::from_secs(90));
+        assert!(waited(&source) < crate::reconnect::LIMIT);
+    }
+    #[test]
+    fn playlist_retry_waits_grow_until_the_cap_and_the_limit_uses_the_reselect_wording() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(10_000),
+            media(13, 3, false, "b", false),
+            false,
+            false,
+        );
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = steps.clone();
+        let clock = source.http.waited.clone();
+        source.sleeper = Some(Box::new(move |step| {
+            recorded.lock().unwrap().push(step);
+            clock.fetch_add(
+                u64::try_from(step.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(())
+        }));
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::ReconnectGaveUp));
+        assert!(error.to_string().contains("番組を選び直して"));
+        assert!(waited(&source) >= crate::reconnect::LIMIT);
+        assert_eq!(source.next, 11);
+        assert_eq!(source.http.skipped.get(), 0);
+        let steps = steps.lock().unwrap().clone();
+        assert_eq!(
+            steps[..4],
+            [
+                Wait::from_secs(1),
+                Wait::from_secs(2),
+                Wait::from_secs(4),
+                Wait::from_secs(8),
+            ]
+        );
+        assert!(steps[4..].iter().all(|step| *step <= Wait::from_secs(10)));
+        assert!(steps.iter().any(|step| *step == Wait::from_secs(10)));
+    }
+    #[test]
+    fn authentication_failure_during_playback_is_not_retried() {
+        let mut source = outage(true, Wait::ZERO, Vec::new(), true, false);
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(
+            matches!(error, ProbeError::At(_, inner) if matches!(inner.as_ref(), ProbeError::Authentication))
+        );
+        assert_eq!(source.http.calls.get(), 1);
+        assert_eq!(waited(&source), Wait::ZERO);
+        assert_eq!(source.next, 11);
+    }
+    #[test]
+    fn cancellation_interrupts_a_playlist_retry_without_waiting() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(20),
+            media(13, 1, false, "b", false),
+            false,
+            true,
+        );
+        source.sleeper = None;
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::Cancelled));
+        assert_eq!(waited(&source), Wait::ZERO);
+    }
+    #[test]
+    fn timefree_outage_resumes_the_same_sequence_and_a_lost_window_does_not_skip() {
+        let mut source = outage(
+            false,
+            Wait::from_secs(20),
+            media(11, 1, false, "b", false),
+            false,
+            false,
+        );
+        let segment = next_segment(&mut source);
+        assert!(!segment.discontinuity);
+        assert_eq!(source.next, 12);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert!(
+            source
+                .http
+                .audio
+                .borrow()
+                .iter()
+                .any(|path| path.ends_with("/s11.aac"))
+        );
+        let mut lost = outage(
+            false,
+            Wait::from_secs(60),
+            media(30, 1, false, "b", false),
+            false,
+            false,
+        );
+        let error = expect_err(lost.poll(Instant::now()));
+        assert!(
+            error
+                .to_string()
+                .contains("未取得セグメントが配信窓から消失")
+        );
+        assert_eq!(lost.next, 11);
+        assert_eq!(lost.http.skipped.get(), 0);
     }
 }

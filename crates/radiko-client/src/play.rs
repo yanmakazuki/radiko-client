@@ -353,6 +353,7 @@ mod tests {
             position: None,
             output: None,
             segments: 0,
+            reconnecting_for: None,
         };
         let text = describe(&p);
         for expected in [
