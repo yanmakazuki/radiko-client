@@ -299,7 +299,7 @@ impl Screen {
                 && !self.playback_notice.contains("配信認証を更新")
             {
                 self.playback_notice = if at_head {
-                    format!("配信の先頭に戻りました（飛ばしたセグメントは累計{skipped}）")
+                    format!("配信窓の先頭から再開しました（累計{skipped}）")
                 } else {
                     format!("ライブ端に追いつきました（飛ばしたセグメントは累計{skipped}）")
                 };
@@ -2595,7 +2595,7 @@ mod tests {
         screen.apply_playback(update(2, 0, true));
         assert_eq!(
             screen.playback_notice,
-            "配信の先頭に戻りました（飛ばしたセグメントは累計2）"
+            "配信窓の先頭から再開しました（累計2）"
         );
         assert!(screen.pipeline_diagnostics.contains("飛ばしたセグメント2"));
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
@@ -2610,7 +2610,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>()
             .replace(' ', "");
-        assert!(shown.contains("配信の先頭に戻りました"), "{shown}");
+        assert!(shown.contains("配信窓の先頭から再開しました"), "{shown}");
+        assert!(shown.contains("累計2"), "{shown}");
         assert!(shown.contains("飛ばしたセグメント2"), "{shown}");
         screen.apply_playback(update(4, 0, false));
         assert_eq!(
@@ -2633,7 +2634,7 @@ mod tests {
         screen.apply_playback(update(4, 1, true));
         assert_eq!(
             screen.playback_notice,
-            "配信の先頭に戻りました（飛ばしたセグメントは累計4）"
+            "配信窓の先頭から再開しました（累計4）"
         );
         assert!(screen.pipeline_diagnostics.contains("通し番号の巻き戻り1"));
         screen.playback_notice = "配信認証を更新して再生を続けます".into();
