@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "番組表、認証、再生、保存を扱う radiko クライアントライブラリ"
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]
