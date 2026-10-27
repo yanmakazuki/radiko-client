@@ -12,7 +12,9 @@
 
 `local_mock_http` は4件である。これまでのタイムアウトと再試行の2件に加え、401・403・429 を再試行せず対応するエラーにすること、プレイリストの 401 のあと `authenticate` を1回通して同じ枠の次のセグメントまで続くことを、ローカルの HTTP サーバーで確認する。後者は、期限切れのトークンで 401、会員セッションで auth1 と auth2、新しいトークンでプレイリストの取り直し、までを1本の TCP 上の HTTP で行う。トークンは合成値で、エラー文言には出さない。
 
-Linux x86_64、Rust 1.99.1 で `cargo +stable test --locked -p radiko --lib local_mock_http -- --test-threads=8` を20回続け、各回4件成功、0件失敗、1回あたり約0.51秒だった。応答しない接続の待ちは250msが2回で、404 のクライアント期限は2秒だが応答はすぐ返る。ポート衝突や待ちによる失敗は出ていない。`native_muted` の2件は ignored のままである。ワークフローは変えていない。radiko への通信、実トークンの期限切れ、音声の保存、耳での確認はない。
+Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 332 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 332 件成功、失敗 0、ignored 2 件である。
+
+同じ Rust 1.99.1 で `cargo +stable test --locked -p radiko --lib local_mock_http -- --test-threads=8` を20回続け、各回4件成功、0件失敗、1回あたり約0.51秒だった。応答しない接続の待ちは250msが2回で、404 のクライアント期限は2秒だが応答はすぐ返る。ポート衝突や待ちによる失敗は出ていない。ワークフローは変えていない。radiko への通信、実トークンの期限切れ、音声の保存、耳での確認はない。
 
 ## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
 
