@@ -4,6 +4,12 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月27日：ライブの配信窓から遅れても再生を続ける
+
+ライブで、次の通し番号が新しいプレイリストに無いときは止めない。再開位置は、終端から target duration の3倍以内に始まるセグメントのうち最も古いものである。窓全体がその範囲なら先頭の `MEDIA-SEQUENCE` になる。飛ばした通し番号の個数は通信診断の「飛ばしたセグメント」と、TUI の再生通知に出す。CLI の状態表示は同じ通信診断の行である。再開したセグメントは不連続としてデコーダーを作り直す。`MEDIA-SEQUENCE` が小さくなったライブは、配信のリセットとして同じ位置から再開し、回数を「通し番号の巻き戻り」に足す。リセットで捨てた古い番号は飛ばした個数に入れない。タイムフリーの欠落と巻き戻りは失敗のままである。再認証、終了時に出力を先に閉じること、サンプル形式の選択は変えていない。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 333 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 333 件成功、失敗 0、ignored 4 件はそのままである。偽のプレイリストで、通常の進み方、窓から遅れた短い窓と 6 セグメントの窓、通し番号の巻き戻りを確認した。タイムフリーの同じ欠落と巻き戻りは、セグメントを取らずに失敗する。アカウント、radiko への通信、実配信で窓が先に進む再生は確認していない。
+
 ## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
 
 対象は `a5b8786` の ignored テスト `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` である。環境は Linux x86_64、Rust 1.99.1、PulseAudio 16.1 の `module-null-sink`（シンク名 `null`、`libasound2-plugins` 経由の ALSA `default`）で、`/dev/snd` はない。ALSA の `null` PCM は使っていない。テストの判定は変えていない。
