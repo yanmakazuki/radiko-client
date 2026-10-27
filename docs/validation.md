@@ -21,7 +21,7 @@
 | 取り消しと終了 | HTTP の待ちと本文、AAC のパケット前後、部分データの破棄。SIGINT、SIGTERM、SIGHUP で端末復元。終了時は、応答しないローカル HTTP の途中でも出力の破棄が1.5秒以内に返り、準備が5秒ブロックしても同じ | OS の名前解決と、1パケットの復号呼び出し自体は途中で切れない。SIGKILL と、認証の書き込み中の完了は保証しない。再生中の `q` の直後に実機の `output-info` が0になることは未確認 |
 | 出力とコーデック | 純 Rust の AAC/SBR と CPAL。既定と同じ名前の機器を開く。MacBook Air Speakers の無音3秒は不足0。Yamaha URX22 A は無音のあと物理切断で機器エラーになり、接ぎ直し後の無音5秒は不足0。JP1〜JP47 の96局のライブ先頭は `mp4a.40.5` の ADTS で SBR。Linux のカードなしでは「既定の音声出力機器がありません」と `ALSA lib` 0 行。PulseAudio の null sink では `default` の f32・48000Hz・2ch で無音3秒、不足0 | TUI 操作中の切断、失敗した再生の自動再開、他の機器は未確認。実配信の非 ADTS と、PS の明示が真になる例は未確認。Linux の実機再生、i16 だけの機器を開いた再生、PipeWire のデスクトップは未確認 |
 
-自動テストは、2026年10月24日の通常 Rust で305件が成功しています。ミュートの実機4件は ignored のままです。fmt と clippy も成功しています。Rust 1.85 での、その日の再ビルドはしていません。それより前の変更では、Rust 1.85.0 のオフラインテストが成功した記録があります。GitHub Actions は、fragmented AAC より前のコミットで成功を確認し、10月24日の `0f419e5` の Checks はこの要約の時点では未確認です。2026年10月26日に ubuntu-24.04 の同じ検査をワークフローへ足しました。GitHub 上のその実行はまだありません。同日の macOS では、通常 Rust 1.98.1 で fmt、clippy、306件が成功し、ignored 4件はそのままです。同日の Linux、通常 Rust 1.99.1 では、終了時に出力を先に閉じる確認で fmt、clippy、308件が成功し、ignored 4件はそのままです。この確認には音声デバイスがなく、再生と端末の操作確認はしていません。別の確認では、同じ Linux の Rust 1.99.1 で fmt、clippy、312件が成功し、ignored 4件はそのままです。カードなしと PulseAudio の null sink の出力確認は [実装状況](implementation.md) の同日の節です。実機の再生ではありません。macOS の再生結果は Linux の結果にしません。同日の再生中 401 の変更は、Linux の Rust 1.99.1 で fmt、clippy、318件が成功し、ignored 4件はそのままです。モック上の再認証は含みます。radiko の実トークン期限切れと、90分以上のライブでの復旧は、日本からの接続がないため未確認です。2026年10月27日にその変更へ origin/main を取り込み、Linux の Rust 1.99.1 で fmt、clippy、327件、Rust 1.85.0 でテスト 327件が成功しました。どちらも失敗 0、ignored 4件です。同日の検証スクリプトの Linux 対応は、Linux の Rust 1.99.1 で fmt、clippy、327件が成功し、失敗 0、ignored 4件です。Python の検証スクリプトテストは 63 件成功です。機器なしの `output-info` は終了 1、「エラー: 既定の音声出力機器がありません」の1行で、`ALSA lib` は 0 行です。Linux の実機 TUI は実行していません。詳細は [実装状況](implementation.md) の同日の節です。
+自動テストは、2026年10月24日の通常 Rust で305件が成功しています。ミュートの実機4件は ignored のままです。fmt と clippy も成功しています。Rust 1.85 での、その日の再ビルドはしていません。それより前の変更では、Rust 1.85.0 のオフラインテストが成功した記録があります。GitHub Actions は、fragmented AAC より前のコミットで成功を確認し、10月24日の `0f419e5` の Checks はこの要約の時点では未確認です。2026年10月26日に ubuntu-24.04 の同じ検査をワークフローへ足しました。GitHub 上のその実行はまだありません。同日の macOS では、通常 Rust 1.98.1 で fmt、clippy、306件が成功し、ignored 4件はそのままです。同日の Linux、通常 Rust 1.99.1 では、終了時に出力を先に閉じる確認で fmt、clippy、308件が成功し、ignored 4件はそのままです。この確認には音声デバイスがなく、再生と端末の操作確認はしていません。別の確認では、同じ Linux の Rust 1.99.1 で fmt、clippy、312件が成功し、ignored 4件はそのままです。カードなしと PulseAudio の null sink の出力確認は [実装状況](implementation.md) の同日の節です。実機の再生ではありません。macOS の再生結果は Linux の結果にしません。同日の再生中 401 の変更は、Linux の Rust 1.99.1 で fmt、clippy、318件が成功し、ignored 4件はそのままです。モック上の再認証は含みます。radiko の実トークン期限切れと、90分以上のライブでの復旧は、日本からの接続がないため未確認です。2026年10月27日にその変更へ origin/main を取り込み、Linux の Rust 1.99.1 で fmt、clippy、327件、Rust 1.85.0 でテスト 327件が成功しました。どちらも失敗 0、ignored 4件です。
 
 ## まだ確認していないこと
 
@@ -66,25 +66,15 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 
 ## 実機の TUI 検証
 
-`scripts/verify_tui_playback.py` は Python 3 の標準ライブラリと Unix の termios を使います。説明は macOS / Linux（Linux は実機未確認）です。2026年10月27日より前に記録した実機実行は macOS だけで、Linux の実機 TUI はまだ実行していません。実行ファイルとセッションを、権限を制限した一時コピーにしてから使います。音声はミュートです。子プロセスは親の制御端末から分離し、指定した PTY の寸法も見ます。番組本文、音声、URL、Cookie、トークンは残しません。通常の `cargo test` からは呼びません。画面に投影したテキストへ `ALSA lib` が混ざると `failed` になり、ライブラリの行そのものは残しません。
+`scripts/verify_tui_playback.py` は Python 3 の標準ライブラリと Unix の termios を使います。実機での実行は macOS だけで、Linux では実行していません。実行ファイルとセッションを、権限を制限した一時コピーにしてから使います。音声はミュートです。子プロセスは親の制御端末から分離し、指定した PTY の寸法も見ます。番組本文、音声、URL、Cookie、トークンは残しません。通常の `cargo test` からは呼びません。
 
 事前にビルドし、有効な保存セッションと、十分な長さの枠を指定します。日付と枠は、そのとき聴けるものへ変えてください。
 
-セッションの既定パスは OS で違います。macOS のパスは変えていません。
-
 ```sh
-# macOS
 python3 scripts/verify_tui_playback.py \
   --session-file "$HOME/Library/Application Support/jp.radiko-client.radiko-client/session.json" \
   --station TBS --date 20261015 --start 20261015120000
-
-# Linux。XDG_DATA_HOME が無ければ ~/.local/share です。
-python3 scripts/verify_tui_playback.py \
-  --session-file "${XDG_DATA_HOME:-$HOME/.local/share}/radiko-client/session.json" \
-  --station TBS --date 20261015 --start 20261015120000
 ```
-
-同じパスは `python3 scripts/verify_host.py session` でも出ます。ファイルは読みません。
 
 よく使う指定は次です。
 
@@ -104,11 +94,11 @@ python3 scripts/verify_tui_playback.py \
 
 `starting` は再生を要求した試行、`playing` は要求した枠とモードで出力秒数が正になった状態です。出力0の停止は開始成功にしません。終了 JSON には完了、不足、端末復元、ビルドのハッシュを出します。Ctrl+C、SIGTERM、SIGHUP で中断しても、検証プロセスと一時ファイルを片付けます。
 
-画面のスリープを検証中だけ止めるときは、コマンドの先頭に抑制を付けます。プロセスが終わると解除されます。記録にはその条件を残し、スリープ復帰の確認とは分けます。macOS はこれまでどおり `caffeinate -i` です。Linux は `systemd-inhibit --what=idle --mode=block` です。`python3 scripts/verify_host.py inhibit` が、その OS の先頭コマンドを出します。
+画面のスリープを検証中だけ止めるときは、コマンドの先頭に `caffeinate -i` を付けます。プロセスが終わると解除されます。記録にはその条件を残し、スリープ復帰の確認とは分けます。
 
 不足が増えた読取は最大8件まで通知し、回数と直近1件を残します。操作中は読取の間隔が伸びるので、音切れの回数や原因の断定には使いません。処理診断と通信診断はワーカーの直近の観測で、停止後に全通信を集計したものではありません。
 
-全国検索の負荷は、アカウントを使わない別スクリプトです。取得件数、時間、失敗、不正枠、子プロセスのピーク RSS、ヘルプまでの時間、端末復元を出します。PTY の読取待ちを含むので、描画だけの計測ではありません。`catalog_complete` の `peak_child_rss_bytes` はバイトです。macOS の `ru_maxrss` はバイトなので、そのまま出します。Linux の `ru_maxrss` は KiB なので、1024 倍してバイトに揃えます。画面投影は再生検証と同じで、`ALSA lib` が混ざると失敗します。
+全国検索の負荷は、アカウントを使わない別スクリプトです。取得件数、時間、失敗、不正枠、子プロセスのピーク RSS、ヘルプまでの時間、端末復元を出します。PTY の読取待ちを含むので、描画だけの計測ではありません。`catalog_complete` の `peak_child_rss_bytes` の単位はバイトです。macOS の `ru_maxrss` はバイトなので、そのまま出します。Linux の `ru_maxrss` は KiB なので、1024 倍してバイトに揃えます。
 
 ```sh
 python3 scripts/verify_tui_catalog.py --start 20260921 --end 20261020
@@ -231,24 +221,3 @@ Q2-N の参考として、QA のコンテナ（実機ではない）の結果は
 | Q5-2 `--sleep-check`：`complete`、復帰後の通知、`terminal_restored` | 未実施 | 未実施 |
 
 仮想マシンでのスリープと USB の受け渡しは、物理 PC と同じ動きとは限りません。できれば物理 PC で行い、仮想マシンで行ったときはそのことを記録します。
-
-### 録音とモニターのコマンド
-
-上の表は、そのときの結果です。ここは、これからの手順です。アプリは録音せず、検証スクリプトも録音ファイルを作りません。コマンドを出すだけです。既定の出力先はスクリプトからは変えません。
-
-サーバーの見分けは、`pactl info` の Server Name と、`pactl` が無いときの `pw-cli info 0` です。文面に `PipeWire` があるときは PipeWire です。`PulseAudio (on PipeWire …)` も PipeWire です。`pulseaudio` だけなら PulseAudio のみです。分類は `scripts/verify_host.py` の `classify_audio_server` で、単体テストが上の文字列を固定しています。
-
-| 用途 | PipeWire | PulseAudio のみ |
-| --- | --- | --- |
-| シンク一覧 | `pw-cli list-objects Node` | `pactl list short sinks` |
-| 既定シンク | `pactl get-default-sink`（pipewire-pulse があるとき） | `pactl get-default-sink` |
-| モニター録音 | `pw-record --target <sink>.monitor --rate 48000 --channels 2 <file.wav>` | `parecord --device=<sink>.monitor --file-format=wav --rate=48000 --channels=2 <file.wav>` |
-
-`<sink>` は既定シンク名です。`.monitor` が既に付いていれば、もう一度は付けません。印刷だけなら次です。
-
-```sh
-python3 scripts/verify_host.py sinks --server pipewire
-python3 scripts/verify_host.py record --server pulse --sink null --destination /tmp/monitor.wav
-```
-
-`/tmp/monitor.wav` は例です。`record` はファイルを作りません。CI の PulseAudio null sink の合否は、これまでどおり `scripts/check_null_sink_audio.py` が見ます。

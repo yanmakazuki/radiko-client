@@ -4,16 +4,6 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
-## 2026年10月27日：検証スクリプトの RSS 単位と画面の ALSA 判定を Linux に合わせる
-
-対象は `scripts/verify_tui_catalog.py`、`scripts/verify_tui_playback.py`、`scripts/verify_host.py` である。`catalog_complete` の `peak_child_rss_bytes` はバイトに揃える。Linux の `ru_maxrss` は KiB なので 1024 倍し、macOS の `ru_maxrss` はバイトのまま出す。再生検証の説明は「macOS / Linux（Linux は実機未確認）」である。画面に投影したテキストへ `ALSA lib` が混ざると `failed` になり、ライブラリの行は残さない。セッションの既定パス、アイドルスリープの抑制、PipeWire と PulseAudio のシンク一覧とモニター録音コマンドは `verify_host.py` が印刷する。録音コマンドは実行せず、ファイルも作らない。`scripts/check_null_sink_audio.py` の合否判定は、この変更の前と同じである。
-
-確認環境は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）、Python 3.12.3、`/dev/snd` なしである。`pw-record` は libpipewire 1.0.5、`parecord` は pacat 16.1 である。`--help` の `--target`、`--rate`、`--channels` と、`--device`、`--file-format`、`--rate`、`--channels` は、印刷する引数と一致した。`parecord --list-file-formats` に wav がある。
-
-`python3 -m unittest discover -s scripts -p 'test_*.py'` は 63 件成功、失敗 0 である。この Python プロセスの `ru_maxrss` は 18644 で、バイト換算は 19,091,456（約 18.2 MiB）である。KiB として扱うと、プロセスの大きさとして桁が合う。`python3 scripts/verify_host.py session` は `/home/ubuntu/.local/share/radiko-client/session.json` を出した。`inhibit` は `systemd-inhibit --what=idle --mode=block` を出した。`record --server pulse --sink null --destination /tmp/monitor-example.wav` は parecord のコマンド行を出し、そのファイルは作らなかった。`systemd-inhibit --what=idle --mode=block true` はユーザーバスが無く、`Failed to connect to bus: Connection refused` で終了した。抑制は掛かっていない。`pw-cli list-objects Node` はデーモンが無く `failed to connect: Host is down`（終了 255）である。`pactl info` は `Connection refused` である。`target/debug/radiko-client output-info` は終了 1 で、stderr は「エラー: 既定の音声出力機器がありません」の1行、`ALSA lib` は stdout と stderr で 0 行である。
-
-`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は成功した。327 件成功、失敗 0、ignored 4 件である。Rust 1.85.0 はこの環境ではテストしていない。macOS の再実行、Linux の実機 TUI、radiko への通信、PipeWire や PulseAudio のデーモンを立てた録音、耳での確認はない。
-
 ## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
 
 対象は `a5b8786` の ignored テスト `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` である。環境は Linux x86_64、Rust 1.99.1、PulseAudio 16.1 の `module-null-sink`（シンク名 `null`、`libasound2-plugins` 経由の ALSA `default`）で、`/dev/snd` はない。ALSA の `null` PCM は使っていない。テストの判定は変えていない。

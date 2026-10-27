@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit macOS / Linux（Linux は実機未確認） network/audio verification; always muted, never an ordinary test.
+"""Network and audio verification for macOS and Linux; always muted, never an ordinary test.
 
 Only target identifiers and diagnostics are printed. Schedule content, terminal state, and audio
 stay in memory. A private binary copy survives rebuilding target/debug during a run.

@@ -508,18 +508,26 @@ else:
             os.close(slave)
 
 
-ALSA_SCREEN_FIXTURE = """\
+CLEAN_SCREEN_FIXTURE = """\
 再生中: [TBS / TimeFree] title
 10/06 12:00〜10/06 13:00 JST / Playing / 音量0% / 位置1.0秒
 今回の出力 1.0秒 / 不足 0フレーム
-ALSA lib pcm.c:1:(snd_pcm_open) synthetic-secret
 """
+
+ALSA_SCREEN_FIXTURE = CLEAN_SCREEN_FIXTURE + "ALSA lib pcm.c:1:(snd_pcm_open) synthetic-secret\n"
 
 
 class AlsaScreenTests(unittest.TestCase):
+    def test_screen_fixture_without_alsa_lib_keeps_the_existing_success(self):
+        require_no_alsa_noise(CLEAN_SCREEN_FIXTURE)
+        start = datetime.datetime.fromisoformat('2026-10-06T12:00:00+09:00')
+        end = start + datetime.timedelta(hours=1)
+        self.assertTrue(output_has_started(CLEAN_SCREEN_FIXTURE, 'TBS', start, end, 'TimeFree'))
+        terminal = Terminal(-1)
+        terminal.feed(CLEAN_SCREEN_FIXTURE.encode())
+        self.assertIn('今回の出力 1.0秒', terminal.screen())
+
     def test_screen_fixture_containing_alsa_lib_fails_and_hides_the_library_line(self):
-        require_no_alsa_noise('再生中: [TBS / TimeFree]\n今回の出力 1.0秒 / 不足 0フレーム')
-        require_no_alsa_noise('libasound の診断は出しません')
         with self.assertRaisesRegex(RuntimeError, 'ALSA lib noise on screen') as raised:
             require_no_alsa_noise(ALSA_SCREEN_FIXTURE)
         self.assertNotIn('synthetic-secret', str(raised.exception))
@@ -533,7 +541,8 @@ class AlsaScreenTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(script), '--help'],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0)
-        self.assertIn('macOS / Linux（Linux は実機未確認）', result.stdout)
+        self.assertIn('Network and audio verification for macOS and Linux', result.stdout)
+        self.assertNotIn('Explicit macOS network/audio verification', result.stdout)
 
     def test_projected_alsa_lib_line_fails_the_playback_script(self):
         script = Path(__file__).with_name('verify_tui_playback.py')
