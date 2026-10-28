@@ -16,7 +16,7 @@ TUIの再生通知とCLIの `エラー:` 行では、次の3つだけをその�
 
 `scripts/verify_tui_playback.py` は、接頭辞のないこの3文を `window_lost`、`reconnect_limit`、`auth_expired` に分ける。段階名が残っているときは、これまでどおり `source_stage` を読む。
 
-確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 373 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 clippy` と同じオプションのテストも 373 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。この環境では AppArmor の sysctl は無く、`unshare -rn` はそのまま成功した。`--help` と `tui --help` の文言は main と同じである。radiko への通信と実機の再生はない。
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 375 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 clippy` と同じオプションのテストも 375 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。この環境では AppArmor の sysctl は無く、`unshare -rn` はそのまま成功した。`--help` と `tui --help` の文言は main と同じである。radiko への通信と実機の再生はない。
 
 ## 2026年10月28日：ダイアログの q は閉じるだけにする
 

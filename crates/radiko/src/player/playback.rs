@@ -2838,6 +2838,38 @@ mod tests {
         );
     }
 
+    const WINDOW_LOST: &str =
+        "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
+    const RECONNECT_LIMIT: &str =
+        "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください";
+    const AUTH_EXPIRED: &str =
+        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください";
+
+    /// stderr of `main`'s `eprintln!("エラー: {}", cli_error_body(...))`.
+    fn cli_stderr(error: &PlaybackError) -> String {
+        format!(
+            "エラー: {}",
+            cli_error_body(error as &(dyn std::error::Error + 'static))
+        )
+    }
+
+    fn assert_plain(error: PlaybackError, chain: &str) {
+        assert_eq!(error.to_string(), chain);
+        assert_eq!(failure_notice(&error), format!("再生停止: {chain}"));
+        assert_eq!(cli_stderr(&error), format!("エラー: {chain}"));
+    }
+
+    fn assert_confirmed(error: PlaybackError, sentence: &str, chain: &str) {
+        assert_eq!(failure_notice(&error), sentence);
+        assert_eq!(error.to_string(), chain);
+        let stderr = if chain == sentence {
+            format!("エラー: {sentence}")
+        } else {
+            format!("エラー: {sentence}\n{chain}")
+        };
+        assert_eq!(cli_stderr(&error), stderr);
+    }
+
     fn probe_code(error: &ProbeError) -> &'static str {
         match error {
             ProbeError::At(_, _) => "At",
@@ -2870,180 +2902,348 @@ mod tests {
         }
     }
 
-    fn assert_surfaces(error: PlaybackError) {
-        let historical_tui = format!("再生停止: {error}");
-        let historical_cli = format!("エラー: {error}");
-        let tui = failure_notice(&error);
-        let cli = format!("エラー: {}", cli_playback_body(&error));
-        let chain = error.to_string();
-        if let Some(message) = confirmed_message(&error) {
-            assert_eq!(tui, message);
-            assert!(!tui.contains("再生停止:"), "{tui}");
-            assert!(!tui.contains("配信取得:"), "{tui}");
-            for stage in [
-                "HLS一覧更新",
-                "HLS初期化情報取得",
-                "HLS音声取得",
-                "別段階",
-                "外側",
-            ] {
-                assert!(
-                    !tui.contains(&format!("{stage}: ")),
-                    "stage prefix in {tui}"
-                );
-            }
-            assert!(cli.starts_with(&format!("エラー: {message}")), "{cli}");
-            assert!(cli.contains(&chain), "chain missing from stderr: {cli}");
-            assert_ne!(tui, historical_tui);
-            if chain == message {
-                assert_eq!(cli, historical_cli);
-            } else {
-                assert_ne!(cli, historical_cli);
-                let expected = format!("エラー: {message}");
-                let mut lines = cli.lines();
-                assert_eq!(lines.next(), Some(expected.as_str()));
-                assert_eq!(lines.next(), Some(chain.as_str()));
-                assert_eq!(lines.next(), None);
-            }
-        } else {
-            assert_eq!(tui, historical_tui);
-            assert_eq!(cli, historical_cli);
-        }
-    }
-
     #[test]
     fn failure_text_changes_only_for_the_three_confirmed_messages() {
         use crate::api::auth::AuthError;
         use crate::player::output::OfferedOutputFormat;
         use crate::storage::StorageError;
         use std::collections::BTreeSet;
-        let leaves = [
-            ProbeError::InvalidInput,
-            ProbeError::InvalidPosition,
-            ProbeError::Network,
-            ProbeError::Cancelled,
-            ProbeError::Http(503),
-            ProbeError::Authentication,
-            ProbeError::AuthExpired,
-            ProbeError::Denied,
-            ProbeError::NotFound,
-            ProbeError::RateLimited,
-            ProbeError::TooLarge,
-            ProbeError::UnsafeUrl,
-            ProbeError::InvalidAuth,
-            ProbeError::OutsideJapan,
-            ProbeError::InvalidXml,
-            ProbeError::InvalidProgram,
-            ProbeError::Upcoming,
-            ProbeError::StillOnAir,
-            ProbeError::Expired,
-            ProbeError::ContractRequired,
-            ProbeError::AvailabilityUnknown,
-            ProbeError::Unavailable,
-            ProbeError::InvalidPlaylist,
-            ProbeError::WindowLost,
-            ProbeError::NoEndpoint,
-            ProbeError::ReconnectGaveUp,
-        ];
         let mut seen = BTreeSet::new();
-        for error in leaves {
-            let code = probe_code(&error);
-            assert!(seen.insert(code), "duplicate {code}");
-            let probe_body = cli_error_body(&error);
-            let probe_chain = error.to_string();
-            if let Some(message) = confirmed_probe(&error) {
-                if probe_chain == message {
-                    assert_eq!(probe_body, message);
-                } else {
-                    assert_eq!(probe_body, format!("{message}\n{probe_chain}"));
-                }
-            } else {
-                assert_eq!(probe_body, probe_chain);
-            }
-            assert_surfaces(PlaybackError::Source(error));
-        }
+        let mut plain_source = |error: ProbeError, text: &str| {
+            assert!(seen.insert(probe_code(&error)), "duplicate probe leaf");
+            assert_plain(PlaybackError::Source(error), &format!("配信取得: {text}"));
+        };
+        plain_source(
+            ProbeError::InvalidInput,
+            "局IDまたは日時が不正です（日時は日本時間のYYYYMMDDHHmmss）",
+        );
+        plain_source(
+            ProbeError::InvalidPosition,
+            "シーク位置は番組冒頭以上・放送枠末尾未満で指定してください",
+        );
+        plain_source(ProbeError::Network, "配信の検証中に通信に失敗しました");
+        plain_source(ProbeError::Cancelled, "配信取得を取り消しました");
+        plain_source(ProbeError::Http(503), "配信サーバーがHTTP 503を返しました");
+        plain_source(
+            ProbeError::Authentication,
+            "配信認証が拒否されました。sessionで会員認証を確認してください",
+        );
+        plain_source(
+            ProbeError::Denied,
+            "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）",
+        );
+        plain_source(ProbeError::NotFound, "対象の番組または配信が見つかりません");
+        plain_source(
+            ProbeError::RateLimited,
+            "アクセス制限中です。時間をおいて再実行してください",
+        );
+        plain_source(
+            ProbeError::TooLarge,
+            "応答または音声サンプルのサイズ上限を超えました",
+        );
+        plain_source(
+            ProbeError::UnsafeUrl,
+            "未対応の配信先またはリダイレクトです",
+        );
+        plain_source(
+            ProbeError::InvalidAuth,
+            "配信認証の応答が想定形式と異なります",
+        );
+        plain_source(ProbeError::OutsideJapan, "国内エリアを確認できませんでした");
+        plain_source(
+            ProbeError::InvalidXml,
+            "局または配信設定XMLの形式が不正です",
+        );
+        plain_source(
+            ProbeError::InvalidProgram,
+            "指定時刻と番組の放送枠を対応付けできません",
+        );
+        plain_source(ProbeError::Upcoming, "放送前のため配信取得できません");
+        plain_source(
+            ProbeError::StillOnAir,
+            "放送中のためタイムフリーの検証対象外です",
+        );
+        plain_source(ProbeError::Expired, "タイムフリーの候補期限を過ぎています");
+        plain_source(
+            ProbeError::ContractRequired,
+            "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）",
+        );
+        plain_source(
+            ProbeError::AvailabilityUnknown,
+            "番組の配信条件が未確認のため取得を中止しました",
+        );
+        plain_source(
+            ProbeError::Unavailable,
+            "番組情報でタイムフリー配信対象外とされています",
+        );
+        plain_source(
+            ProbeError::InvalidPlaylist,
+            "HLSプレイリストまたはサンプルの構造が不正・未対応です",
+        );
+        plain_source(
+            ProbeError::NoEndpoint,
+            "対象モードと地域に対応する配信先がありません",
+        );
+        assert!(seen.insert("WindowLost"));
+        assert!(seen.insert("AuthExpired"));
+        assert!(seen.insert("ReconnectGaveUp"));
         assert_eq!(seen.len(), 26, "one row per ProbeError leaf, saw {seen:?}");
-        assert!(!seen.contains("At"));
-        let stages = ["HLS一覧更新", "HLS初期化情報取得", "HLS音声取得", "別段階"];
-        for stage in stages {
-            for inner in [
-                ProbeError::NotFound,
-                ProbeError::Network,
-                ProbeError::Http(503),
-                ProbeError::InvalidPlaylist,
-                ProbeError::WindowLost,
-                ProbeError::AuthExpired,
-                ProbeError::ReconnectGaveUp,
-            ] {
-                assert_surfaces(PlaybackError::Source(ProbeError::At(
-                    stage,
-                    Box::new(inner),
-                )));
-            }
-        }
-        assert_surfaces(PlaybackError::Source(ProbeError::At(
-            "外側",
-            Box::new(ProbeError::At(
+        assert_confirmed(
+            PlaybackError::Source(ProbeError::WindowLost),
+            WINDOW_LOST,
+            &format!("配信取得: {WINDOW_LOST}"),
+        );
+        assert_confirmed(
+            PlaybackError::Source(ProbeError::AuthExpired),
+            AUTH_EXPIRED,
+            &format!("配信取得: {AUTH_EXPIRED}"),
+        );
+        assert_confirmed(
+            PlaybackError::Source(ProbeError::ReconnectGaveUp),
+            RECONNECT_LIMIT,
+            &format!("配信取得: {RECONNECT_LIMIT}"),
+        );
+        for (stage, not_found_chain, network_chain, http_chain, playlist_chain) in [
+            (
+                "HLS一覧更新",
+                "配信取得: HLS一覧更新: 対象の番組または配信が見つかりません",
+                "配信取得: HLS一覧更新: 配信の検証中に通信に失敗しました",
+                "配信取得: HLS一覧更新: 配信サーバーがHTTP 503を返しました",
+                "配信取得: HLS一覧更新: HLSプレイリストまたはサンプルの構造が不正・未対応です",
+            ),
+            (
+                "HLS初期化情報取得",
+                "配信取得: HLS初期化情報取得: 対象の番組または配信が見つかりません",
+                "配信取得: HLS初期化情報取得: 配信の検証中に通信に失敗しました",
+                "配信取得: HLS初期化情報取得: 配信サーバーがHTTP 503を返しました",
+                "配信取得: HLS初期化情報取得: HLSプレイリストまたはサンプルの構造が不正・未対応です",
+            ),
+            (
                 "HLS音声取得",
-                Box::new(ProbeError::AuthExpired),
+                "配信取得: HLS音声取得: 対象の番組または配信が見つかりません",
+                "配信取得: HLS音声取得: 配信の検証中に通信に失敗しました",
+                "配信取得: HLS音声取得: 配信サーバーがHTTP 503を返しました",
+                "配信取得: HLS音声取得: HLSプレイリストまたはサンプルの構造が不正・未対応です",
+            ),
+            (
+                "別段階",
+                "配信取得: 別段階: 対象の番組または配信が見つかりません",
+                "配信取得: 別段階: 配信の検証中に通信に失敗しました",
+                "配信取得: 別段階: 配信サーバーがHTTP 503を返しました",
+                "配信取得: 別段階: HLSプレイリストまたはサンプルの構造が不正・未対応です",
+            ),
+        ] {
+            assert_plain(
+                PlaybackError::Source(ProbeError::At(stage, Box::new(ProbeError::NotFound))),
+                not_found_chain,
+            );
+            assert_plain(
+                PlaybackError::Source(ProbeError::At(stage, Box::new(ProbeError::Network))),
+                network_chain,
+            );
+            assert_plain(
+                PlaybackError::Source(ProbeError::At(stage, Box::new(ProbeError::Http(503)))),
+                http_chain,
+            );
+            assert_plain(
+                PlaybackError::Source(ProbeError::At(stage, Box::new(ProbeError::InvalidPlaylist))),
+                playlist_chain,
+            );
+            assert_confirmed(
+                PlaybackError::Source(ProbeError::At(stage, Box::new(ProbeError::WindowLost))),
+                WINDOW_LOST,
+                &format!("配信取得: {stage}: {WINDOW_LOST}"),
+            );
+            assert_confirmed(
+                PlaybackError::Source(ProbeError::At(stage, Box::new(ProbeError::AuthExpired))),
+                AUTH_EXPIRED,
+                &format!("配信取得: {stage}: {AUTH_EXPIRED}"),
+            );
+            assert_confirmed(
+                PlaybackError::Source(ProbeError::At(stage, Box::new(ProbeError::ReconnectGaveUp))),
+                RECONNECT_LIMIT,
+                &format!("配信取得: {stage}: {RECONNECT_LIMIT}"),
+            );
+        }
+        assert_confirmed(
+            PlaybackError::Source(ProbeError::At(
+                "外側",
+                Box::new(ProbeError::At(
+                    "HLS音声取得",
+                    Box::new(ProbeError::AuthExpired),
+                )),
             )),
-        )));
-        assert_surfaces(PlaybackError::LoginRequired);
-        assert_surfaces(PlaybackError::EarlyEnd);
-        assert_surfaces(PlaybackError::SourceStalled);
-        assert_surfaces(PlaybackError::ReconnectGaveUp);
-        assert_surfaces(PlaybackError::Worker);
-        for error in [
-            AuthError::InvalidCredentials,
-            AuthError::SessionExpired,
-            AuthError::Network,
-            AuthError::Cancelled,
-            AuthError::Http(401),
-            AuthError::RateLimited,
-            AuthError::InvalidResponse,
-            AuthError::ResponseTooLarge,
-            AuthError::InvalidInput,
-        ] {
-            assert_surfaces(PlaybackError::Auth(error));
-        }
-        for error in [
-            StorageError::Io(std::io::ErrorKind::PermissionDenied),
-            StorageError::Invalid,
-            StorageError::UnsupportedVersion,
-            StorageError::UnsafePermissions,
-            StorageError::UnsafePath,
-            StorageError::NoDataDirectory,
-        ] {
-            assert_surfaces(PlaybackError::Storage(error));
-        }
-        for error in [
-            AacError::Cancelled,
-            AacError::TooLarge,
-            AacError::InvalidMetadata,
-            AacError::InvalidContainer,
-            AacError::UnsupportedContainer,
-            AacError::InvalidConfig,
-            AacError::InvalidPacket,
-            AacError::InvalidHeader,
-            AacError::TruncatedFrame,
-            AacError::Empty,
-            AacError::TooManyPackets,
-            AacError::UnsupportedTransport,
-            AacError::UnsupportedCodec,
-            AacError::DecodeFailed,
-            AacError::FormatChanged,
-            AacError::InvalidPcm,
-            AacError::DeclaredSbrMissing,
-            AacError::SbrNotReconstructed,
-        ] {
-            assert_surfaces(PlaybackError::Decode(error));
-        }
-        for error in [
-            OutputError::InvalidPcm,
-            OutputError::NoDevice,
-            OutputError::DeviceInfo,
-            OutputError::UnsupportedFormat,
-            OutputError::IncompatibleOutput {
+            AUTH_EXPIRED,
+            &format!("配信取得: 外側: HLS音声取得: {AUTH_EXPIRED}"),
+        );
+        assert_plain(
+            PlaybackError::LoginRequired,
+            "未ログインです。loginでログインしてください",
+        );
+        assert_plain(
+            PlaybackError::EarlyEnd,
+            "放送枠末尾より前に配信が終了しました",
+        );
+        assert_plain(
+            PlaybackError::SourceStalled,
+            "30秒間新しいセグメントを確認できないため停止しました",
+        );
+        assert_confirmed(
+            PlaybackError::ReconnectGaveUp,
+            RECONNECT_LIMIT,
+            RECONNECT_LIMIT,
+        );
+        assert_plain(PlaybackError::Worker, "再生ワーカーが予期せず終了しました");
+        assert_plain(
+            PlaybackError::Auth(AuthError::InvalidCredentials),
+            "ログインに失敗しました。メールアドレスとパスワードを確認してください",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::SessionExpired),
+            "セッションが失効しました。loginで再ログインしてください",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::Network),
+            "認証サーバーと通信できません",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::Cancelled),
+            "認証処理を取り消しました",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::Http(401)),
+            "認証サーバーがHTTP 401を返しました",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::RateLimited),
+            "認証サーバーのアクセス制限中です。時間をおいて再実行してください",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::InvalidResponse),
+            "認証応答が想定形式と異なります",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::ResponseTooLarge),
+            "認証応答のサイズ上限を超えました",
+        );
+        assert_plain(
+            PlaybackError::Auth(AuthError::InvalidInput),
+            "メールアドレスまたはパスワードが空です",
+        );
+        assert_plain(
+            PlaybackError::Storage(StorageError::Io(std::io::ErrorKind::PermissionDenied)),
+            "セッションファイルの操作に失敗しました (PermissionDenied)",
+        );
+        assert_plain(
+            PlaybackError::Storage(StorageError::Invalid),
+            "セッションファイルが破損しています",
+        );
+        assert_plain(
+            PlaybackError::Storage(StorageError::UnsupportedVersion),
+            "未対応のセッション保存形式です",
+        );
+        assert_plain(
+            PlaybackError::Storage(StorageError::UnsafePermissions),
+            "セッションのディレクトリは0700、ファイルは0600にしてください",
+        );
+        assert_plain(
+            PlaybackError::Storage(StorageError::UnsafePath),
+            "セッション保存先にシンボリックリンクや通常ファイル以外は使用できません",
+        );
+        assert_plain(
+            PlaybackError::Storage(StorageError::NoDataDirectory),
+            "データ保存先を解決できません。--data-dirを指定してください",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::Cancelled),
+            "デコード: AACデコードを取り消しました",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::TooLarge),
+            "デコード: AACセグメントのサイズ上限を超えました",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::InvalidMetadata),
+            "デコード: AACに付加されたID3の形式が不正です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::InvalidContainer),
+            "デコード: AACコンテナの時刻またはデータ構造が不正です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::UnsupportedContainer),
+            "デコード: AACコンテナの構成が未対応です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::InvalidConfig),
+            "デコード: AACの設定情報（ASC）が不正・未対応です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::InvalidPacket),
+            "デコード: AACアクセスユニットに余分なデータがあります",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::InvalidHeader),
+            "デコード: ADTSヘッダーが不正です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::TruncatedFrame),
+            "デコード: ADTSフレームが途中で切れています",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::Empty),
+            "デコード: AAC音声フレームがありません",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::TooManyPackets),
+            "デコード: AACセグメントのパケット数上限を超えました",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::UnsupportedTransport),
+            "デコード: CRC付きまたは複数raw blockのADTSは検証対象外です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::UnsupportedCodec),
+            "デコード: AACの構成がデコーダーで未対応です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::DecodeFailed),
+            "デコード: AACパケットのデコードに失敗しました",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::FormatChanged),
+            "デコード: AACの構成が変わりました。新しいデコーダーで再開してください",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::InvalidPcm),
+            "デコード: デコードしたPCMの形式またはサンプル値が不正です",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::DeclaredSbrMissing),
+            "デコード: HLSはHE-AACを宣言していますが、このサンプルではSBR再構成を確認できません",
+        );
+        assert_plain(
+            PlaybackError::Decode(AacError::SbrNotReconstructed),
+            "デコード: SBRデータを検出しましたが出力がコアレートのままです",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::InvalidPcm),
+            "出力用PCMまたは再生時間が不正です",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::NoDevice),
+            "既定の音声出力機器がありません",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::DeviceInfo),
+            "音声出力機器の情報を取得できません",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::UnsupportedFormat),
+            "出力中のサンプルレートまたはチャンネル数が、開いた音声と一致しません",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::IncompatibleOutput {
                 requested_rate: 48_000,
                 offered: vec![OfferedOutputFormat {
                     channels: 2,
@@ -3051,16 +3251,31 @@ mod tests {
                     max_sample_rate: 44_100,
                     sample_format: "f32",
                 }],
-            },
-            OutputError::Device,
-            OutputError::Stalled,
-            OutputError::ReconnectGaveUp,
-            OutputError::ProbeTimeout,
-            OutputError::Deadline,
-        ] {
-            assert_surfaces(PlaybackError::Output(error));
-        }
+            }),
+            "必要な形式は48000Hzのmonoまたはstereoのf32・i16・i32です。機器の対応範囲: 44100Hz・f32・2ch",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::Device),
+            "音声出力機器の開始・実行に失敗しました",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::Stalled),
+            "音声コールバックが進まないため出力を停止しました。スリープ復帰・機器変更後は出力先を確認し、番組を選び直して再生してください",
+        );
+        assert_confirmed(
+            PlaybackError::Output(OutputError::ReconnectGaveUp),
+            RECONNECT_LIMIT,
+            RECONNECT_LIMIT,
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::ProbeTimeout),
+            "無音出力診断の実時間上限を超えたため停止しました",
+        );
+        assert_plain(
+            PlaybackError::Output(OutputError::Deadline),
+            "番組終了：放送終了日時に達したため音声を停止しました",
+        );
         let unrelated = std::io::Error::other("unchanged");
-        assert_eq!(cli_error_body(&unrelated), unrelated.to_string());
+        assert_eq!(cli_error_body(&unrelated), "unchanged");
     }
 }

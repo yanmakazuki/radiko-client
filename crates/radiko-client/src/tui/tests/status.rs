@@ -510,6 +510,74 @@ fn confirmed_stop_notices_survive_reconnect_catch_up_and_auth_renewal() {
     }
 }
 #[test]
+fn stopped_window_lost_notice_is_not_replaced_by_the_live_edge_catch_up() {
+    use radiko::player::diagnostics::{Snapshot, Stage};
+    let now = Utc::now().fixed_offset();
+    let sentence = "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
+    let http = |skipped| radiko::api::stream::playback::RequestSnapshot {
+        stage: radiko::api::stream::playback::RequestStage::Idle,
+        response_status: Some(200),
+        elapsed: Duration::ZERO,
+        headers_max: Duration::ZERO,
+        body_max: Duration::ZERO,
+        attempts: 1,
+        retry_waits: 0,
+        network_failures: 0,
+        timeouts: 0,
+        connect_failures: 0,
+        reauthentications: 0,
+        skipped_segments: skipped,
+        sequence_resets: 0,
+        joined_window_head: false,
+    };
+    let snapshot = |skipped| radiko::player::state::PlaybackSnapshot {
+        info: radiko::api::stream::playback::StreamInfo {
+            title: Some("枠".into()),
+            station: "TBS".into(),
+            mode: radiko::api::stream::ProbeMode::Live,
+            starts_at: now,
+            ends_at: now + chrono::Duration::hours(1),
+            position: Duration::ZERO,
+        },
+        state: PlaybackState::Playing,
+        pending: None,
+        volume: 25,
+        position: None,
+        output: None,
+        segments: 1,
+        reconnecting_for: None,
+        pipeline: Some(Snapshot {
+            stage: Stage::Waiting,
+            elapsed: Duration::from_secs(1),
+            acquisition_max: Duration::ZERO,
+            acquisition_max_pcm_start: Duration::ZERO,
+            acquisition_max_pcm_min: Duration::ZERO,
+            decode_max: Duration::ZERO,
+            decode_last: Duration::ZERO,
+            media_last: Duration::ZERO,
+            decoded_segments: 1,
+            waiting_pcm_segments: 0,
+            waiting_pcm_media: Duration::ZERO,
+            http: Some(http(skipped)),
+        }),
+    };
+    let mut screen = screen();
+    screen.apply_playback(radiko::app::playback::Update {
+        stopped: true,
+        ended: true,
+        notice: Some(sentence.into()),
+        snapshot: Some(snapshot(0)),
+        ..radiko::app::playback::Update::default()
+    });
+    assert!(screen.playback_stopped);
+    screen.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(snapshot(5)),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(screen.playback_notice, sentence);
+    assert!(!screen.playback_notice.contains("ライブ端に追いつきました"));
+}
+#[test]
 fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
     use radiko::player::diagnostics::{Snapshot, Stage};
     let mut screen = screen();
