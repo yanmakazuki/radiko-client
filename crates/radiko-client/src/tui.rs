@@ -12,6 +12,7 @@ mod seek;
 mod viewport;
 use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
+use clap::{ArgAction, CommandFactory, Parser};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use radiko::{
     api::catalog::CatalogClient,
@@ -52,7 +53,27 @@ use std::{
     },
     time::Duration,
 };
-const USAGE: &str = "tui [--offline] [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。\n--offline は試験用の番組表だけで起動し、通信と音声出力はしません。";
+const USAGE: &str = "/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。";
+#[derive(Parser)]
+#[command(
+    name = "tui",
+    disable_version_flag = true,
+    disable_help_flag = true,
+    disable_colored_help = true
+)]
+struct TuiHelp {
+    #[arg(long, hide = true, action = ArgAction::SetTrue)]
+    offline: bool,
+}
+fn tui_command() -> clap::Command {
+    TuiHelp::command()
+        .override_usage("tui [programsと同じ局・地域・期間・絞り込み]")
+        .after_long_help(USAGE)
+}
+fn help_text() -> String {
+    let mut command = tui_command();
+    command.render_long_help().to_string()
+}
 fn named_receipt(result: &Result<NamedOutcome, radiko::app::named::Error>) -> String {
     match result {
         Ok(NamedOutcome::Saved(name)) => format!("「{name}」を保存しました"),
@@ -1576,7 +1597,7 @@ async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(
 }
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if args == ["--help"] {
-        stdout_ln!("{USAGE}");
+        stdout_ln!("{}", help_text().trim_end());
         return Ok(());
     }
     let (offline, args) = offline::split_args(args);
@@ -1793,6 +1814,19 @@ mod tests {
         let now = radiko::api::stream::parse_time("20261015060000").unwrap();
         let criteria = crate::programs::criteria(&["TBS".into(), "20261015".into()], now).unwrap();
         Screen::new(criteria, String::new())
+    }
+    #[test]
+    fn offline_argument_is_hidden_by_clap() {
+        let mut command = super::tui_command();
+        let hidden = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("offline"))
+            .unwrap()
+            .is_hide_set();
+        assert!(hidden);
+        let help = command.render_long_help().to_string();
+        assert!(!help.contains("--offline"));
+        assert!(help.contains("g 秒数指定"));
     }
     #[test]
     fn offline_keys_do_not_request_playback_login_or_chapters() {

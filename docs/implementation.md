@@ -4,6 +4,12 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：テスト専用の --offline をヘルプから隠す
+
+`tui --offline` はテストと CI 専用のままである。利用者向けの起動オプションにはしない。clap の `hide = true` で `tui --help` から外し、トップの `--help` にも書かない。フラグの受け付け方と、通信も音声機器も開かない挙動は変えていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 371 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 clippy` と同じオプションのテストも 371 件成功、失敗 0、ignored 2 件である。`scripts/smoke_tui.py` は終了 0、端末復元だった。radiko への通信と実機の再生はない。
+
 ## 2026年10月28日：CIのUbuntuジョブでオフラインTUIを疑似端末から終了まで確認する
 
 `tui --offline` は試験用の番組表だけをメモリに持つ。局一覧を聞かれた地域には TBS を一つ返し、指定した局と放送日には日本時間 6:00〜7:00 の「オフライン番組」を一つ返す。`CatalogClient` と `Http` は作らない。セッションはファイルの有無だけを見て、保存済みトークンは送らない。ログイン、認証の再確認、チャプター、再生は通信も音声機器も開かない。
