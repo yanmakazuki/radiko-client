@@ -4,6 +4,14 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：origin/main の配信窓と再接続を、ProbeError の表示とローカル HTTP テストへ合わせる
+
+`origin/main`（#39）を merge commit で取り込んだ。衝突は `crates/radiko/src/api/stream.rs`、`docs/implementation.md`、`docs/validation.md` である。`http.rs` と `playback.rs` は自動で合わさった。`ProbeError` は `NotFound`、`WindowLost`、`ReconnectGaveUp` を残し、表示は一段の網羅的な `match` のままにした。`unreachable!` は戻していない。`WindowLost` の文言と、再接続の上限文言は main のままである。再生の再接続、ライブの追いつきと巻き戻り、失効した chunklist を最初の配信 URL から取り直す処理も残した。ローカル HTTP の 4 件は通常の `cargo test` のままである。文書は両方の記録を残し、新しい日付を前にした。
+
+Rust 1.85.0 の clippy は、プレイリスト URL の16進文字列を `format!` の `collect` で作ることと、出力待ちの `!is_some_and` を警告にした。16進文字列は `String` へ直接書き、出力待ちは `is_none_or` にした。待つ条件と URL の中身は変えていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。どちらも `cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features` は 365 件成功、失敗 0、ignored 2 件（`native_muted`）である。radiko への通信、実配信の STOP/CONT、音声の保存、耳での確認はない。
+
 ## 2026年10月28日：ライブの失効した chunklist は、最初の配信 URL から取り直す
 
 YFM のライブを Linux aarch64、PipeWire で再生し、`kill -STOP` の 60 秒と 90 秒のあと `kill -CONT` すると、出力は戻りバッファ分は鳴る。追いつきの通知は出ず、「再生停止: 配信取得: HLS一覧更新: 対象の番組または配信が見つかりません」で止まる。
@@ -87,6 +95,20 @@ TUI で、配信窓の先頭から再開したときの通知を「配信窓の�
 ライブで、次の通し番号が新しいプレイリストに無いときは止めない。再開位置は、終端から target duration の3倍以内に始まるセグメントのうち最も古いものである。窓全体がその範囲なら先頭の `MEDIA-SEQUENCE` になる。飛ばした通し番号の個数は通信診断の「飛ばしたセグメント」と、TUI の再生通知に出す。CLI の状態表示は同じ通信診断の行である。再開したセグメントは不連続としてデコーダーを作り直す。`MEDIA-SEQUENCE` が小さくなったライブは、配信のリセットとして同じ位置から再開し、回数を「通し番号の巻き戻り」に足す。リセットで捨てた古い番号は飛ばした個数に入れない。タイムフリーの欠落と巻き戻りは失敗のままである。再認証、終了時に出力を先に閉じること、サンプル形式の選択は変えていない。
 
 確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 333 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 333 件成功、失敗 0、ignored 4 件はそのままである。偽のプレイリストで、通常の進み方、窓から遅れた短い窓と 6 セグメントの窓、通し番号の巻き戻りを確認した。タイムフリーの同じ欠落と巻き戻りは、セグメントを取らずに失敗する。アカウント、radiko への通信、実配信で窓が先に進む再生は確認していない。
+
+## 2026年10月27日：ProbeError の表示とローカル HTTP テスト
+
+`ProbeError` の `Display` は、`At` と `Http` を外側で処理したあとの内側の `match` に `unreachable!` があった。同じ列挙を一段の網羅的な `match` にし、各バリアントの文言は変えていない。新しいバリアントを足すと、表示と `to_string` のテストの両方がコンパイルできなくなる。表示からパニックする経路はない。
+
+ローカル HTTP のテストは `#[ignore]` を外し、通常の `cargo test` に入れた。待受は `127.0.0.1` の空いているポートだけである。本番のクライアントは HTTPS 専用のままで、信頼するホストの判定も変えていない。テスト用の取得だけが、その待受へパスとクエリを写してから、本番と同じ状態コードの変換と再試行予算（`get_once` と `retry_get`）を使う。
+
+`local_mock_http` は4件である。これまでのタイムアウトと再試行の2件に加え、401・403・429 を再試行せず対応するエラーにすること、プレイリストの 401 のあと `authenticate` を1回通して同じ枠の次のセグメントまで続くことを、ローカルの HTTP サーバーで確認する。後者は、期限切れのトークンで 401、会員セッションで auth1 と auth2、新しいトークンでプレイリストの取り直し、までを1本の TCP 上の HTTP で行う。トークンは合成値で、エラー文言には出さない。
+
+Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 332 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 332 件成功、失敗 0、ignored 2 件である。
+
+同じ Rust 1.99.1 で `cargo +stable test --locked -p radiko --lib local_mock_http -- --test-threads=8` を20回続け、各回4件成功、0件失敗、1回あたり約0.51秒だった。応答しない接続の待ちは250msが2回で、404 のクライアント期限は2秒だが応答はすぐ返る。ポート衝突や待ちによる失敗は出ていない。ワークフローは変えていない。radiko への通信、実トークンの期限切れ、音声の保存、耳での確認はない。
+
+そのあとの GitHub Actions では、ubuntu-24.04 と Rust 1.85.0 の macos-15 は成功し、stable の macos-15 だけが既存2件で失敗した。macOS は非ブロッキングの待受から受け取ったソケットも非ブロッキングのままなので、要求が届く前の `read` が `WouldBlock`（`EAGAIN`）になる。Linux は受け取ったソケットがブロッキングなので、同じテストはそこで待っていた。受け取ったソケットをブロッキングに戻し、`WouldBlock` と `Interrupted` は期限まで読み直すようにした。別ジョブには分けていない。
 
 ## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
 

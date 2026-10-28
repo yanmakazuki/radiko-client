@@ -318,6 +318,29 @@ impl Http {
             url: url.clone(),
         }))
     }
+    // Same retry budget as `Fetch::get`, without the trusted-host check.
+    fn exchange(
+        &self,
+        url: &Url,
+        headers: &HeaderMap,
+        limit: usize,
+        range: Option<(u64, u64)>,
+        redirects: bool,
+    ) -> Result<GetStep, ProbeError> {
+        retry_get(
+            || self.get_once(url, headers, limit, range, redirects),
+            |retries| {
+                self.observe(RequestStage::RetryWait);
+                let jitter = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|n| n.subsec_millis() % 50)
+                    .unwrap_or(0);
+                self.retry_wait(Duration::from_millis(
+                    100 * (1 << retries) + u64::from(jitter),
+                ))
+            },
+        )
+    }
 }
 struct FinishRequest<'a>(Option<&'a RequestMeasurements>);
 impl Drop for FinishRequest<'_> {
@@ -389,19 +412,7 @@ impl Fetch for Http {
             if !trusted(&url) {
                 return Err(ProbeError::UnsafeUrl);
             }
-            let step = retry_get(
-                || self.get_once(&url, &headers, limit, range, redirects),
-                |retries| {
-                    self.observe(RequestStage::RetryWait);
-                    let jitter = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|n| n.subsec_millis() % 50)
-                        .unwrap_or(0);
-                    self.retry_wait(Duration::from_millis(
-                        100 * (1 << retries) + u64::from(jitter),
-                    ))
-                },
-            )?;
+            let step = self.exchange(&url, &headers, limit, range, redirects)?;
             match step {
                 GetStep::Reply(reply) => return Ok(reply),
                 GetStep::Redirect(next) => url = next,
@@ -411,17 +422,360 @@ impl Fetch for Http {
     }
 }
 
+/// Loopback HTTP for tests. Production clients stay HTTPS-only and still reject untrusted hosts.
+#[cfg(test)]
+pub(crate) mod local_http {
+    use super::{Client, Fetch, GetStep, HeaderMap, Http, Policy, ProbeError, Reply, Url};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread::{self, JoinHandle},
+        time::Duration,
+    };
+
+    pub(crate) struct LocalRequest {
+        pub path: String,
+        pub query: Option<String>,
+        pub token: Option<String>,
+        pub cookie: Option<String>,
+        pub partial_key: Option<String>,
+    }
+    pub(crate) struct LocalReply {
+        pub status: u16,
+        pub headers: Vec<(String, String)>,
+        pub body: Vec<u8>,
+    }
+    pub(crate) struct LocalHttp {
+        origin: String,
+        log: Arc<Mutex<Vec<LocalRequest>>>,
+        stop: Arc<AtomicBool>,
+        server: Option<JoinHandle<()>>,
+    }
+    impl LocalHttp {
+        pub(crate) fn spawn(
+            handler: impl Fn(&LocalRequest) -> LocalReply + Send + Sync + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+            listener
+                .set_nonblocking(true)
+                .expect("loopback nonblocking");
+            let address = listener.local_addr().expect("loopback address");
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let recorded = Arc::clone(&log);
+            let stop_flag = Arc::clone(&stop);
+            let handler = Arc::new(handler);
+            let server = thread::spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            socket.set_nonblocking(false).expect("accepted socket");
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .expect("read timeout");
+                            socket
+                                .set_write_timeout(Some(Duration::from_secs(2)))
+                                .expect("write timeout");
+                            let request = read_request(&mut socket);
+                            let reply = handler(&request);
+                            write_reply(&mut socket, &reply);
+                            recorded.lock().expect("request log").push(request);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("local http accept: {error}"),
+                    }
+                }
+            });
+            Self {
+                origin: format!("http://{address}"),
+                log,
+                stop,
+                server: Some(server),
+            }
+        }
+        pub(crate) fn origin(&self) -> &str {
+            &self.origin
+        }
+        pub(crate) fn finish(mut self) -> Vec<LocalRequest> {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(server) = self.server.take() {
+                server.join().expect("local http server");
+            }
+            std::mem::take(&mut *self.log.lock().expect("request log"))
+        }
+    }
+    impl Drop for LocalHttp {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+    fn read_request(socket: &mut std::net::TcpStream) -> LocalRequest {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if bytes.len() > 8192 {
+                panic!("local http headers exceeded 8192 bytes");
+            }
+            match socket.read(&mut chunk) {
+                Ok(0) => panic!("local http client closed before headers"),
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    // macOS keeps an accepted socket nonblocking. Wait for the request.
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "local http request did not arrive"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("local http read: {error}"),
+            }
+        }
+        let text = std::str::from_utf8(&bytes).expect("local http headers are utf-8");
+        let mut lines = text.split("\r\n");
+        let target = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("local http request line");
+        let (path, query) = target
+            .split_once('?')
+            .map(|(path, query)| (path.to_string(), Some(query.to_string())))
+            .unwrap_or_else(|| (target.to_string(), None));
+        let mut token = None;
+        let mut cookie = None;
+        let mut partial_key = None;
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim().to_string();
+            match name.to_ascii_lowercase().as_str() {
+                "x-radiko-authtoken" => token = Some(value),
+                "cookie" => cookie = Some(value),
+                "x-radiko-partialkey" => partial_key = Some(value),
+                _ => {}
+            }
+        }
+        LocalRequest {
+            path,
+            query,
+            token,
+            cookie,
+            partial_key,
+        }
+    }
+    fn write_reply(socket: &mut std::net::TcpStream, reply: &LocalReply) {
+        let reason = match reply.status {
+            200 => "OK",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "Status",
+        };
+        let mut head = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {len}\r\nConnection: close\r\n",
+            status = reply.status,
+            len = reply.body.len(),
+        );
+        for (name, value) in &reply.headers {
+            assert!(
+                !name.bytes().any(|b| b == b'\r' || b == b'\n' || b == b':')
+                    && !value.bytes().any(|b| b == b'\r' || b == b'\n'),
+                "local http header contains a line break"
+            );
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        socket
+            .write_all(head.as_bytes())
+            .expect("local http response");
+        socket.write_all(&reply.body).expect("local http body");
+    }
+
+    /// Speaks real HTTP to `origin`, then uses the production status mapping and retry budget.
+    pub(crate) struct LoopbackFetch {
+        http: Http,
+        origin: String,
+        renewals: AtomicUsize,
+    }
+    impl LoopbackFetch {
+        pub(crate) fn open(origin: &str) -> Result<Self, ProbeError> {
+            let mut http = Http::new()?;
+            // The production constructor remains HTTPS-only. This replacement is test-only.
+            http.client = Client::builder()
+                .redirect(Policy::none())
+                .no_proxy()
+                .pool_max_idle_per_host(0)
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(2))
+                .build()
+                .map_err(|_| ProbeError::Network)?;
+            Ok(Self {
+                http,
+                origin: origin.to_string(),
+                renewals: AtomicUsize::new(0),
+            })
+        }
+        pub(crate) fn renewals(&self) -> usize {
+            self.renewals.load(Ordering::Relaxed)
+        }
+        fn rewrite(&self, url: &Url) -> Result<Url, ProbeError> {
+            let mut target = Url::parse(&self.origin).map_err(|_| ProbeError::UnsafeUrl)?;
+            target.set_path(url.path());
+            target.set_query(url.query());
+            Ok(target)
+        }
+    }
+    impl Fetch for LoopbackFetch {
+        fn note_reauthentication(&self) {
+            self.renewals.fetch_add(1, Ordering::Relaxed);
+            self.http.note_reauthentication();
+        }
+        fn get(
+            &self,
+            url: Url,
+            headers: HeaderMap,
+            limit: usize,
+            range: Option<(u64, u64)>,
+            redirects: bool,
+        ) -> Result<Reply, ProbeError> {
+            let target = self.rewrite(&url)?;
+            match self
+                .http
+                .exchange(&target, &headers, limit, range, redirects)?
+            {
+                GetStep::Reply(reply) => Ok(reply),
+                // These tests do not redirect. Production redirect checks stay in `Http::get`.
+                GetStep::Redirect(_) => Err(ProbeError::UnsafeUrl),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::local_http::{LocalHttp, LocalReply, LoopbackFetch};
     use super::*;
-    #[test]
-    #[ignore = "explicit loopback mock: requires local listening permission, no external network"]
-    fn local_mock_http_retry_discards_partial_body_and_keeps_numeric_diagnostics() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            thread,
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+    };
+
+    /// macOS inherits `O_NONBLOCK` onto accepted sockets. Linux does not.
+    fn accept_blocking(listener: &TcpListener, deadline: std::time::Instant) -> TcpStream {
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "local client never connected"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("local mock accept: {error}"),
+            }
         };
+        socket.set_nonblocking(false).expect("blocking socket");
+        socket
+    }
+    fn read_some(socket: &mut TcpStream, deadline: std::time::Instant) {
+        let mut request = [0; 1024];
+        loop {
+            match socket.read(&mut request) {
+                Ok(0) => panic!("local mock closed before request"),
+                Ok(_) => return,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "local request did not arrive"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("local mock read: {error}"),
+            }
+        }
+    }
+    #[test]
+    fn local_mock_http_maps_401_403_and_429_without_retrying() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let step = AtomicUsize::new(0);
+        let server = LocalHttp::spawn(move |_| {
+            let status = match step.fetch_add(1, Ordering::Relaxed) {
+                0 => 401,
+                1 => 403,
+                _ => 429,
+            };
+            LocalReply {
+                status,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }
+        });
+        let http = LoopbackFetch::open(server.origin()).unwrap();
+        let url =
+            Url::parse("https://radiko.jp/audio/media.m3u8?signature=synthetic-secret").unwrap();
+        let Err(authentication) = http.get(url.clone(), HeaderMap::new(), 64, None, false) else {
+            panic!("401 must be an error");
+        };
+        let Err(denied) = http.get(url.clone(), HeaderMap::new(), 64, None, false) else {
+            panic!("403 must be an error");
+        };
+        let Err(limited) = http.get(url, HeaderMap::new(), 64, None, true) else {
+            panic!("429 must be an error");
+        };
+        assert!(matches!(authentication, ProbeError::Authentication));
+        assert!(matches!(denied, ProbeError::Denied));
+        assert!(matches!(limited, ProbeError::RateLimited));
+        assert_eq!(
+            authentication.to_string(),
+            "配信認証が拒否されました。sessionで会員認証を確認してください"
+        );
+        assert_eq!(
+            denied.to_string(),
+            "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）"
+        );
+        assert_eq!(
+            limited.to_string(),
+            "アクセス制限中です。時間をおいて再実行してください"
+        );
+        assert!(!format!("{authentication} {denied} {limited}").contains("synthetic-secret"));
+        assert_eq!(http.renewals(), 0);
+        assert_eq!(server.finish().len(), 3);
+    }
+    #[test]
+    fn local_mock_http_retry_discards_partial_body_and_keeps_numeric_diagnostics() {
         for partial in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -429,21 +783,11 @@ mod tests {
             let server = thread::spawn(move || {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
                 for attempt in 0..2 {
-                    let mut socket = loop {
-                        match listener.accept() {
-                            Ok((socket, _)) => break socket,
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                assert!(std::time::Instant::now() < deadline);
-                                thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(error) => panic!("local mock accept: {error}"),
-                        }
-                    };
+                    let mut socket = accept_blocking(&listener, deadline);
                     socket
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
-                    let mut request = [0; 1024];
-                    assert!(socket.read(&mut request).unwrap() > 0);
+                    read_some(&mut socket, deadline);
                     let response: &[u8] = if attempt == 1 {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
                     } else if partial {
@@ -493,14 +837,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "explicit loopback mock: requires local listening permission, no external network"]
     fn local_mock_http_retains_header_body_timeout_and_404_diagnostics() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            sync::mpsc,
-            thread,
-        };
+        use std::sync::mpsc;
         for status in [None, Some(200), Some(404)] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -508,24 +846,11 @@ mod tests {
             let (release, wait) = mpsc::channel();
             let server = thread::spawn(move || {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                let mut socket = loop {
-                    match listener.accept() {
-                        Ok((socket, _)) => break socket,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "local client never connected"
-                            );
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => panic!("local mock accept: {error}"),
-                    }
-                };
+                let mut socket = accept_blocking(&listener, deadline);
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                let mut request = [0; 1024];
-                assert!(socket.read(&mut request).unwrap() > 0);
+                read_some(&mut socket, deadline);
                 if status == Some(200) {
                     socket
                         .write_all(
@@ -543,7 +868,12 @@ mod tests {
             // target checks remain HTTPS-only; no account, DNS, or radiko request is used.
             http.client = Client::builder()
                 .no_proxy()
-                .timeout(Duration::from_millis(250))
+                // A fast local 404 must win against scheduler delay. The hang cases stay short.
+                .timeout(if status == Some(404) {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(250)
+                })
                 .build()
                 .unwrap();
             let measurements = http.enable_diagnostics();

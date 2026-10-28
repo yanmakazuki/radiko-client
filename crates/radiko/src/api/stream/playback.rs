@@ -1738,6 +1738,112 @@ mod tests {
         assert!(source.http.steps.borrow().is_empty());
     }
     #[test]
+    fn local_mock_http_playlist_401_reauthenticates_once_over_real_http() {
+        use crate::api::http::local_http::{LocalHttp, LocalReply, LoopbackFetch};
+        let renewed = stamped(11, "new", "2026-10-15T12:00:05+09:00");
+        let server = LocalHttp::spawn(move |request| match request.path.as_str() {
+            "/audio/s10.aac" => LocalReply {
+                status: 200,
+                headers: Vec::new(),
+                body: vec![10],
+            },
+            "/audio/s11.aac" => LocalReply {
+                status: 200,
+                headers: Vec::new(),
+                body: vec![11],
+            },
+            "/audio/media.m3u8" if request.token.as_deref() == Some("synthetic-renewed-token") => {
+                LocalReply {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: renewed.clone(),
+                }
+            }
+            "/audio/media.m3u8" => LocalReply {
+                status: 401,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            "/v2/api/auth1" => LocalReply {
+                status: 200,
+                headers: vec![
+                    (
+                        "x-radiko-authtoken".into(),
+                        "synthetic-renewed-token".into(),
+                    ),
+                    ("x-radiko-keyoffset".into(), "1".into()),
+                    ("x-radiko-keylength".into(), "4".into()),
+                ],
+                body: b"OK".to_vec(),
+            },
+            "/v2/api/auth2" => LocalReply {
+                status: 200,
+                headers: Vec::new(),
+                body: b"JP13,Tokyo\n".to_vec(),
+            },
+            _ => LocalReply {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        });
+        let mut headers = HeaderMap::new();
+        let mut expired = HeaderValue::from_static("synthetic-expired-token");
+        expired.set_sensitive(true);
+        headers.insert("x-radiko-authtoken", expired);
+        let mut source = HlsStream::new(
+            LoopbackFetch::open(server.origin()).unwrap(),
+            Url::parse("https://radiko.jp/audio/media.m3u8").unwrap(),
+            headers,
+            parsed(&stamped(10, "old", "2026-10-15T12:00:00+09:00")),
+            Some("mp4a.40.2".into()),
+        )
+        .unwrap();
+        source.refresh = Some(playback_refresh("synthetic-member".into()));
+        let first = source.poll(Instant::now());
+        let second = source.poll(Instant::now());
+        let log = server.finish();
+        let Next::Segment(first) = first.unwrap() else {
+            panic!("first segment");
+        };
+        let Next::Segment(second) = second.unwrap() else {
+            panic!("segment after re-auth");
+        };
+        assert_eq!(first.bytes, vec![10]);
+        assert_eq!(second.bytes, vec![11]);
+        assert!(second.starts_at > first.starts_at);
+        assert_eq!(
+            second.starts_at.unwrap() - first.starts_at.unwrap(),
+            Duration::seconds(5)
+        );
+        assert!(!second.discontinuity);
+        assert_eq!(source.next, 12);
+        assert_eq!(source.http.renewals(), 1);
+        assert_eq!(log.len(), 6);
+        assert_eq!(log[0].path, "/audio/s10.aac");
+        assert_eq!(log[0].query.as_deref(), Some("signature=old"));
+        assert!(log[0].token.is_none());
+        assert_eq!(log[1].path, "/audio/media.m3u8");
+        assert_eq!(log[1].token.as_deref(), Some("synthetic-expired-token"));
+        assert_eq!(log[2].path, "/v2/api/auth1");
+        assert_eq!(
+            log[2].cookie.as_deref(),
+            Some("radiko_session=synthetic-member")
+        );
+        assert!(log[2].token.is_none());
+        assert_eq!(log[3].path, "/v2/api/auth2");
+        assert_eq!(log[3].token.as_deref(), Some("synthetic-renewed-token"));
+        assert_eq!(
+            log[3].partial_key.as_deref(),
+            Some(partial_key(1, 4).unwrap().as_str())
+        );
+        assert_eq!(log[4].path, "/audio/media.m3u8");
+        assert_eq!(log[4].token.as_deref(), Some("synthetic-renewed-token"));
+        assert_eq!(log[5].path, "/audio/s11.aac");
+        assert_eq!(log[5].query.as_deref(), Some("signature=new"));
+        assert!(log[5].token.is_none());
+    }
+    #[test]
     fn segment_401_refreshes_the_signed_url_once_and_does_not_advance_twice() {
         let mut source = authed(
             &media(0, 1, false, "old", false),

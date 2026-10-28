@@ -841,7 +841,7 @@ fn play_loop<S: AudioSink>(
             && !paused
             && current.is_none()
             && !eof
-            && !output.as_ref().is_some_and(|o| o.accepted() >= maximum)
+            && output.as_ref().is_none_or(|o| o.accepted() < maximum)
         {
             let event = rx.try_recv();
             if stop.is_cancelled() {
@@ -926,7 +926,7 @@ fn play_loop<S: AudioSink>(
             && current.is_none()
             && !eof
             && !paused
-            && !output.as_ref().is_some_and(|o| o.accepted() >= maximum);
+            && output.as_ref().is_none_or(|o| o.accepted() < maximum);
         let silent_for = last_pcm_at.elapsed();
         let reconnecting_for = silence_reconnect(
             waiting_for_audio,
