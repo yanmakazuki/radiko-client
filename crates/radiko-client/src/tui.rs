@@ -5,6 +5,7 @@ mod filters;
 mod help;
 mod login;
 mod named;
+mod offline;
 mod picker;
 mod scroll;
 mod seek;
@@ -51,7 +52,7 @@ use std::{
     },
     time::Duration,
 };
-const USAGE: &str = "tui [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。";
+const USAGE: &str = "tui [--offline] [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。\n--offline は試験用の番組表だけで起動し、通信と音声出力はしません。";
 fn named_receipt(result: &Result<NamedOutcome, radiko::app::named::Error>) -> String {
     match result {
         Ok(NamedOutcome::Saved(name)) => format!("「{name}」を保存しました"),
@@ -125,6 +126,7 @@ struct Screen {
     list_height: usize,
     input: Option<String>,
     preferences_notice: String,
+    offline: bool,
 }
 impl Screen {
     fn new(criteria: SearchCriteria, preferences_notice: String) -> Self {
@@ -168,6 +170,7 @@ impl Screen {
             list_height: 1,
             input: None,
             preferences_notice,
+            offline: false,
         }
     }
     fn dispatch_requested(
@@ -179,9 +182,14 @@ impl Screen {
         chapters: &mut ChapterService,
     ) -> Result<(), &'static str> {
         if let Some(credentials) = self.login_requested.take() {
-            self.auth_refresh = false;
-            authentication.cancel();
-            login_service.submit(self.app.authentication.begin_login()?, credentials)?;
+            if self.offline {
+                drop(credentials);
+                self.playback_notice = "オフライン確認ではログインしません".into();
+            } else {
+                self.auth_refresh = false;
+                authentication.cancel();
+                login_service.submit(self.app.authentication.begin_login()?, credentials)?;
+            }
         }
         if std::mem::take(&mut self.logout_requested) {
             player.stop();
@@ -191,10 +199,17 @@ impl Screen {
             logout.submit(self.app.authentication.begin_logout()?)?;
         }
         if std::mem::take(&mut self.auth_refresh) {
-            authentication.submit(self.app.authentication.begin()?);
+            if self.offline {
+                self.playback_notice = "オフライン確認ではセッションを通信確認しません".into();
+            } else {
+                authentication.submit(self.app.authentication.begin()?);
+            }
         }
         if let Some(action) = self.chapter_action.take() {
             match action {
+                ChapterAction::Fetch(_, _) if self.offline => {
+                    self.chapter_notice = "オフライン確認ではチャプターを取得しません".into();
+                }
                 ChapterAction::Fetch(id, target) => chapters.submit(id, *target),
                 ChapterAction::Cancel => chapters.cancel(),
             }
@@ -206,6 +221,15 @@ impl Screen {
         let Some(action) = self.playback_action.take() else {
             return;
         };
+        if self.offline
+            && !matches!(
+                action,
+                PlaybackAction::Stop | PlaybackAction::Command(Command::Volume(_))
+            )
+        {
+            self.playback_notice = "オフライン確認では再生しません".into();
+            return;
+        }
         let volume = match &action {
             PlaybackAction::Command(Command::Volume(volume)) => Some((*volume).min(100)),
             _ => None,
@@ -804,9 +828,21 @@ impl Screen {
                     self.failure_list.select(Some(0));
                 }
             }
-            KeyCode::Char('a') => self.auth_refresh = true,
+            KeyCode::Char('a') => {
+                if self.offline {
+                    self.playback_notice = "オフライン確認ではセッションを通信確認しません".into();
+                } else {
+                    self.auth_refresh = true;
+                }
+            }
             KeyCode::Char('O') => self.logout_confirm = true,
-            KeyCode::Char('I') => self.login = Some(login::Editor::default()),
+            KeyCode::Char('I') => {
+                if self.offline {
+                    self.playback_notice = "オフライン確認ではログインしません".into();
+                } else {
+                    self.login = Some(login::Editor::default());
+                }
+            }
             KeyCode::Char('b') => {
                 self.named_generation = self
                     .named_generation
@@ -823,7 +859,9 @@ impl Screen {
                 ));
             }
             KeyCode::Char('c') => {
-                if let Some(target) = self.selected().cloned() {
+                if self.offline {
+                    self.playback_notice = "オフライン確認ではチャプターを取得しません".into();
+                } else if let Some(target) = self.selected().cloned() {
                     self.open_chapters(target)?;
                 }
             }
@@ -854,7 +892,9 @@ impl Screen {
                 viewport::navigate(&mut self.list, count, self.list_height, key.code);
             }
             KeyCode::Enter => {
-                if let Some(program) = self.selected() {
+                if self.offline {
+                    self.playback_notice = "オフライン確認では再生しません".into();
+                } else if let Some(program) = self.selected() {
                     let request = if self.live_mode {
                         playback::live_request
                     } else {
@@ -873,7 +913,9 @@ impl Screen {
                 }
             }
             KeyCode::Char('l') if self.app.chapters.target.is_none() => {
-                if let Some(program) = self.selected() {
+                if self.offline {
+                    self.playback_notice = "オフライン確認では再生しません".into();
+                } else if let Some(program) = self.selected() {
                     match playback::live_request(program, Utc::now().fixed_offset()) {
                         Ok(_) => self.playback_action = Some(PlaybackAction::Live(program.clone())),
                         Err(reason) => self.playback_notice = reason.into(),
@@ -1182,18 +1224,23 @@ fn draw_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, a
         Scope::Areas(ids) => ids.join(","),
     };
     let filter = screen.app.committed.filter();
+    let mode = if screen.live_mode
+        && radiko::domain::broadcast_day(now)
+            .is_some_and(|day| day != screen.app.committed.range().start())
+    {
+        "ライブ（取得日が当日と異なります・rで更新）"
+    } else if screen.live_mode {
+        "ライブ（放送中のみ）"
+    } else {
+        "タイムフリー"
+    };
+    let mode = if screen.offline {
+        format!("{mode} / オフライン確認")
+    } else {
+        mode.to_string()
+    };
     let header = format!(
-        "{} / {} / {}〜{}（日本時間・05:00区切り）\nキーワード: {}\n番組ジャンル: {} / 出演者分類: {}\n認証: {}\n{}",
-        if screen.live_mode
-            && radiko::domain::broadcast_day(now)
-                .is_some_and(|day| day != screen.app.committed.range().start())
-        {
-            "ライブ（取得日が当日と異なります・rで更新）"
-        } else if screen.live_mode {
-            "ライブ（放送中のみ）"
-        } else {
-            "タイムフリー"
-        },
+        "{mode} / {} / {}〜{}（日本時間・05:00区切り）\nキーワード: {}\n番組ジャンル: {} / 出演者分類: {}\n認証: {}\n{}",
         scope,
         screen.app.committed.range().start(),
         screen.app.committed.range().end(),
@@ -1532,6 +1579,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         stdout_ln!("{USAGE}");
         return Ok(());
     }
+    let (offline, args) = offline::split_args(args);
     if args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--json" | "--classifications"))
@@ -1542,7 +1590,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     let explicit = if args.is_empty() {
         None
     } else {
-        Some(crate::programs::criteria(args, now)?)
+        Some(crate::programs::criteria(&args, now)?)
     };
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("tuiは対話端末で実行してください".into());
@@ -1570,13 +1618,51 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         let _restore = RestoreTerminal;
         let mut terminal = ratatui::try_init()?;
         let mut screen = Screen::new(criteria, preferences_notice);
+        if offline {
+            screen.offline = true;
+            if !screen.preferences_notice.is_empty() {
+                screen.preferences_notice.push('\n');
+            }
+            screen.preferences_notice.push_str(offline::NOTICE);
+        }
         let rt = runtime.0.as_ref().ok_or("実行環境を開始できません")?;
         rt.block_on(async {
-            let mut service = Service::new_cancellable(CatalogClient::new_cancellable);
-            let mut player = PlaybackService::new(playback_dir);
-            let mut chapters = ChapterService::default();
-            let mut authentication = AuthService::new(auth_dir.clone());
-            let mut login_service = LoginService::new(auth_dir.clone());
+            let mut service = if offline {
+                Service::new(|| Ok(offline::Fixture))
+            } else {
+                Service::new_cancellable(CatalogClient::new_cancellable)
+            };
+            let mut player = if offline {
+                PlaybackService::with_factory(|_| {
+                    Err(radiko::player::playback::PlaybackError::Source(
+                        radiko::api::stream::ProbeError::AvailabilityUnknown,
+                    ))
+                })
+            } else {
+                PlaybackService::new(playback_dir)
+            };
+            let mut chapters = if offline {
+                ChapterService::with_cancellable_source(|_, _| {
+                    Err(radiko::api::stream::chapters::Error::Cancelled)
+                })
+            } else {
+                ChapterService::default()
+            };
+            let mut authentication = if offline {
+                let dir = auth_dir.clone();
+                AuthService::with_cancellable_check(move |cancel| {
+                    offline::session_status(dir.clone(), &cancel)
+                })
+            } else {
+                AuthService::new(auth_dir.clone())
+            };
+            let mut login_service = if offline {
+                LoginService::with_login(|_| {
+                    AuthStatus::LoginFailed(radiko::api::auth::AuthError::Cancelled)
+                })
+            } else {
+                LoginService::new(auth_dir.clone())
+            };
             let mut logout = LogoutService::new(auth_dir);
             let mut named_service = NamedService::new(named_dir);
             authentication.submit(screen.app.authentication.begin()?);
@@ -1707,6 +1793,35 @@ mod tests {
         let now = radiko::api::stream::parse_time("20261015060000").unwrap();
         let criteria = crate::programs::criteria(&["TBS".into(), "20261015".into()], now).unwrap();
         Screen::new(criteria, String::new())
+    }
+    #[test]
+    fn offline_keys_do_not_request_playback_login_or_chapters() {
+        let mut screen = screen();
+        screen.offline = true;
+        let mut search =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("offline keys must not fetch") });
+        for key in ['I', 'a', 'c', 'l'] {
+            screen
+                .key(
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                    &mut search,
+                )
+                .unwrap();
+            assert!(screen.playback_action.is_none());
+            assert!(screen.login.is_none());
+            assert!(!screen.auth_refresh);
+            assert!(screen.chapter_action.is_none());
+            assert!(!screen.playback_notice.is_empty());
+        }
+        screen.playback_notice.clear();
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
+        assert!(screen.playback_action.is_none());
+        assert!(screen.playback_notice.contains("再生しません"));
     }
     #[test]
     fn volume_display_changes_only_after_the_playback_service_accepts_the_command() {
