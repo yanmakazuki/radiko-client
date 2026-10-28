@@ -4,7 +4,7 @@
 //! `failed printing to stdout: Broken pipe` でパニックし、終了コード 101 になる。
 //! ここでは書き込みの `ErrorKind::BrokenPipe` を受け取り、メッセージを足さず
 //! 終了コード 141（128 + SIGPIPE）で戻す。SIGPIPE を既定動作へ戻す `unsafe` は使わない。
-//! stderr の進捗と失敗は `eprintln!` / `eprint!` のままである。
+//! 標準エラーの進捗と失敗は `stderr_ln!` に集め、書けないときは表示だけ捨てて終了コードは変えない。
 
 use std::fmt::Arguments;
 use std::io::{self, Write};

@@ -1,4 +1,5 @@
 //! 保存した検索条件を管理するオフラインCLI。番組取得や認証通信は行わない。
+use crate::stderr::stderr_ln;
 use crate::stdout::stdout_ln;
 use chrono::Utc;
 use radiko::{
@@ -63,7 +64,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                     None => SearchCriteria::initial(now)?,
                 },
                 Err(error) => {
-                    eprintln!("検索条件を復元できません: {error}（当日・全国・指定なしを使用）");
+                    stderr_ln!("検索条件を復元できません: {error}（当日・全国・指定なしを使用）");
                     SearchCriteria::initial(now)?
                 }
             };

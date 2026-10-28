@@ -86,8 +86,9 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
-        let mut controller =
-            Self::with_reporter(commands, stop, factory, |message| eprintln!("{message}"));
+        let mut controller = Self::with_reporter(commands, stop, factory, |message| {
+            crate::stderr::write_line(format_args!("{message}"));
+        });
         controller.notification_interval = Duration::from_secs(5);
         controller
     }
@@ -100,7 +101,7 @@ impl Controller {
         + 'static,
     ) -> Self {
         let mut controller = Self::with_cancellable_reporter(commands, stop, factory, |message| {
-            eprintln!("{message}")
+            crate::stderr::write_line(format_args!("{message}"));
         });
         controller.notification_interval = Duration::from_secs(5);
         controller

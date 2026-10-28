@@ -3,9 +3,11 @@ mod chapters;
 mod play;
 mod programs;
 mod searches;
+mod stderr;
 mod stdout;
 mod tui;
 
+use stderr::{stderr_ln, stderr_write};
 use stdout::stdout_ln;
 
 use radiko::{
@@ -21,7 +23,7 @@ use radiko::{
 };
 use std::{
     fs::File,
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Read},
     path::PathBuf,
     process::ExitCode,
     time::Duration,
@@ -133,7 +135,7 @@ fn probe_media(
         .load()?
         .ok_or("未ログインです。loginでログインしてください")?;
     let membership = MemberClient::new()?.check(&session)?;
-    eprintln!("会員セッション有効。放送枠・配信認証・HLSを検証しています…");
+    stderr_ln!("会員セッション有効。放送枠・配信認証・HLSを検証しています…");
     let report = if args[0] == "play-sample" {
         stream::probe_for_output(&args[1], mode, cursor, &session, &membership)?
     } else {
@@ -334,9 +336,12 @@ fn probe_output(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let cancelled = stop.clone();
         ctrlc::set_handler(move || cancelled.cancel())?;
         let summary = output::probe_silent(seconds, stop.clone(), |summary| {
-            eprintln!(
+            stderr_ln!(
                 "無音出力中: {}フレーム / {}Hz / {} / 不足{}フレーム",
-                summary.frames, summary.sample_rate, summary.sample_format, summary.underrun_frames
+                summary.frames,
+                summary.sample_rate,
+                summary.sample_format,
+                summary.underrun_frames
             );
         })?;
         stdout_ln!(
@@ -396,7 +401,7 @@ fn member_command(command: &str, store: &SessionStore) -> Result<(), Box<dyn std
     let saved = match store.load() {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("{error}。既存ファイルを保持して未ログインとして扱います");
+            stderr_ln!("{error}。既存ファイルを保持して未ログインとして扱います");
             None
         }
     };
@@ -413,8 +418,8 @@ fn member_command(command: &str, store: &SessionStore) -> Result<(), Box<dyn std
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Err("loginは対話端末で実行してください".into());
     }
-    eprint!("メールアドレス: ");
-    io::stderr().flush()?;
+    stderr_write!("メールアドレス: ");
+    radiko::stderr::flush();
     let mut mail = String::new();
     io::stdin().read_line(&mut mail)?;
     let password = zeroize::Zeroizing::new(rpassword::prompt_password("パスワード（非表示）: ")?);
@@ -450,7 +455,7 @@ fn main() -> ExitCode {
             ExitCode::from(stdout::BROKEN_PIPE_STATUS)
         }
         Err(error) => {
-            eprintln!(
+            stderr_ln!(
                 "エラー: {}",
                 radiko::player::playback::cli_error_body(error.as_ref())
             );

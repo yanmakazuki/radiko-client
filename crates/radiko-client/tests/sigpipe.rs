@@ -28,10 +28,15 @@ fn chapters_fixture() -> String {
     )
 }
 
-/// 読み口を、子プロセスが書くより前に閉じた標準出力。
-fn stdout_closed_before_start() -> Stdio {
+/// 読み口を、子プロセスが書くより前に閉じたパイプの書き口。
+fn closed_pipe_writer() -> Stdio {
     let (_reader, writer) = cloexec_pipe();
     Stdio::from(writer)
+}
+
+/// 読み口を、子プロセスが書くより前に閉じた標準出力。
+fn stdout_closed_before_start() -> Stdio {
+    closed_pipe_writer()
 }
 
 /// 両方の端に `FD_CLOEXEC` を付けたパイプ。
@@ -370,4 +375,273 @@ fn read_one_line_then_close_matches_head_without_a_panic() {
     assert!(code == 0 || code == 141, "code={code} stderr={stderr}");
     assert!(!line.is_empty());
     assert!(!stderr.contains("Broken pipe"), "{stderr}");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Stderr {
+    /// 読み手が最後まで読む。
+    Open,
+    /// `2>&-`。ファイル記述子 2 を閉じる。
+    ClosedFd,
+    /// パイプの読み口を、起動より前に閉じる。
+    ClosedReader,
+}
+
+fn code_with_stderr(args: &[String], mode: Stderr) -> i32 {
+    match mode {
+        Stderr::Open => {
+            let _guard = fork_guard();
+            let output = Command::new(binary())
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            code_of(output.status)
+        }
+        Stderr::ClosedFd => {
+            let _guard = fork_guard();
+            let output = Command::new("bash")
+                .arg("-c")
+                .arg(r#"exec "$@" 2>&-"#)
+                .arg("closed-stderr")
+                .arg(binary())
+                .args(args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.code().is_some(),
+                "bash/exec died on a signal: {}",
+                output.status
+            );
+            code_of(output.status)
+        }
+        Stderr::ClosedReader => {
+            let stderr = closed_pipe_writer();
+            let _guard = fork_guard();
+            let child = Command::new(binary())
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(stderr)
+                .spawn()
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            code_of(output.status)
+        }
+    }
+}
+
+fn sequence(mode: Stderr) -> Vec<i32> {
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path());
+    cases(&dir)
+        .into_iter()
+        .map(|(args, _)| {
+            let code = code_with_stderr(&args, mode);
+            assert_ne!(code, 101, "args={args:?} mode={mode:?} code={code}");
+            code
+        })
+        .collect()
+}
+
+#[test]
+fn closed_stderr_does_not_change_exit_codes_for_the_stdout_command_set() {
+    let open = sequence(Stderr::Open);
+    assert_eq!(sequence(Stderr::ClosedFd), open);
+    assert_eq!(sequence(Stderr::ClosedReader), open);
+}
+
+fn code_with_closed_stdout(args: &[String], mode: Stderr) -> i32 {
+    match mode {
+        Stderr::Open => {
+            let child = spawn(args, stdout_closed_before_start());
+            let output = child.wait_with_output().unwrap();
+            code_of(output.status)
+        }
+        Stderr::ClosedFd => {
+            let stdout = stdout_closed_before_start();
+            let _guard = fork_guard();
+            let status = Command::new("bash")
+                .arg("-c")
+                .arg(r#"exec "$@" 2>&-"#)
+                .arg("closed-stderr")
+                .arg(binary())
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(stdout)
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            code_of(status)
+        }
+        Stderr::ClosedReader => {
+            let stdout = closed_pipe_writer();
+            let stderr = closed_pipe_writer();
+            let _guard = fork_guard();
+            let mut child = Command::new(binary())
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn()
+                .unwrap();
+            code_of(child.wait().unwrap())
+        }
+    }
+}
+
+#[test]
+fn closed_stdout_stays_141_when_stderr_is_also_closed() {
+    for mode in [Stderr::ClosedFd, Stderr::ClosedReader] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = data_dir(root.path());
+        let open_root = tempfile::tempdir().unwrap();
+        let open_dir = data_dir(open_root.path());
+        let open_cases = cases(&open_dir);
+        for (index, (args, kind)) in cases(&dir).into_iter().enumerate() {
+            let code = code_with_closed_stdout(&args, mode);
+            let open = code_with_closed_stdout(&open_cases[index].0, Stderr::Open);
+            assert_ne!(code, 101, "args={args:?} mode={mode:?}");
+            assert_eq!(code, open, "args={args:?} mode={mode:?}");
+            match kind {
+                Kind::Writes => assert_eq!(code, 141, "args={args:?} mode={mode:?}"),
+                Kind::Empty => assert_eq!(code, 0, "args={args:?} mode={mode:?}"),
+                Kind::Fails(_) => assert_eq!(code, 1, "args={args:?} mode={mode:?}"),
+                Kind::Device => {
+                    assert!(
+                        code == 1 || code == 141,
+                        "args={args:?} mode={mode:?} code={code}"
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn dead_proxy(command: &mut Command) {
+    for key in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env(key, "http://127.0.0.1:1");
+    }
+    command.env_remove("NO_PROXY");
+    command.env_remove("no_proxy");
+}
+
+fn code_progress(args: &[String], mode: Stderr) -> i32 {
+    match mode {
+        Stderr::Open => {
+            let _guard = fork_guard();
+            let mut command = Command::new(binary());
+            dead_proxy(&mut command);
+            let output = command.args(args).stdin(Stdio::null()).output().unwrap();
+            code_of(output.status)
+        }
+        Stderr::ClosedFd => {
+            let _guard = fork_guard();
+            let mut command = Command::new("bash");
+            dead_proxy(&mut command);
+            let output = command
+                .arg("-c")
+                .arg(r#"exec "$@" 2>&-"#)
+                .arg("closed-stderr")
+                .arg(binary())
+                .args(args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .unwrap();
+            code_of(output.status)
+        }
+        Stderr::ClosedReader => {
+            let stderr = closed_pipe_writer();
+            let _guard = fork_guard();
+            let mut command = Command::new(binary());
+            dead_proxy(&mut command);
+            let child = command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(stderr)
+                .spawn()
+                .unwrap();
+            code_of(child.wait_with_output().unwrap().status)
+        }
+    }
+}
+
+#[test]
+fn program_progress_on_closed_stderr_exits_1_without_a_panic() {
+    // `programs --areas` reaches the progress line in programs.rs. A dead proxy
+    // fails the fetch before any radiko connection, and still runs that line.
+    let args_for = |dir: &str, tail: &[&str]| {
+        let mut args = vec!["--data-dir".to_string(), dir.to_string(), "programs".into()];
+        args.extend(tail.iter().copied().map(str::to_string));
+        args
+    };
+    for tail in [vec!["--areas", "JP13"], vec!["TBS", "20261001", "20261002"]] {
+        for mode in [Stderr::Open, Stderr::ClosedFd, Stderr::ClosedReader] {
+            let root = tempfile::tempdir().unwrap();
+            let args = args_for(data_dir(root.path()).as_str(), &tail);
+            let code = code_progress(&args, mode);
+            assert_eq!(code, 1, "args={args:?} mode={mode:?} code={code}");
+        }
+    }
+}
+
+fn prepared_dir(bytes: &[u8], name: &str, mode: u32) -> (tempfile::TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("data");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    (root, dir.to_str().unwrap().to_string())
+}
+
+#[test]
+fn stderr_messages_that_do_not_fail_the_command_keep_exit_0() {
+    for mode in [Stderr::Open, Stderr::ClosedFd, Stderr::ClosedReader] {
+        let (_root, dir) = prepared_dir(b"corrupt-synthetic-session", "session.json", 0o600);
+        let session = vec!["--data-dir".into(), dir.clone(), "session".into()];
+        assert_eq!(code_with_stderr(&session, mode), 0, "session mode={mode:?}");
+
+        let (_root, dir) = prepared_dir(b"not-json", "searches.json", 0o600);
+        let restore = vec![
+            "--data-dir".into(),
+            dir,
+            "searches".into(),
+            "restore".into(),
+        ];
+        assert_eq!(code_with_stderr(&restore, mode), 0, "restore mode={mode:?}");
+    }
+}
+
+#[test]
+fn search_save_and_restore_errors_on_closed_stderr_still_exit_1() {
+    for mode in [Stderr::Open, Stderr::ClosedFd, Stderr::ClosedReader] {
+        let (_root, dir) = prepared_dir(b"not-json", "searches.json", 0o644);
+        let save = vec!["--data-dir".into(), dir, "programs".into(), "TBS".into()];
+        let code = code_progress(&save, mode);
+        assert_eq!(code, 1, "save mode={mode:?} code={code}");
+
+        let (_root, dir) = prepared_dir(b"not-json", "searches.json", 0o600);
+        let restore = vec![
+            "--data-dir".into(),
+            dir,
+            "programs".into(),
+            "--restore".into(),
+        ];
+        let code = code_progress(&restore, mode);
+        assert_eq!(code, 1, "programs restore mode={mode:?} code={code}");
+    }
 }

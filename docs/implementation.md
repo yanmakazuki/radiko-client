@@ -4,6 +4,22 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月29日：閉じた標準エラーでは表示だけ捨て、終了コードは変えない
+
+Rust は SIGPIPE を無視する。標準エラーが閉じたパイプだと、進捗の書き込みが `failed printing to stderr` でパニックし、終了コード 101 になる。対象は CLI と、再生準備が状態を出す箇所である。
+
+標準エラーへの書き込みは `radiko::stderr` の一つに集めた。バイナリは `stderr_ln!` と、改行のない `stderr_write!` からそれを呼ぶ。ログインのプロンプトも同じである。書けないときは文字を捨てる。閉じたパイプでも、それ以外の書き込みエラーでも、終了コードは変えない。成功は 0、失敗は 1、閉じた標準出力は 141 のままである。SIGPIPE を `unsafe` で既定に戻すことはしない。
+
+統合テストは Unix の `#![cfg(unix)]` で、子プロセスの標準エラーを `2>&-` と、読む側を閉じたパイプの両方にする。判定は終了コードである。#42 の sigpipe と同じコマンド一式に加え、`programs --areas JP13` と局を指定した2日分が進捗表示を通る。こちらの取得は `127.0.0.1:1` へのプロキシで失敗させ、radiko には繋がない。終了は 1 のままである。壊れたセッションと検索条件、保存できない検索条件も、閉じた標準エラーで終了コードが変わらない。`tui --offline` は標準エラーを閉じて `q` を送り、終了 0 と端末属性・代替画面の復元を見る。
+
+標準エラーを開いたときの CLI 29 例は、`568e130` のバイナリと標準出力・標準エラーともバイト列が一致した。`--help` を含む。オフライン TUI の見える文字も一致した。同じバイナリでも疑似端末の生バイトは実行のたびにずれる。
+
+エラー行、番組表の進捗、検索条件の復元失敗を、それぞれ元の書き込みに戻すと、対応するテストが終了 101 で失敗した。戻したあとは元のヘルパーに戻している。ログインのプロンプトは、標準エラーが端末でないと到達しない。再生の状態表示と準備の報告は、会員セッションと配信が要る。無音出力の途中表示は、音声機器が要る。保存先を解決できない表示は、ホームディレクトリが無いときにだけ出る。これらは今回の自動テストでは到達していない。
+
+標準出力がパイプ以外で書けないとき、たとえば容量不足のとき、残りの番組表取得を止める処理は足していない。止めるのは、これまでどおり標準出力の `BrokenPipe` だけである。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 389 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 fmt`、同じオプションの clippy とテストも 389 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。この環境では AppArmor の sysctl は無く、`unshare -rn` はそのまま成功した。macOS はこの環境では実行していない。同じテストは `#![cfg(unix)]` なので、GitHub Actions の macos-15 でも走る。radiko への通信と実機の再生はない。音声デバイスは使っていない。
+
 ## 2026年10月28日：保持する通知を種類ごとに確認する
 
 表示の仕方は変えていない。`show_notice` の時刻だけ、画面が持つ時計を通す。本番はその時計が空なので、これまでどおり壁時計である。
@@ -184,7 +200,7 @@ TUI で、配信窓の先頭から再開したときの通知を「配信窓の�
 
 対象は `radiko-client` の CLI である。Rust は SIGPIPE を無視するため、`println!` が閉じたパイプへ書くと `failed printing to stdout: Broken pipe (os error 32)` でパニックし、終了コード 101 になる。`programs --areas JP13 | head -1` で再現する。
 
-選んだ方法は、標準出力の行を `stdout.rs` の `stdout_ln!` に集め、`ErrorKind::BrokenPipe` のときは stderr に足さず終了コード 141（128+SIGPIPE）で戻すことである。SIGPIPE を `unsafe` で既定に戻す方法は採らない。書き込みエラーを返すと、再生や取得の Drop が走り、終了コードをこちらで決められる。stderr の `eprintln!` と、ログインプロンプトの `eprint!` はそのままである。コード中の標準出力向け `println!` は CLI から外した。`print!` で標準出力へ書く箇所はなかった。テストと `build.rs` の `println!` は Cargo とテスト診断のままである。`stations` というサブコマンドはなく、局の表示は `programs` である。番組表の取得中にパイプが閉じたら、既存の取り消しフラグで残りの取得を止める。画面の TUI 本体は crossterm が端末へ書く。`tui --help` だけをこの行出力に含めた。
+選んだ方法は、標準出力の行を `stdout.rs` の `stdout_ln!` に集め、`ErrorKind::BrokenPipe` のときは stderr に足さず終了コード 141（128+SIGPIPE）で戻すことである。SIGPIPE を `unsafe` で既定に戻す方法は採らない。書き込みエラーを返すと、再生や取得の Drop が走り、終了コードをこちらで決められる。この節の時点では標準エラーの進捗と失敗をそのままにしていた。閉じた標準エラーで終了コードを変えない扱いは、後の節で `stderr_ln!` に集めている。コード中の標準出力向け `println!` は CLI から外した。`print!` で標準出力へ書く箇所はなかった。テストと `build.rs` の `println!` は Cargo とテスト診断のままである。`stations` というサブコマンドはなく、局の表示は `programs` である。番組表の取得中にパイプが閉じたら、既存の取り消しフラグで残りの取得を止める。画面の TUI 本体は crossterm が端末へ書く。`tui --help` だけをこの行出力に含めた。
 
 確認環境は Linux x86_64、Rust 1.99.1、音声デバイスなしである。`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features` は 332 件成功、失敗 0、ignored 4 件のままである。統合テスト `sigpipe` は、読み口を閉じたパイプと bash の `| head -1` を、ヘルプと `login`、`session`、`logout`、`probe-live`、`probe-timefree`、`play-live`、`play-timefree`、`output-info`、`probe-output`、`play-sample`、`programs`、`tui --help`、`searches`、`chapters`、`inspect-chapters` に対して実行する。標準出力へ書くコマンドは、閉じたパイプで終了 141、panic なし、stderr に新たなエラーなしである。書く前に失敗するコマンドは終了 1 のままである。読み切ったときの `--help`、`searches show` / `restore` の JSON、`inspect-chapters` の全文は終了 0 で欠けるところはない。`output-info` と `probe-output` は機器がないため終了 1、stderr は「エラー: 既定の音声出力機器がありません」だけである。
 

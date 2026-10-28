@@ -27,6 +27,7 @@ mod screen;
 mod scroll;
 mod seek;
 mod viewport;
+use crate::stderr::stderr_ln;
 use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -474,28 +475,28 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         })
     };
     if let Some(notice) = login_exit_notice {
-        eprintln!("ログイン: {notice}");
+        stderr_ln!("ログイン: {notice}");
     }
     if login_pending {
-        eprintln!("ログイン結果が未確認です。sessionで保存状態を確認してください");
+        stderr_ln!("ログイン結果が未確認です。sessionで保存状態を確認してください");
     }
     if let Some(notice) = logout_exit_notice {
-        eprintln!("ログアウト: {notice}");
+        stderr_ln!("ログアウト: {notice}");
     }
     if logout_pending {
-        eprintln!("ログアウト結果が未確認です。保存セッションの削除を確認してください");
+        stderr_ln!("ログアウト結果が未確認です。保存セッションの削除を確認してください");
     }
     if named_write_pending {
-        eprintln!("保存条件の書き込み結果が未確認です。前回条件の終了時保存は省略しました");
+        stderr_ln!("保存条件の書き込み結果が未確認です。前回条件の終了時保存は省略しました");
     } else if let Ok(criteria) = &result {
         if let Some(store) = store {
             if let Err(error) = store.save_last(criteria.clone()) {
-                eprintln!("条件保存失敗: {error}");
+                stderr_ln!("条件保存失敗: {error}");
             }
         }
     }
     if let Some(notice) = named_exit_notice {
-        eprintln!("{notice}");
+        stderr_ln!("{notice}");
     }
     result.map(|_| ())
 }
