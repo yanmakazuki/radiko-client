@@ -1,3 +1,4 @@
+use super::*;
     #[test]
     fn help_never_dispatches_search_authentication_or_playback_and_closes_without_quitting() {
         let mut screen = screen();
@@ -223,7 +224,7 @@
     }
     fn program() -> Program {
         radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )

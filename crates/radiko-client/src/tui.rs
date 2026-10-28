@@ -468,16 +468,4 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
-    fn screen() -> Screen {
-        let now = radiko::api::stream::parse_time("20261015060000").unwrap();
-        let criteria = crate::programs::criteria(&["TBS".into(), "20261015".into()], now).unwrap();
-        Screen::new(criteria, String::new())
-    }
-    include!("tui_tests_editing.rs");
-    include!("tui_tests_status.rs");
-    include!("tui_tests_keys.rs");
-    include!("tui_tests_chapters.rs");
-}
+mod tests;

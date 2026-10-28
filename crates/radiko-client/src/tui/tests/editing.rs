@@ -1,3 +1,4 @@
+use super::*;
     #[test]
     fn offline_keys_do_not_request_playback_login_chapters_or_stored_state() {
         let mut screen = screen();
@@ -63,7 +64,7 @@
             assert!(screen.playback_action.is_none());
         }
         let program = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -120,7 +121,7 @@
         let mut screen = screen();
         let original = screen.app.committed.clone();
         let mut p = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -309,7 +310,7 @@
     fn live_rows_update_at_slot_boundaries_without_fetching_or_starting_playback() {
         let mut screen = screen();
         let mut programs = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -353,7 +354,7 @@
         let mut search =
             Service::new(|| -> Result<CatalogClient, _> { panic!("enter must not search") });
         let mut p = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )

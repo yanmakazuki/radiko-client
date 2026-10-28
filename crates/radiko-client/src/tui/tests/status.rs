@@ -1,3 +1,4 @@
+use super::*;
     #[test]
     fn auth_refresh_is_independent_of_search_and_playback_and_is_text_during_editing() {
         let mut screen = screen();
@@ -657,7 +658,7 @@
         let mut search =
             Service::new(|| -> Result<CatalogClient, _> { panic!("navigation must not fetch") });
         let template = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -708,7 +709,7 @@
         let mut search =
             Service::new(|| -> Result<CatalogClient, _> { panic!("navigation must not fetch") });
         let template = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )

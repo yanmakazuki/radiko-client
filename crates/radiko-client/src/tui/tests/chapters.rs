@@ -1,3 +1,4 @@
+use super::*;
     #[test]
     fn question_mark_in_keyword_draft_does_not_open_help_or_fetch() {
         let mut screen = screen();
@@ -29,7 +30,7 @@
         let mut search =
             Service::new(|| -> Result<CatalogClient, _> { panic!("jump must not search") });
         let program = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -47,7 +48,7 @@
                 title: Some(program.title.clone()),
                 outcome: Outcome::Aligned(
                     radiko::api::parse_chapters(
-                        include_bytes!("../../../tests/fixtures/chapters.json"),
+                        include_bytes!("../../../../../tests/fixtures/chapters.json"),
                         Duration::from_secs(90),
                         0.0,
                     )
@@ -156,7 +157,7 @@
         let mut search =
             Service::new(|| -> Result<CatalogClient, _> { panic!("chapter keys must not search") });
         let program = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -205,7 +206,7 @@
                 title: Some(program.title.clone()),
                 outcome: radiko::api::stream::chapters::Outcome::Candidates(
                     radiko::api::parse_chapters(
-                        include_bytes!("../../../tests/fixtures/chapters.json"),
+                        include_bytes!("../../../../../tests/fixtures/chapters.json"),
                         Duration::from_secs(90),
                         0.0,
                     )
@@ -331,7 +332,7 @@
     fn chapter_loading_unavailable_unresolved_and_failure_render_distinctly_at_small_sizes() {
         let mut screen = screen();
         let target = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -388,7 +389,7 @@
             panic!("playback keys must not fetch search")
         });
         let mut programs = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
@@ -616,7 +617,7 @@
         let mut screen = screen();
         let id = screen.app.commit().unwrap();
         let list = radiko::api::catalog::parse_programs(
-            include_bytes!("../../../tests/fixtures/schedule.xml"),
+            include_bytes!("../../../../../tests/fixtures/schedule.xml"),
             "TBS",
             radiko::api::catalog::parse_day("20261015").unwrap(),
         )
