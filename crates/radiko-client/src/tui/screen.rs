@@ -31,6 +31,7 @@ impl Screen {
             playback_action: None,
             playback_notice: String::new(),
             notice_hold: super::NoticeHold::Other,
+            notice_hold_until: None,
             playback_stopped: false,
             playback_ended: false,
             seen_reauthentications: 0,
@@ -132,12 +133,16 @@ impl Screen {
         }
     }
     pub(super) fn apply_playback(&mut self, update: playback::Update) {
+        self.apply_playback_at(update, std::time::Instant::now());
+    }
+    pub(super) fn apply_playback_at(&mut self, update: playback::Update, now: std::time::Instant) {
         if update.new_session {
             self.app.playback = None;
             self.playback_diagnostics.clear();
             self.pipeline_diagnostics.clear();
             self.playback_notice.clear();
             self.notice_hold = super::NoticeHold::Other;
+            self.notice_hold_until = None;
             self.playback_stopped = false;
             self.playback_ended = false;
             self.seen_reauthentications = 0;
@@ -167,6 +172,7 @@ impl Screen {
             self.playback_diagnostics =
                 format!("直近通知（終了時未集計）: {}", self.playback_diagnostics);
         }
+        let has_snapshot = update.snapshot.is_some();
         let reconnecting_for = update
             .snapshot
             .as_ref()
@@ -207,51 +213,62 @@ impl Screen {
             if !self.playback_stopped && !self.playback_ended {
                 self.playback_notice = "配信認証を更新して再生を続けます".into();
                 self.notice_hold = super::NoticeHold::AuthRenewal;
+                self.notice_hold_until = Some(now + super::NOTICE_HOLD);
             }
         }
         let at_head = http.is_some_and(|http| http.joined_window_head);
         let paused = snapshot_state == Some(radiko::player::state::PlaybackState::Paused);
         let before_audio = snapshot_state == Some(radiko::player::state::PlaybackState::Buffering);
-        let held = matches!(
-            self.notice_hold,
-            super::NoticeHold::AuthRenewal | super::NoticeHold::CatchUp
-        );
-        let show_gap =
-            !self.playback_stopped && !self.playback_ended && !paused && !before_audio && !held;
-        if show_gap {
-            if let Some(elapsed) = reconnecting_for {
-                self.playback_notice = radiko::player::playback::reconnect_notice(elapsed);
-                self.notice_hold = super::NoticeHold::Reconnecting;
-            } else if receiving {
-                self.playback_notice = radiko::player::playback::RECEPTION_NOTICE.into();
-                self.notice_hold = super::NoticeHold::Receiving;
-            } else if matches!(
+        let held = self.notice_hold_until.is_some_and(|until| now < until)
+            && matches!(
                 self.notice_hold,
-                super::NoticeHold::Receiving | super::NoticeHold::Reconnecting
-            ) {
+                super::NoticeHold::AuthRenewal | super::NoticeHold::CatchUp
+            );
+        // An empty poll has no snapshot. Leaving the notice alone stops the
+        // once-a-second blink: most 50ms ticks carry no playback snapshot.
+        if has_snapshot {
+            let show_gap =
+                !self.playback_stopped && !self.playback_ended && !paused && !before_audio && !held;
+            if show_gap {
+                if let Some(elapsed) = reconnecting_for {
+                    self.playback_notice = radiko::player::playback::reconnect_notice(elapsed);
+                    self.notice_hold = super::NoticeHold::Reconnecting;
+                    self.notice_hold_until = None;
+                } else if receiving {
+                    self.playback_notice = radiko::player::playback::RECEPTION_NOTICE.into();
+                    self.notice_hold = super::NoticeHold::Receiving;
+                    self.notice_hold_until = None;
+                } else if matches!(
+                    self.notice_hold,
+                    super::NoticeHold::Receiving | super::NoticeHold::Reconnecting
+                ) {
+                    self.playback_notice.clear();
+                    self.notice_hold = super::NoticeHold::Other;
+                    self.notice_hold_until = None;
+                }
+            } else if !held
+                && matches!(
+                    self.notice_hold,
+                    super::NoticeHold::Receiving | super::NoticeHold::Reconnecting
+                )
+            {
                 self.playback_notice.clear();
                 self.notice_hold = super::NoticeHold::Other;
+                self.notice_hold_until = None;
             }
-        } else if matches!(
-            self.notice_hold,
-            super::NoticeHold::Receiving | super::NoticeHold::Reconnecting
-        ) {
-            self.playback_notice.clear();
-            self.notice_hold = super::NoticeHold::Other;
         }
         if let Some((skipped, resets)) = realign {
             self.seen_sequence_resets = resets;
             self.seen_skipped_segments = skipped;
-            if !self.playback_stopped
-                && !self.playback_ended
-                && self.notice_hold != super::NoticeHold::AuthRenewal
-            {
+            let auth_held = held && self.notice_hold == super::NoticeHold::AuthRenewal;
+            if !self.playback_stopped && !self.playback_ended && !auth_held {
                 self.playback_notice = if at_head {
                     format!("配信窓の先頭から再開しました（累計{skipped}）")
                 } else {
                     format!("ライブ端に追いつきました（飛ばしたセグメントは累計{skipped}）")
                 };
                 self.notice_hold = super::NoticeHold::CatchUp;
+                self.notice_hold_until = Some(now + super::NOTICE_HOLD);
             }
         }
         if let Some(notice) = update.notice {

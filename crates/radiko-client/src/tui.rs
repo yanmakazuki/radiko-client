@@ -120,6 +120,12 @@ enum PlaybackAction {
     Command(Command),
     Stop,
 }
+/// How long a catch-up or auth notice keeps a later outage from replacing it.
+///
+/// Five seconds is long enough to read the line. After that, a new outage shows
+/// 「受信待ち…」. Confirmed stops are not on this timer.
+const NOTICE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Why `playback_notice` is set. Gap text is cleared from this, not from the wording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoticeHold {
@@ -159,6 +165,8 @@ struct Screen {
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
     notice_hold: NoticeHold,
+    /// Catch-up and auth text stay until this instant. Gap notices wait.
+    notice_hold_until: Option<std::time::Instant>,
     /// Set from a failed playback update. Not inferred from the notice text.
     playback_stopped: bool,
     /// The control session ended (program end, stop, or failure). Gap notices stay off.

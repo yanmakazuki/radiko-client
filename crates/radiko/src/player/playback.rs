@@ -12,7 +12,10 @@ use crate::api::stream::{
 use chrono::Utc;
 use std::{
     fmt,
-    sync::mpsc::{self, Receiver, TryRecvError, TrySendError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError, TrySendError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -391,14 +394,97 @@ fn decode_segment_pcm(
     }
 }
 
-pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker, PcmReceiver) {
+pub(crate) trait MonoClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+    /// Block until `duration` has passed on this clock, or `stop` is cancelled.
+    fn park(&self, duration: Duration, stop: &StopToken);
+}
+
+struct WallClock;
+
+impl MonoClock for WallClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+    fn park(&self, duration: Duration, stop: &StopToken) {
+        let until = Instant::now() + duration;
+        while !stop.is_cancelled() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Virtual time for playback tests. `sleep` advances it. `park` waits for that advance.
+#[cfg(test)]
+pub(crate) struct ManualClock {
+    origin: Instant,
+    millis: std::sync::Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: Instant::now(),
+            millis: std::sync::Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+    pub(crate) fn elapsed(&self) -> Duration {
+        Duration::from_millis(*self.millis.lock().expect("clock"))
+    }
+}
+
+#[cfg(test)]
+impl MonoClock for ManualClock {
+    fn now(&self) -> Instant {
+        self.origin + self.elapsed()
+    }
+    fn sleep(&self, duration: Duration) {
+        let mut millis = self.millis.lock().expect("clock");
+        *millis = millis.saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        self.cv.notify_all();
+        drop(millis);
+        // A short real pause lets the worker run while virtual time moves in 5ms steps.
+        thread::sleep(Duration::from_micros(20));
+    }
+    fn park(&self, duration: Duration, stop: &StopToken) {
+        let deadline = self.now() + duration;
+        let mut millis = self.millis.lock().expect("clock");
+        while self.origin + Duration::from_millis(*millis) < deadline {
+            if stop.is_cancelled() {
+                return;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(millis, Duration::from_millis(50))
+                .expect("clock");
+            millis = guard;
+        }
+    }
+}
+
+pub(super) fn worker(source: impl SegmentSource, stop: StopToken) -> (Worker, PcmReceiver) {
+    worker_timed(source, stop, Arc::new(WallClock))
+}
+fn worker_timed(
+    mut source: impl SegmentSource,
+    stop: StopToken,
+    clock: Arc<dyn MonoClock>,
+) -> (Worker, PcmReceiver) {
     let (tx, rx) = mpsc::sync_channel(PCM_QUEUE_CAPACITY);
     let http_diagnostics = source.enable_http_diagnostics();
     let control = stop.clone();
     let cancelled = control.clone();
     source.set_cancellation(std::sync::Arc::new(move || cancelled.is_cancelled()));
-    let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Tracker::new(Instant::now())));
+    let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Tracker::new(clock.now())));
     let measurements = diagnostics.clone();
+    let pace = clock.clone();
     let handle = thread::spawn(move || {
         let enter = |stage| {
             if let Ok(mut tracker) = measurements.lock() {
@@ -411,7 +497,7 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
             .ok()
             .and_then(|offset| info.starts_at.checked_add_signed(offset));
         let mut seeking = !info.position.is_zero();
-        let mut last_segment = Instant::now();
+        let mut last_segment = pace.now();
         loop {
             if control.is_cancelled() {
                 break;
@@ -433,14 +519,12 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
             match next {
                 Next::Pending(delay) => {
                     enter(Stage::Waiting);
-                    if last_segment.elapsed() > crate::reconnect::LIMIT {
+                    if pace.now().saturating_duration_since(last_segment) > crate::reconnect::LIMIT
+                    {
                         send(&tx, Event::Failed(PlaybackError::ReconnectGaveUp), &control);
                         break;
                     }
-                    let until = Instant::now() + delay.min(Duration::from_secs(1));
-                    while !control.is_cancelled() && Instant::now() < until {
-                        thread::sleep(Duration::from_millis(10));
-                    }
+                    pace.park(delay.min(Duration::from_secs(1)), &control);
                 }
                 Next::End => {
                     enter(Stage::Finished);
@@ -473,7 +557,7 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                             if !send(&tx, Event::Pcm(pcm), &control) {
                                 break;
                             }
-                            last_segment = Instant::now();
+                            last_segment = pace.now();
                         }
                         Err(error) => {
                             send(&tx, Event::Failed(PlaybackError::Decode(error)), &control);
@@ -878,9 +962,46 @@ fn play_loop<S: AudioSink>(
     initial: Initial<impl SegmentSource>,
     seconds: Option<u32>,
     stop: StopToken,
+    progress: impl FnMut(Progress),
+    create: impl FnMut(&DecodedPcm, u64, Option<Duration>, StopToken) -> Result<S, OutputError>,
+    controls: Option<&mut super::seek::Controller>,
+) -> Result<PlaybackReport, PlaybackError> {
+    play_loop_clocked(
+        initial,
+        seconds,
+        stop,
+        progress,
+        create,
+        controls,
+        Arc::new(WallClock),
+    )
+}
+#[cfg(test)]
+pub(crate) fn play_with_clock<S: AudioSink>(
+    source: impl SegmentSource,
+    stop: StopToken,
+    clock: Arc<dyn MonoClock>,
+    progress: impl FnMut(Progress),
+    create: impl FnMut(&DecodedPcm, u64, Option<Duration>, StopToken) -> Result<S, OutputError>,
+) -> Result<PlaybackReport, PlaybackError> {
+    play_loop_clocked(
+        Initial::Source(source),
+        None,
+        stop,
+        progress,
+        create,
+        None,
+        clock,
+    )
+}
+fn play_loop_clocked<S: AudioSink>(
+    initial: Initial<impl SegmentSource>,
+    seconds: Option<u32>,
+    stop: StopToken,
     mut progress: impl FnMut(Progress),
     mut create: impl FnMut(&DecodedPcm, u64, Option<Duration>, StopToken) -> Result<S, OutputError>,
     mut controls: Option<&mut super::seek::Controller>,
+    clock: Arc<dyn MonoClock>,
 ) -> Result<PlaybackReport, PlaybackError> {
     struct CancelOnExit(StopToken);
     impl Drop for CancelOnExit {
@@ -893,7 +1014,7 @@ fn play_loop<S: AudioSink>(
     let (mut info, mut running_worker, mut rx) = match initial {
         Initial::Source(source) => {
             let info = source.info().clone();
-            let (worker, rx) = worker(source, local.clone());
+            let (worker, rx) = worker_timed(source, local.clone(), clock.clone());
             (info, Some(worker), rx)
         }
         Initial::Idle(info) => (info, None, PcmReceiver::disconnected()),
@@ -905,8 +1026,8 @@ fn play_loop<S: AudioSink>(
     let mut reason = EndReason::ProgramEnd;
     let mut segments = 0;
     let mut eof = false;
-    let mut report_at = Instant::now();
-    let mut last_pcm_at = Instant::now();
+    let mut report_at = clock.now();
+    let mut last_pcm_at = clock.now();
     let mut empty_since: Option<Instant> = None;
     let result = 'playback: loop {
         if stop.is_cancelled() {
@@ -962,9 +1083,9 @@ fn play_loop<S: AudioSink>(
                         reason = why;
                         segments = ready.segments;
                         eof = false;
-                        last_pcm_at = Instant::now();
+                        last_pcm_at = clock.now();
                         empty_since = None;
-                        report_at = Instant::now();
+                        report_at = clock.now();
                         control.report(format!("再生切替完了: {} / {:?}", info.station, info.mode));
                     }
                 }
@@ -974,7 +1095,7 @@ fn play_loop<S: AudioSink>(
             .as_mut()
             .is_some_and(|c| std::mem::take(&mut c.changed))
         {
-            report_at = Instant::now();
+            report_at = clock.now();
         }
         let paused = controls.as_ref().is_some_and(|c| c.paused);
         let volume = controls.as_ref().map_or(25, |c| c.volume);
@@ -982,7 +1103,7 @@ fn play_loop<S: AudioSink>(
             out.configure(paused, volume);
         }
         if paused {
-            last_pcm_at = Instant::now();
+            last_pcm_at = clock.now();
         }
         if running_worker.is_some() && info.mode == ProbeMode::Live && Utc::now() >= info.ends_at {
             break 'playback Ok(PlaybackReport {
@@ -1004,7 +1125,7 @@ fn play_loop<S: AudioSink>(
             match event {
                 Ok(Event::Pcm(pcm)) => {
                     let pcm = pcm.into_pcm();
-                    last_pcm_at = Instant::now();
+                    last_pcm_at = clock.now();
                     if output.is_none() {
                         (maximum, reason) =
                             match frame_limit(&info, pcm.summary.sample_rate, seconds) {
@@ -1033,7 +1154,7 @@ fn play_loop<S: AudioSink>(
                         };
                         sink.configure(paused, volume);
                         output = Some(sink);
-                        report_at = Instant::now();
+                        report_at = clock.now();
                     }
                     segments += 1;
                     current = Some(pcm);
@@ -1081,7 +1202,7 @@ fn play_loop<S: AudioSink>(
             && !eof
             && !paused
             && output.as_ref().is_none_or(|o| o.accepted() < maximum);
-        let silent_for = last_pcm_at.elapsed();
+        let silent_for = clock.now().saturating_duration_since(last_pcm_at);
         let heard = output
             .as_ref()
             .is_some_and(|sink| sink.summary().frames > 0);
@@ -1089,12 +1210,14 @@ fn play_loop<S: AudioSink>(
         let buffer_empty = waiting_for_audio && heard && queued == 0;
         if buffer_empty {
             if empty_since.is_none() {
-                empty_since = Some(Instant::now());
+                empty_since = Some(clock.now());
             }
         } else {
             empty_since = None;
         }
-        let empty_for = empty_since.map(|start| start.elapsed()).unwrap_or_default();
+        let empty_for = empty_since
+            .map(|start| clock.now().saturating_duration_since(start))
+            .unwrap_or_default();
         let phase = audible_wait(AudibleGap {
             heard,
             paused,
@@ -1164,10 +1287,10 @@ fn play_loop<S: AudioSink>(
             phase,
             AudiblePhase::Receiving | AudiblePhase::Reconnecting(_)
         );
-        if refresh && report_at > Instant::now() + Duration::from_secs(1) {
-            report_at = Instant::now();
+        if refresh && report_at > clock.now() + Duration::from_secs(1) {
+            report_at = clock.now();
         }
-        if running_worker.is_some() && Instant::now() >= report_at {
+        if running_worker.is_some() && clock.now() >= report_at {
             let mut snapshot = Progress::active(
                 &info,
                 output.as_ref().map(|out| out.summary()),
@@ -1195,9 +1318,9 @@ fn play_loop<S: AudioSink>(
             } else {
                 interval
             };
-            report_at = Instant::now() + interval;
+            report_at = clock.now() + interval;
         }
-        thread::sleep(Duration::from_millis(5));
+        clock.sleep(Duration::from_millis(5));
     };
     // An error can arrive between periodic notifications. Read the current generation once
     // more before teardown; this is an observation, not a post-shutdown final aggregate.
@@ -2798,19 +2921,21 @@ mod tests {
     }
     #[test]
     fn silence_shorter_than_thirty_seconds_continues_and_the_limit_gives_up() {
-        let below = RECEPTION_AFTER - Duration::from_nanos(1);
+        assert_eq!(RECEPTION_AFTER, Duration::from_secs(2));
+        assert_eq!(NOTICE_AFTER, Duration::from_secs(30));
+        let below = Duration::from_secs(2) - Duration::from_nanos(1);
         assert_eq!(audible_wait(gap(below, below)).notice(), None);
         assert_eq!(
-            audible_wait(gap(RECEPTION_AFTER, RECEPTION_AFTER)).notice(),
-            Some(RECEPTION_NOTICE.into())
+            audible_wait(gap(Duration::from_secs(2), Duration::from_secs(2))).notice(),
+            Some("受信待ち…".into())
         );
         assert_eq!(
-            audible_wait(gap(Duration::from_secs(20), Duration::from_secs(20))),
+            audible_wait(gap(Duration::from_secs(29), Duration::from_secs(29))),
             AudiblePhase::Receiving
         );
         assert!(matches!(
-            audible_wait(gap(NOTICE_AFTER, NOTICE_AFTER)),
-            AudiblePhase::Reconnecting(elapsed) if elapsed == NOTICE_AFTER
+            audible_wait(gap(Duration::from_secs(30), Duration::from_secs(30))),
+            AudiblePhase::Reconnecting(elapsed) if elapsed == Duration::from_secs(30)
         ));
         assert!(matches!(
             audible_wait(gap(Duration::from_secs(90), Duration::from_secs(90))),
