@@ -4,6 +4,16 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：オフライン確認はファイルを触らず、CIではネットワークのない名前空間で起動する
+
+clap は外した。`Cargo.toml` と `Cargo.lock` は main と同じである。`--offline` は手書きの引数分解のままで、`USAGE` とトップの `--help` には書かない。`tui --offline --help` は使い方を出して終了 0 になる。
+
+オフラインでは `SessionStore` も `SearchStore` も作らない。`session.json` と `searches.json` は、`--data-dir` でも `HOME` と `XDG_DATA_HOME` の既定の場所でも、読まない、書かない、消さない。`O` のあと `y` はログアウトしない。保存条件の `b` もファイルを開かない。
+
+ubuntu-24.04 の Format, lint, and tests は、権限のない `unshare -rn` の中でスモークする。`unshare -rn true` が失敗したときだけ、`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` にしてから同じ `unshare -rn` を使う。スモークのプロセスはホストの root ではない。名前空間に入ったあと、ホストでは届く `1.1.1.1:443` へ TCP 接続できないことを確認してから TUI を起動する。接続できたらその場で失敗する。疑似端末の確認は、終了 0、端末の復元、`ALSA lib` と `panicked` がないこと、TCP/UDP を開いていないことのままである。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 370 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 clippy` と同じオプションのテストも 370 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 55 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。この環境では AppArmor の sysctl は無く、`unshare -rn` はそのまま成功した。radiko への通信と実機の再生はない。
+
 ## 2026年10月28日：テスト専用の --offline をヘルプから隠す
 
 `tui --offline` はテストと CI 専用のままである。利用者向けの起動オプションにはしない。clap の `hide = true` で `tui --help` から外し、トップの `--help` にも書かない。フラグの受け付け方と、通信も音声機器も開かない挙動は変えていない。

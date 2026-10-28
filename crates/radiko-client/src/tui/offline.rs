@@ -2,14 +2,8 @@
 use chrono::NaiveDate;
 use radiko::{
     api::catalog::{self, CatalogError, ProgramList},
-    app::auth::Status,
     catalog::Source,
     domain::Station,
-    storage::SessionStore,
-};
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub const NOTICE: &str = "オフライン確認: 試験用の番組表です。通信と音声出力はしません";
@@ -39,25 +33,6 @@ impl Source for Fixture {
     }
 }
 
-/// Read the session file only. A saved token is not sent anywhere.
-pub fn session_status(data_dir: Option<PathBuf>, cancel: &AtomicBool) -> Status {
-    if cancel.load(Ordering::Acquire) {
-        return Status::NotChecked;
-    }
-    let store = match data_dir {
-        Some(path) => SessionStore::new(path),
-        None => match SessionStore::default_location() {
-            Ok(store) => store,
-            Err(error) => return Status::StorageFailed(error),
-        },
-    };
-    match store.load() {
-        Ok(None) => Status::SignedOut,
-        Ok(Some(_)) => Status::NotChecked,
-        Err(error) => Status::StorageFailed(error),
-    }
-}
-
 pub fn split_args(args: &[String]) -> (bool, Vec<String>) {
     let offline = args.iter().any(|arg| arg == "--offline");
     let rest = args
@@ -71,15 +46,6 @@ pub fn split_args(args: &[String]) -> (bool, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use radiko::session::MemberSession;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn directory() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        dir
-    }
 
     #[test]
     fn fixture_returns_one_program_and_one_station_without_network() {
@@ -99,27 +65,6 @@ mod tests {
         assert!(matches!(
             Fixture.programs("tbs", day),
             Err(CatalogError::InvalidStation)
-        ));
-    }
-
-    #[test]
-    fn session_file_is_not_checked_online() {
-        let dir = directory();
-        let path = dir.path().to_owned();
-        assert!(matches!(
-            session_status(Some(path.clone()), &AtomicBool::new(false)),
-            Status::SignedOut
-        ));
-        SessionStore::new(path.clone())
-            .save(MemberSession::new("SYNTHETIC_SESSION_ONLY".into()).unwrap())
-            .unwrap();
-        assert!(matches!(
-            session_status(Some(path), &AtomicBool::new(false)),
-            Status::NotChecked
-        ));
-        assert!(matches!(
-            session_status(Some(dir.path().to_owned()), &AtomicBool::new(true)),
-            Status::NotChecked
         ));
     }
 

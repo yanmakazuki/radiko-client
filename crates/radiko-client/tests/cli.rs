@@ -378,8 +378,13 @@ fn saved_search_invalid_arguments_and_corrupt_restore_do_not_overwrite_storage()
 }
 
 #[test]
-fn offline_flag_is_hidden_from_help() {
-    for args in [vec!["--help"], vec!["tui", "--help"]] {
+fn offline_flag_is_hidden_from_help_and_still_starts() {
+    for args in [
+        vec!["--help"],
+        vec!["tui", "--help"],
+        vec!["tui", "--offline", "--help"],
+        vec!["tui", "--help", "--offline"],
+    ] {
         let output = run(&args);
         assert!(output.status.success(), "{args:?} {output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
@@ -387,9 +392,17 @@ fn offline_flag_is_hidden_from_help() {
             !text.contains("--offline"),
             "{args:?} showed the test-only flag:\n{text}"
         );
+        if args.contains(&"tui") {
+            assert!(text.contains("g 秒数指定"), "{args:?}\n{text}");
+        }
     }
-    let tui = String::from_utf8(run(&["tui", "--help"]).stdout).unwrap();
-    assert!(tui.contains("g 秒数指定"), "{tui}");
+    let started = run(&["tui", "--offline"]);
+    assert!(!started.status.success());
+    let err = String::from_utf8(started.stderr).unwrap();
+    assert!(
+        err.contains("対話端末"),
+        "offline flag was not accepted:\n{err}"
+    );
 }
 
 #[test]

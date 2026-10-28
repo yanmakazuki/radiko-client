@@ -88,7 +88,7 @@ TUI は Tokio の current-thread ランタイムで、約50ms ごとに通知と
 
 公開の番組表は `/v3/program/station/date/{YYYYMMDD}/{station}.xml`、局一覧は `/v3/station/list/{JP1..JP47}.xml` です。gzip の展開は flate2 です。圧縮の前後とも最大4MiB、XML の深さ32、1応答の放送枠2048、局一覧は応答あたり最大512局です。壊れた個別の枠は件数を出して除外し、全枠が不正、局が一致しない、構造が不正、なら失敗します。失敗した地域の局数は推測しません。
 
-`tui --offline` はテストと CI 専用で、ヘルプには出さない。利用者向けの起動オプションではない。`CatalogClient` も `Http` も作りません。バイナリの `tui/offline.rs` が `catalog::Source` を実装し、試験用の1局1番組をメモリで返します。セッション確認はファイルの有無だけで、`MemberClient` は呼びません。再生準備の工場とチャプター取得は、通信と CPAL を呼ばずに失敗を返します。ログインのキーは入力欄を開かず、認証の再確認キーも通信しません。Ubuntu 24.04 の「Format, lint, and tests」ジョブが、Rust のテストのあと `scripts/smoke_tui.py` で疑似端末からこのモードを一度実行します。macOS のジョブと Rust 1.85.0 のジョブには、この手順はありません。
+`tui --offline` はテストと CI 専用で、ヘルプには出さない。利用者向けの起動オプションではない。引数の分解は手書きの `split_args` である。`CatalogClient` も `Http` も作りません。バイナリの `tui/offline.rs` が `catalog::Source` を実装し、試験用の1局1番組をメモリで返します。`SessionStore` と `SearchStore` は作らず、`session.json` と `searches.json` を読まない、書かない、消さない。ログアウトの削除はファイルを開かない空の処理で、画面の `O` と `y` はその処理へ進みません。再生準備の工場とチャプター取得は、通信と CPAL を呼ばずに失敗を返します。ログインのキーは入力欄を開かず、認証の再確認キーも通信しません。Ubuntu 24.04 の「Format, lint, and tests」ジョブは、Rust のテストのあと、権限のない `unshare -rn` の中で `scripts/smoke_tui.py` を一度実行します。AppArmor がユーザ名前空間を拒むときは、先に `kernel.apparmor_restrict_unprivileged_userns=0` にしてから同じ `unshare -rn` を使います。スモークの前に、その名前空間から `1.1.1.1:443` へ TCP 接続できないことを確認します。macOS のジョブと Rust 1.85.0 のジョブには、この手順はありません。
 
 `catalog::search::Filter` は入出力を持たない判定です。観測分類は、絞り込む前の今回の取得から集計します。キーワードは小文字化した文字列を一度作り、各欄の部分一致に使います。分類 ID は各128バイト、キーワードは1024バイトが上限です。
 

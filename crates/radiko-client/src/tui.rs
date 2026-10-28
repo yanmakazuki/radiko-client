@@ -12,7 +12,6 @@ mod seek;
 mod viewport;
 use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
-use clap::{ArgAction, CommandFactory, Parser};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use radiko::{
     api::catalog::CatalogClient,
@@ -53,27 +52,7 @@ use std::{
     },
     time::Duration,
 };
-const USAGE: &str = "/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。";
-#[derive(Parser)]
-#[command(
-    name = "tui",
-    disable_version_flag = true,
-    disable_help_flag = true,
-    disable_colored_help = true
-)]
-struct TuiHelp {
-    #[arg(long, hide = true, action = ArgAction::SetTrue)]
-    offline: bool,
-}
-fn tui_command() -> clap::Command {
-    TuiHelp::command()
-        .override_usage("tui [programsと同じ局・地域・期間・絞り込み]")
-        .after_long_help(USAGE)
-}
-fn help_text() -> String {
-    let mut command = tui_command();
-    command.render_long_help().to_string()
-}
+const USAGE: &str = "tui [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。";
 fn named_receipt(result: &Result<NamedOutcome, radiko::app::named::Error>) -> String {
     match result {
         Ok(NamedOutcome::Saved(name)) => format!("「{name}」を保存しました"),
@@ -615,7 +594,11 @@ impl Screen {
         match key.code {
             KeyCode::Char('y') => {
                 self.logout_confirm = false;
-                self.logout_requested = true;
+                if self.offline {
+                    self.playback_notice = "オフライン確認ではログアウトしません".into();
+                } else {
+                    self.logout_requested = true;
+                }
             }
             KeyCode::Char('n') | KeyCode::Esc => self.logout_confirm = false,
             KeyCode::Char('q') => return Ok(true),
@@ -856,7 +839,13 @@ impl Screen {
                     self.auth_refresh = true;
                 }
             }
-            KeyCode::Char('O') => self.logout_confirm = true,
+            KeyCode::Char('O') => {
+                if self.offline {
+                    self.playback_notice = "オフライン確認ではログアウトしません".into();
+                } else {
+                    self.logout_confirm = true;
+                }
+            }
             KeyCode::Char('I') => {
                 if self.offline {
                     self.playback_notice = "オフライン確認ではログインしません".into();
@@ -865,12 +854,16 @@ impl Screen {
                 }
             }
             KeyCode::Char('b') => {
-                self.named_generation = self
-                    .named_generation
-                    .checked_add(1)
-                    .ok_or("保存条件の表示番号の上限です")?;
-                self.named = Some(named::Manager::new(ViewId(self.named_generation)));
-                self.named_action = Some(NamedOperation::List);
+                if self.offline {
+                    self.playback_notice = "オフライン確認では保存条件を読み書きしません".into();
+                } else {
+                    self.named_generation = self
+                        .named_generation
+                        .checked_add(1)
+                        .ok_or("保存条件の表示番号の上限です")?;
+                    self.named = Some(named::Manager::new(ViewId(self.named_generation)));
+                    self.named_action = Some(NamedOperation::List);
+                }
             }
             KeyCode::Char('f') => {
                 self.app.begin_edit();
@@ -1596,11 +1589,11 @@ async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(
     Ok(())
 }
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let (offline, args) = offline::split_args(args);
     if args == ["--help"] {
-        stdout_ln!("{}", help_text().trim_end());
+        stdout_ln!("{USAGE}");
         return Ok(());
     }
-    let (offline, args) = offline::split_args(args);
     if args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--json" | "--classifications"))
@@ -1619,7 +1612,19 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     let playback_dir = data_dir.clone();
     let auth_dir = data_dir.clone();
     let named_dir = data_dir.clone();
-    let (criteria, store, preferences_notice) = saved_criteria(explicit, data_dir, now)?;
+    // Offline mode never opens session.json, searches.json, or the default data directory.
+    let (criteria, store, preferences_notice) = if offline {
+        (
+            match explicit {
+                Some(criteria) => criteria,
+                None => SearchCriteria::initial(now)?,
+            },
+            None,
+            String::new(),
+        )
+    } else {
+        saved_criteria(explicit, data_dir, now)?
+    };
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal = shutdown.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Release))
@@ -1670,10 +1675,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                 ChapterService::default()
             };
             let mut authentication = if offline {
-                let dir = auth_dir.clone();
-                AuthService::with_cancellable_check(move |cancel| {
-                    offline::session_status(dir.clone(), &cancel)
-                })
+                AuthService::with_cancellable_check(|_| AuthStatus::NotChecked)
             } else {
                 AuthService::new(auth_dir.clone())
             };
@@ -1684,8 +1686,16 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
             } else {
                 LoginService::new(auth_dir.clone())
             };
-            let mut logout = LogoutService::new(auth_dir);
-            let mut named_service = NamedService::new(named_dir);
+            let mut logout = if offline {
+                LogoutService::with_delete(|| Ok(()))
+            } else {
+                LogoutService::new(auth_dir)
+            };
+            let mut named_service = if offline {
+                NamedService::with_store(|_| Err(radiko::storage::searches::Error::NotFound))
+            } else {
+                NamedService::new(named_dir)
+            };
             authentication.submit(screen.app.authentication.begin()?);
             screen.submit(&mut service)?;
             let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -1816,25 +1826,12 @@ mod tests {
         Screen::new(criteria, String::new())
     }
     #[test]
-    fn offline_argument_is_hidden_by_clap() {
-        let mut command = super::tui_command();
-        let hidden = command
-            .get_arguments()
-            .find(|arg| arg.get_long() == Some("offline"))
-            .unwrap()
-            .is_hide_set();
-        assert!(hidden);
-        let help = command.render_long_help().to_string();
-        assert!(!help.contains("--offline"));
-        assert!(help.contains("g 秒数指定"));
-    }
-    #[test]
-    fn offline_keys_do_not_request_playback_login_or_chapters() {
+    fn offline_keys_do_not_request_playback_login_chapters_or_stored_state() {
         let mut screen = screen();
         screen.offline = true;
         let mut search =
             Service::new(|| -> Result<CatalogClient, _> { panic!("offline keys must not fetch") });
-        for key in ['I', 'a', 'c', 'l'] {
+        for key in ['I', 'a', 'c', 'l', 'O', 'b'] {
             screen
                 .key(
                     KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
@@ -1845,8 +1842,21 @@ mod tests {
             assert!(screen.login.is_none());
             assert!(!screen.auth_refresh);
             assert!(screen.chapter_action.is_none());
+            assert!(!screen.logout_confirm);
+            assert!(!screen.logout_requested);
+            assert!(screen.named.is_none());
+            assert!(screen.named_action.is_none());
             assert!(!screen.playback_notice.is_empty());
         }
+        screen.logout_confirm = true;
+        screen
+            .key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &mut search,
+            )
+            .unwrap();
+        assert!(!screen.logout_requested);
+        assert!(!screen.logout_confirm);
         screen.playback_notice.clear();
         screen
             .key(

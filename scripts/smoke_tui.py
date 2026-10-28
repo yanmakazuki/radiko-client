@@ -28,6 +28,22 @@ def output_problems(data):
     return [marker for marker in MARKERS if marker in text]
 
 
+def assert_tcp_blocked(connect=None):
+    """Fail when a TCP connection to 1.1.1.1:443 succeeds.
+
+    CI runs this inside a network namespace. A success means that namespace is not isolating.
+    """
+    if connect is None:
+        def connect():
+            import socket
+            socket.create_connection(('1.1.1.1', 443), timeout=3).close()
+    try:
+        connect()
+    except OSError:
+        return
+    raise RuntimeError('network namespace did not block TCP')
+
+
 def network_sockets(pid):
     """Return TCP/UDP sockets owned by one process. None where /proc is unavailable.
 
@@ -224,7 +240,18 @@ def main():
     parser.add_argument('--binary', type=Path, default=Path('target/debug/radiko-client'))
     parser.add_argument('--rows', type=int, default=40)
     parser.add_argument('--columns', type=int, default=160)
+    parser.add_argument(
+        '--require-isolated-network',
+        action='store_true',
+        help='fail unless TCP to 1.1.1.1:443 is blocked (run inside a network namespace)',
+    )
     args = parser.parse_args()
+    if args.require_isolated_network:
+        try:
+            assert_tcp_blocked()
+        except RuntimeError as error:
+            report(phase='failed', completed=False, error_type='RuntimeError', check=str(error))
+            return 1
     if not args.binary.is_file():
         parser.error('binary not found')
     if not 20 <= args.rows <= 120 or not 80 <= args.columns <= 300:

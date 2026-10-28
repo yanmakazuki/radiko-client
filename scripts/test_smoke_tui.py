@@ -1,7 +1,7 @@
 """Offline checks for the TUI smoke scanner. No radiko, account, terminal, or audio."""
 import unittest
 
-from smoke_tui import network_sockets, output_problems
+from smoke_tui import assert_tcp_blocked, network_sockets, output_problems
 
 
 class OutputProblemTests(unittest.TestCase):
@@ -17,6 +17,20 @@ class OutputProblemTests(unittest.TestCase):
         text = 'タイムフリー / TBS\nオフライン番組\n取得完了\nオフライン確認'
         self.assertEqual(output_problems(text.encode()), [])
         self.assertEqual(output_problems(b''), [])
+
+
+class IsolatedNetworkTests(unittest.TestCase):
+    def test_a_failed_connect_is_isolated(self):
+        def connect():
+            raise OSError('network is unreachable')
+        assert_tcp_blocked(connect)
+
+    def test_a_successful_connect_is_not_isolated(self):
+        def connect():
+            return None
+        with self.assertRaises(RuntimeError) as caught:
+            assert_tcp_blocked(connect)
+        self.assertIn('did not block TCP', str(caught.exception))
 
 
 class NetworkSocketTests(unittest.TestCase):
