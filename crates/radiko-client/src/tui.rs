@@ -120,6 +120,30 @@ enum PlaybackAction {
     Command(Command),
     Stop,
 }
+/// How long a readable notice keeps a later outage from replacing it.
+///
+/// Five seconds is long enough to read one line. It covers catch-up
+/// （「配信窓の先頭から再開しました」「ライブ端に追いつきました」）,
+/// auth renewal （「配信認証を更新して再生を続けます」）, and user-action
+/// results （「再生準備失敗（現在の状態を維持）」「再生準備に失敗しました（現在の状態を維持）」
+/// 「再生準備中」「シーク不可」「切替不可」「位置指定を取消」
+/// 「再生切替失敗（現在の状態を維持）」「再生切替完了」「一時停止」,
+/// and the same kind of result set from the screen, such as 放送前 / 放送終了）.
+/// After it, a pending outage shows 「受信待ち…」, or 「再接続中…（N秒）」 once the
+/// outage has passed 30 seconds. Confirmed stop messages are not on this timer.
+const NOTICE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why `playback_notice` is set. Gap text is cleared from this, not from the wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeHold {
+    Other,
+    Receiving,
+    Reconnecting,
+    CatchUp,
+    AuthRenewal,
+    /// A user-action result or error. Same 5-second hold as catch-up and auth.
+    Action,
+}
 struct Screen {
     help_open: bool,
     help_scroll: scroll::Scroll,
@@ -149,8 +173,15 @@ struct Screen {
     chapter_notice: String,
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
+    notice_hold: NoticeHold,
+    /// Catch-up, auth, and action text stay until this instant. Gap notices wait.
+    notice_hold_until: Option<std::time::Instant>,
+    /// Test clock. Empty in production, so notices use the wall clock.
+    notice_clock: Option<std::time::Instant>,
     /// Set from a failed playback update. Not inferred from the notice text.
     playback_stopped: bool,
+    /// The control session ended (program end, stop, or failure). Gap notices stay off.
+    playback_ended: bool,
     seen_reauthentications: u64,
     seen_skipped_segments: u64,
     seen_sequence_resets: u64,

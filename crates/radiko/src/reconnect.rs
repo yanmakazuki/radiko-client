@@ -22,4 +22,14 @@ pub(crate) const BACKOFF_START: Duration = Duration::from_secs(1);
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
 /// 新しい PCM がこれ以上来ないとき、入力側の「再接続中」を出す。
-pub(crate) const NOTICE_AFTER: Duration = Duration::from_secs(30);
+///
+/// 通信断からの約30秒である。バッファが空になってからの時間ではない。変えない。
+pub const NOTICE_AFTER: Duration = Duration::from_secs(30);
+
+/// 手元のバッファが空の無音がこれだけ続いたら「受信待ち…」を出す。
+///
+/// 機器のリングは2秒で、コールバック1回の無音は数ミリ秒から、遅れても数百ミリ秒である。
+/// そのゆらぎで表示を点滅させないため、空になってから2秒続くまで出さない。
+/// 2秒はセグメント境界の短い遅れより長く、`NOTICE_AFTER` より十分短い。
+/// 30秒の再接続判定や、再取得の待ち、5分の上限は変えない。
+pub const RECEPTION_AFTER: Duration = Duration::from_secs(2);

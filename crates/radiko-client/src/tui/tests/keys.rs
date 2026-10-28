@@ -244,6 +244,7 @@ fn timefree_snapshot() -> radiko::player::state::PlaybackSnapshot {
         position: Some(Duration::from_secs(25)),
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for: None,
     }
 }

@@ -136,6 +136,7 @@ fn display_time(time: DateTime<FixedOffset>) -> String {
         .unwrap_or(time)
         .to_rfc3339()
 }
+/// CLI の状態行。受信待ちと再接続中は TUI の再生通知だけで、ここには出さない。
 fn describe(p: &playback::Progress) -> String {
     use radiko::player::state::PlaybackState;
     let state = match p.state {
@@ -353,9 +354,12 @@ mod tests {
             position: None,
             output: None,
             segments: 0,
-            reconnecting_for: None,
+            receiving_for: Some(Duration::from_secs(4)),
+            reconnecting_for: Some(Duration::from_secs(40)),
         };
         let text = describe(&p);
+        assert!(!text.contains("受信待ち"), "{text}");
+        assert!(!text.contains("再接続中"), "{text}");
         for expected in [
             "一時停止中",
             "現在の番組",

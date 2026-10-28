@@ -119,6 +119,7 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
             position: None,
             output: None,
             segments: 1,
+            receiving_for: None,
             reconnecting_for: None,
             pipeline: Some(Snapshot {
                 stage: Stage::Acquisition,
@@ -216,6 +217,7 @@ fn live_playlist_catch_up_is_shown_in_the_notice_and_http_diagnostics() {
             position: None,
             output: None,
             segments: 2,
+            receiving_for: None,
             reconnecting_for: None,
             pipeline: Some(Snapshot {
                 stage: Stage::Acquisition,
@@ -280,6 +282,8 @@ fn live_playlist_catch_up_is_shown_in_the_notice_and_http_diagnostics() {
     );
     assert!(screen.pipeline_diagnostics.contains("通し番号の巻き戻り1"));
     screen.playback_notice = "配信認証を更新して再生を続けます".into();
+    screen.notice_hold = super::super::NoticeHold::AuthRenewal;
+    screen.notice_hold_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
     screen.apply_playback(update(5, 1, false));
     assert_eq!(screen.playback_notice, "配信認証を更新して再生を続けます");
     assert!(screen.pipeline_diagnostics.contains("飛ばしたセグメント5"));
@@ -314,6 +318,7 @@ fn reconnecting_notice_is_shown_and_yields_to_catch_up_and_stop() {
         position: None,
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for,
         pipeline: Some(Snapshot {
             stage: Stage::Waiting,
@@ -388,6 +393,8 @@ fn reconnecting_notice_is_shown_and_yields_to_catch_up_and_stop() {
     assert!(screen.playback_notice.contains("再生停止"));
     screen.playback_stopped = false;
     screen.playback_notice = "配信認証を更新して再生を続けます".into();
+    screen.notice_hold = super::super::NoticeHold::AuthRenewal;
+    screen.notice_hold_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
     screen.apply_playback(radiko::app::playback::Update {
         snapshot: Some(snapshot(Some(Duration::from_secs(9)), 5, false)),
         ..radiko::app::playback::Update::default()
@@ -460,6 +467,7 @@ fn confirmed_stop_notices_survive_reconnect_catch_up_and_auth_renewal() {
         position: None,
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for,
         pipeline: Some(Snapshot {
             stage: Stage::Waiting,
@@ -545,6 +553,7 @@ fn stopped_window_lost_notice_is_not_replaced_by_the_live_edge_catch_up() {
         position: None,
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for: None,
         pipeline: Some(Snapshot {
             stage: Stage::Waiting,
@@ -611,6 +620,7 @@ fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
         position: None,
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for: None,
         pipeline: Some(Snapshot {
             stage: Stage::Backpressure,
@@ -687,6 +697,7 @@ fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
             position: None,
             output: None,
             segments: 0,
+            receiving_for: None,
             reconnecting_for: None,
             pipeline: None,
         });
@@ -951,5 +962,907 @@ fn large_catalog_keeps_global_selection_visible_at_the_end_and_after_moving_up()
                 &mut search,
             )
             .unwrap();
+    }
+}
+
+fn gap_snapshot(
+    mode: radiko::api::stream::ProbeMode,
+    state: PlaybackState,
+    receiving_for: Option<Duration>,
+    reconnecting_for: Option<Duration>,
+) -> radiko::player::state::PlaybackSnapshot {
+    let now = Utc::now().fixed_offset();
+    radiko::player::state::PlaybackSnapshot {
+        info: radiko::api::stream::playback::StreamInfo {
+            title: Some("枠".into()),
+            station: "TBS".into(),
+            mode,
+            starts_at: now,
+            ends_at: now + chrono::Duration::hours(1),
+            position: Duration::ZERO,
+        },
+        state,
+        pending: None,
+        volume: 25,
+        position: None,
+        output: Some(radiko::player::output::OutputSummary {
+            frames: 48_000,
+            underrun_frames: 0,
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: radiko::player::output::OutputSampleFormat::F32,
+        }),
+        segments: 1,
+        pipeline: None,
+        receiving_for,
+        reconnecting_for,
+    }
+}
+
+fn apply_gap(
+    screen: &mut Screen,
+    mode: radiko::api::stream::ProbeMode,
+    state: PlaybackState,
+    receiving_for: Option<Duration>,
+    reconnecting_for: Option<Duration>,
+) {
+    screen.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(gap_snapshot(mode, state, receiving_for, reconnecting_for)),
+        ..radiko::app::playback::Update::default()
+    });
+}
+
+#[test]
+fn buffer_outage_shows_reception_then_reconnect_and_clears_for_live_and_timefree() {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::playback::{AudibleGap, RECEPTION_NOTICE, audible_wait};
+    use radiko::player::state::PlaybackState;
+    let buffered = Duration::from_secs(5);
+    let below = Duration::from_secs(2) - Duration::from_nanos(1);
+    let above = Duration::from_secs(2);
+    for mode in [ProbeMode::Live, ProbeMode::TimeFree] {
+        let mut probe = screen();
+        let quiet = audible_wait(AudibleGap {
+            heard: true,
+            paused: false,
+            ended: false,
+            waiting: true,
+            empty_for: below,
+            since_pcm: below,
+            output_reconnecting: None,
+        });
+        assert!(quiet.notice().is_none());
+        apply_gap(&mut probe, mode, PlaybackState::Playing, None, None);
+        assert!(
+            probe.playback_notice.is_empty(),
+            "{mode:?} just below the threshold"
+        );
+        let waiting = audible_wait(AudibleGap {
+            heard: true,
+            paused: false,
+            ended: false,
+            waiting: true,
+            empty_for: above,
+            since_pcm: above,
+            output_reconnecting: None,
+        });
+        assert_eq!(waiting.notice().as_deref(), Some(RECEPTION_NOTICE));
+        apply_gap(&mut probe, mode, PlaybackState::Playing, Some(above), None);
+        assert_eq!(probe.playback_notice, RECEPTION_NOTICE, "{mode:?}");
+
+        for seconds in [22_u64, 60] {
+            let until = Duration::from_secs(seconds);
+            let mut outage = screen();
+            let mut first_receiving = None;
+            let mut first_reconnect = None;
+            let mut t = Duration::ZERO;
+            while t < until {
+                let phase = audible_wait(AudibleGap {
+                    heard: true,
+                    paused: false,
+                    ended: false,
+                    waiting: true,
+                    empty_for: t.saturating_sub(buffered),
+                    since_pcm: t,
+                    output_reconnecting: None,
+                });
+                let (receiving_for, reconnecting_for) = match phase {
+                    radiko::player::playback::AudiblePhase::Receiving => (Some(t), None),
+                    radiko::player::playback::AudiblePhase::Reconnecting(elapsed) => {
+                        (None, Some(elapsed))
+                    }
+                    radiko::player::playback::AudiblePhase::Quiet
+                    | radiko::player::playback::AudiblePhase::GaveUp => (None, None),
+                };
+                apply_gap(
+                    &mut outage,
+                    mode,
+                    PlaybackState::Playing,
+                    receiving_for,
+                    reconnecting_for,
+                );
+                if outage.playback_notice == RECEPTION_NOTICE {
+                    first_receiving.get_or_insert(t);
+                }
+                if outage.playback_notice.starts_with("再接続中…（") {
+                    assert_eq!(
+                        outage.playback_notice,
+                        phase.notice().unwrap(),
+                        "{mode:?} t={t:?}"
+                    );
+                    first_reconnect.get_or_insert(t);
+                }
+                let shown = outage.playback_notice.clone();
+                for _ in 0..3 {
+                    outage.apply_playback(radiko::app::playback::Update::default());
+                    assert_eq!(
+                        outage.playback_notice, shown,
+                        "{mode:?} empty update cleared"
+                    );
+                }
+                t += Duration::from_secs(1);
+            }
+            assert_eq!(
+                first_receiving,
+                Some(Duration::from_secs(7)),
+                "{mode:?} {seconds}"
+            );
+            if seconds == 22 {
+                assert_eq!(first_reconnect, None, "{mode:?} 22s must not reconnect");
+                assert_eq!(outage.playback_notice, RECEPTION_NOTICE);
+            } else {
+                assert_eq!(
+                    first_reconnect,
+                    Some(Duration::from_secs(30)),
+                    "{mode:?} {seconds}"
+                );
+                assert_eq!(
+                    outage.playback_notice,
+                    radiko::player::playback::reconnect_notice(Duration::from_secs(59))
+                );
+            }
+            apply_gap(&mut outage, mode, PlaybackState::Playing, None, None);
+            assert!(
+                outage.playback_notice.is_empty(),
+                "{mode:?} {seconds} did not clear"
+            );
+        }
+    }
+}
+
+#[test]
+fn reception_notice_uses_the_status_color() {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::playback::RECEPTION_NOTICE;
+    use radiko::player::state::PlaybackState;
+    use ratatui::style::Color;
+    let mut screen = screen();
+    let now = Utc::now().fixed_offset();
+    apply_gap(
+        &mut screen,
+        ProbeMode::Live,
+        PlaybackState::Playing,
+        Some(Duration::from_secs(3)),
+        None,
+    );
+    assert_eq!(screen.playback_notice, RECEPTION_NOTICE);
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut screen, now))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut notice_fg = None;
+    let mut status_fg = None;
+    for cell in buffer.content.iter() {
+        if cell.symbol() == "受" {
+            notice_fg = Some(cell.fg);
+        }
+        if cell.symbol() == "再" && status_fg.is_none() {
+            status_fg = Some(cell.fg);
+        }
+        assert_ne!(cell.fg, Color::Red);
+        assert_ne!(cell.fg, Color::LightRed);
+    }
+    assert_eq!(notice_fg, Some(Color::Reset));
+    assert_eq!(notice_fg, status_fg);
+}
+
+#[test]
+fn reception_and_reconnect_notices_stay_off_when_paused_stopped_starting_or_ended() {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::playback::RECEPTION_NOTICE;
+    use radiko::player::state::PlaybackState;
+    let mode = ProbeMode::TimeFree;
+    let gap = (Some(Duration::from_secs(4)), Some(Duration::from_secs(40)));
+    let cases = ["一時停止", "停止", "最初の音声の前", "番組終了"];
+    for case in cases {
+        let mut screen = screen();
+        apply_gap(
+            &mut screen,
+            mode,
+            PlaybackState::Playing,
+            Some(Duration::from_secs(3)),
+            None,
+        );
+        assert_eq!(screen.playback_notice, RECEPTION_NOTICE, "{case}");
+        match case {
+            "一時停止" => {
+                apply_gap(&mut screen, mode, PlaybackState::Paused, gap.0, gap.1);
+            }
+            "停止" => {
+                screen.apply_playback(radiko::app::playback::Update {
+                    stopped: true,
+                    ended: true,
+                    notice: Some(
+                        "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください"
+                            .into(),
+                    ),
+                    snapshot: Some(gap_snapshot(mode, PlaybackState::Playing, gap.0, gap.1)),
+                    ..radiko::app::playback::Update::default()
+                });
+                assert!(screen.playback_stopped);
+            }
+            "最初の音声の前" => {
+                apply_gap(&mut screen, mode, PlaybackState::Buffering, gap.0, gap.1);
+            }
+            "番組終了" => {
+                let shown = std::time::Instant::now();
+                screen.apply_playback_at(
+                    radiko::app::playback::Update {
+                        ended: true,
+                        notice: Some("番組終了".into()),
+                        snapshot: Some(gap_snapshot(mode, PlaybackState::Playing, gap.0, gap.1)),
+                        ..radiko::app::playback::Update::default()
+                    },
+                    shown,
+                );
+                assert_eq!(screen.playback_notice, "番組終了");
+                // After the 5s hold, only `playback_ended` still blocks the outage.
+                screen.apply_playback_at(
+                    radiko::app::playback::Update {
+                        snapshot: Some(gap_snapshot(mode, PlaybackState::Playing, gap.0, gap.1)),
+                        ..radiko::app::playback::Update::default()
+                    },
+                    shown + Duration::from_millis(5100),
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !screen.playback_notice.contains(RECEPTION_NOTICE)
+                && !screen.playback_notice.contains("再接続中"),
+            "{case}: {}",
+            screen.playback_notice
+        );
+        if case == "停止" {
+            assert_eq!(
+                screen.playback_notice,
+                "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください"
+            );
+        }
+        if case == "番組終了" {
+            assert_eq!(screen.playback_notice, "番組終了");
+        }
+    }
+    let mut screen = screen();
+    apply_gap(
+        &mut screen,
+        ProbeMode::Live,
+        PlaybackState::Playing,
+        None,
+        None,
+    );
+    screen.apply_playback(radiko::app::playback::Update {
+        snapshot: Some({
+            let mut snapshot = gap_snapshot(ProbeMode::Live, PlaybackState::Playing, None, None);
+            snapshot.pipeline = Some(radiko::player::diagnostics::Snapshot {
+                stage: radiko::player::diagnostics::Stage::Waiting,
+                elapsed: Duration::from_secs(1),
+                acquisition_max: Duration::ZERO,
+                acquisition_max_pcm_start: Duration::ZERO,
+                acquisition_max_pcm_min: Duration::ZERO,
+                decode_max: Duration::ZERO,
+                decode_last: Duration::ZERO,
+                media_last: Duration::ZERO,
+                decoded_segments: 1,
+                waiting_pcm_segments: 0,
+                waiting_pcm_media: Duration::ZERO,
+                http: Some(radiko::api::stream::playback::RequestSnapshot {
+                    stage: radiko::api::stream::playback::RequestStage::Idle,
+                    response_status: Some(200),
+                    elapsed: Duration::ZERO,
+                    headers_max: Duration::ZERO,
+                    body_max: Duration::ZERO,
+                    attempts: 1,
+                    retry_waits: 0,
+                    network_failures: 0,
+                    timeouts: 0,
+                    connect_failures: 0,
+                    reauthentications: 0,
+                    skipped_segments: 2,
+                    sequence_resets: 0,
+                    joined_window_head: true,
+                }),
+            });
+            snapshot
+        }),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(
+        screen.playback_notice,
+        "配信窓の先頭から再開しました（累計2）"
+    );
+    apply_gap(
+        &mut screen,
+        ProbeMode::Live,
+        PlaybackState::Playing,
+        Some(Duration::from_secs(4)),
+        Some(Duration::from_secs(40)),
+    );
+    assert_eq!(
+        screen.playback_notice,
+        "配信窓の先頭から再開しました（累計2）"
+    );
+}
+
+#[test]
+fn empty_updates_keep_reception_and_reconnect_notices_visible() {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::playback::RECEPTION_NOTICE;
+    use radiko::player::state::PlaybackState;
+    let mut screen = screen();
+    apply_gap(
+        &mut screen,
+        ProbeMode::Live,
+        PlaybackState::Playing,
+        Some(Duration::from_secs(3)),
+        None,
+    );
+    assert_eq!(screen.playback_notice, RECEPTION_NOTICE);
+    for _ in 0..40 {
+        screen.apply_playback(radiko::app::playback::Update::default());
+        assert_eq!(screen.playback_notice, RECEPTION_NOTICE);
+    }
+    apply_gap(
+        &mut screen,
+        ProbeMode::TimeFree,
+        PlaybackState::Playing,
+        None,
+        Some(Duration::from_secs(30)),
+    );
+    assert_eq!(screen.playback_notice, "再接続中…（30秒）");
+    for _ in 0..40 {
+        screen.apply_playback(radiko::app::playback::Update::default());
+        assert_eq!(screen.playback_notice, "再接続中…（30秒）");
+    }
+}
+
+fn catch_up_update(skipped: u64) -> radiko::app::playback::Update {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::state::PlaybackState;
+    let mut snapshot = gap_snapshot(ProbeMode::Live, PlaybackState::Playing, None, None);
+    snapshot.pipeline = Some(radiko::player::diagnostics::Snapshot {
+        stage: radiko::player::diagnostics::Stage::Waiting,
+        elapsed: Duration::from_secs(1),
+        acquisition_max: Duration::ZERO,
+        acquisition_max_pcm_start: Duration::ZERO,
+        acquisition_max_pcm_min: Duration::ZERO,
+        decode_max: Duration::ZERO,
+        decode_last: Duration::ZERO,
+        media_last: Duration::ZERO,
+        decoded_segments: 1,
+        waiting_pcm_segments: 0,
+        waiting_pcm_media: Duration::ZERO,
+        http: Some(radiko::api::stream::playback::RequestSnapshot {
+            stage: radiko::api::stream::playback::RequestStage::Idle,
+            response_status: Some(200),
+            elapsed: Duration::ZERO,
+            headers_max: Duration::ZERO,
+            body_max: Duration::ZERO,
+            attempts: 1,
+            retry_waits: 0,
+            network_failures: 0,
+            timeouts: 0,
+            connect_failures: 0,
+            reauthentications: 0,
+            skipped_segments: skipped,
+            sequence_resets: 0,
+            joined_window_head: false,
+        }),
+    });
+    radiko::app::playback::Update {
+        snapshot: Some(snapshot),
+        ..radiko::app::playback::Update::default()
+    }
+}
+
+fn auth_update() -> radiko::app::playback::Update {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::state::PlaybackState;
+    let mut snapshot = gap_snapshot(ProbeMode::TimeFree, PlaybackState::Playing, None, None);
+    snapshot.pipeline = Some(radiko::player::diagnostics::Snapshot {
+        stage: radiko::player::diagnostics::Stage::Waiting,
+        elapsed: Duration::ZERO,
+        acquisition_max: Duration::ZERO,
+        acquisition_max_pcm_start: Duration::ZERO,
+        acquisition_max_pcm_min: Duration::ZERO,
+        decode_max: Duration::ZERO,
+        decode_last: Duration::ZERO,
+        media_last: Duration::ZERO,
+        decoded_segments: 1,
+        waiting_pcm_segments: 0,
+        waiting_pcm_media: Duration::ZERO,
+        http: Some(radiko::api::stream::playback::RequestSnapshot {
+            stage: radiko::api::stream::playback::RequestStage::Idle,
+            response_status: Some(200),
+            elapsed: Duration::ZERO,
+            headers_max: Duration::ZERO,
+            body_max: Duration::ZERO,
+            attempts: 1,
+            retry_waits: 0,
+            network_failures: 0,
+            timeouts: 0,
+            connect_failures: 0,
+            reauthentications: 1,
+            skipped_segments: 0,
+            sequence_resets: 0,
+            joined_window_head: false,
+        }),
+    });
+    radiko::app::playback::Update {
+        snapshot: Some(snapshot),
+        ..radiko::app::playback::Update::default()
+    }
+}
+
+#[test]
+fn catch_up_and_auth_notices_hold_for_five_seconds_then_an_outage_replaces_them() {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::playback::RECEPTION_NOTICE;
+    use radiko::player::state::PlaybackState;
+    assert_eq!(super::super::NOTICE_HOLD, Duration::from_secs(5));
+    let stop_sentence =
+        "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
+    let cases = [
+        (
+            "ライブ端に追いつきました（飛ばしたセグメントは累計2）",
+            catch_up_update(2),
+        ),
+        ("配信認証を更新して再生を続けます", auth_update()),
+    ];
+    for (sentence, initial) in cases {
+        let mut screen = screen();
+        let shown = std::time::Instant::now();
+        screen.apply_playback_at(initial, shown);
+        assert_eq!(screen.playback_notice, sentence, "{sentence}");
+        let quiet = radiko::app::playback::Update {
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                None,
+                None,
+            )),
+            ..radiko::app::playback::Update::default()
+        };
+        screen.apply_playback_at(quiet, shown + Duration::from_secs(2));
+        assert_eq!(
+            screen.playback_notice, sentence,
+            "{sentence} cleared while audio returned during the hold"
+        );
+        screen.apply_playback(radiko::app::playback::Update::default());
+        assert_eq!(screen.playback_notice, sentence);
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(3)),
+                    Some(Duration::from_secs(40)),
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            shown + Duration::from_secs(5) - Duration::from_nanos(1),
+        );
+        assert_eq!(
+            screen.playback_notice, sentence,
+            "{sentence} just before 5s"
+        );
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(3)),
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            shown + Duration::from_secs(5) + Duration::from_nanos(1),
+        );
+        assert_eq!(
+            screen.playback_notice, RECEPTION_NOTICE,
+            "{sentence} just after 5s"
+        );
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::TimeFree,
+                    PlaybackState::Playing,
+                    None,
+                    Some(Duration::from_secs(30)),
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            shown + Duration::from_secs(30),
+        );
+        assert_eq!(screen.playback_notice, "再接続中…（30秒）", "{sentence}");
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    None,
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            shown + Duration::from_secs(31),
+        );
+        assert!(
+            screen.playback_notice.is_empty(),
+            "{sentence} did not clear"
+        );
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(4)),
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            shown + Duration::from_secs(40),
+        );
+        assert_eq!(
+            screen.playback_notice, RECEPTION_NOTICE,
+            "{sentence} second outage"
+        );
+    }
+    let mut screen = screen();
+    let shown = std::time::Instant::now();
+    screen.apply_playback_at(
+        radiko::app::playback::Update {
+            stopped: true,
+            ended: true,
+            notice: Some(stop_sentence.into()),
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                Some(Duration::from_secs(4)),
+                Some(Duration::from_secs(40)),
+            )),
+            ..radiko::app::playback::Update::default()
+        },
+        shown,
+    );
+    screen.apply_playback_at(
+        radiko::app::playback::Update {
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                Some(Duration::from_secs(4)),
+                Some(Duration::from_secs(30)),
+            )),
+            ..radiko::app::playback::Update::default()
+        },
+        shown + Duration::from_secs(30),
+    );
+    screen.apply_playback(radiko::app::playback::Update::default());
+    assert_eq!(screen.playback_notice, stop_sentence);
+}
+
+#[test]
+fn action_failure_notices_hold_for_five_seconds_during_an_outage() {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::playback::RECEPTION_NOTICE;
+    use radiko::player::state::PlaybackState;
+    assert_eq!(super::super::NOTICE_HOLD, Duration::from_secs(5));
+    let failures = [
+        "シーク不可: タイムフリーの放送枠内を指定してください（再生を継続）",
+        "切替不可: 局・日時・開始位置を確認してください",
+        "再生準備失敗（現在の状態を維持）: 配信取得: 通信に失敗しました",
+    ];
+    let outage = std::time::Instant::now();
+    let raised = outage + Duration::from_secs(2);
+    for sentence in failures {
+        let mut screen = screen();
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::TimeFree,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(2)),
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            raised,
+        );
+        assert_eq!(screen.playback_notice, RECEPTION_NOTICE);
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                notice: Some(sentence.into()),
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::TimeFree,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(2)),
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            raised,
+        );
+        assert_eq!(screen.playback_notice, sentence);
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::TimeFree,
+                    PlaybackState::Playing,
+                    None,
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            raised + Duration::from_secs(2),
+        );
+        assert_eq!(
+            screen.playback_notice, sentence,
+            "audio return cleared {sentence}"
+        );
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(4)),
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            raised + Duration::from_millis(4900),
+        );
+        assert_eq!(screen.playback_notice, sentence, "{sentence} at 4.9s");
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(6)),
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            raised + Duration::from_millis(5100),
+        );
+        assert_eq!(
+            screen.playback_notice, RECEPTION_NOTICE,
+            "{sentence} at 5.1s"
+        );
+        screen.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    None,
+                    Some(Duration::from_secs(30)),
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            outage + Duration::from_secs(30),
+        );
+        assert_eq!(screen.playback_notice, "再接続中…（30秒）", "{sentence}");
+    }
+    let mut late_screen = screen();
+    let late = outage + Duration::from_secs(26);
+    late_screen.apply_playback_at(
+        radiko::app::playback::Update {
+            notice: Some("再生切替失敗（現在の状態を維持）: 出力を開けません".into()),
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                None,
+                Some(Duration::from_secs(26)),
+            )),
+            ..radiko::app::playback::Update::default()
+        },
+        late,
+    );
+    let late_sentence = "再生切替失敗（現在の状態を維持）: 出力を開けません";
+    late_screen.apply_playback_at(
+        radiko::app::playback::Update {
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                None,
+                Some(Duration::from_secs(30)),
+            )),
+            ..radiko::app::playback::Update::default()
+        },
+        late + Duration::from_millis(4900),
+    );
+    assert_eq!(late_screen.playback_notice, late_sentence);
+    late_screen.apply_playback_at(
+        radiko::app::playback::Update {
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                None,
+                Some(Duration::from_secs(31)),
+            )),
+            ..radiko::app::playback::Update::default()
+        },
+        late + Duration::from_millis(5100),
+    );
+    assert_eq!(late_screen.playback_notice, "再接続中…（31秒）");
+    let mut stopped = screen();
+    let stop_sentence =
+        "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください";
+    stopped.apply_playback_at(
+        radiko::app::playback::Update {
+            stopped: true,
+            ended: true,
+            notice: Some(stop_sentence.into()),
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                Some(Duration::from_secs(4)),
+                Some(Duration::from_secs(40)),
+            )),
+            ..radiko::app::playback::Update::default()
+        },
+        outage,
+    );
+    stopped.apply_playback_at(
+        radiko::app::playback::Update {
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                Some(Duration::from_secs(8)),
+                Some(Duration::from_secs(40)),
+            )),
+            ..radiko::app::playback::Update::default()
+        },
+        outage + Duration::from_millis(5100),
+    );
+    assert_eq!(stopped.playback_notice, stop_sentence);
+}
+
+#[test]
+fn every_held_notice_lasts_four_point_nine_seconds_then_yields_to_reception() {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::playback::RECEPTION_NOTICE;
+    use radiko::player::state::PlaybackState;
+    // Far from the wall clock, so show_notice must use the injected instant.
+    let raised = std::time::Instant::now() + Duration::from_secs(86_400);
+    let rows = [
+        "シーク不可: タイムフリーの放送枠内を指定してください（再生を継続）",
+        "切替不可: 局・日時・開始位置を確認してください",
+        "再生準備失敗（現在の状態を維持）: 配信取得: 通信に失敗しました",
+        "再生準備に失敗しました（現在の状態を維持）",
+        "再生準備中: TBS / TimeFree / 1.000秒（現在の再生を継続）",
+        "一時停止",
+        "位置指定を取消: 再生対象が変わりました（再生を継続）",
+        "再生切替失敗（現在の状態を維持）: 出力を開けません",
+        "再生切替完了: TBS / TimeFree",
+        "放送前のため再生できません（現在の再生を継続）",
+        "放送終了のためライブ再生できません（現在の再生を継続）",
+        "配信窓の先頭から再開しました（累計1）",
+        "ライブ端に追いつきました（飛ばしたセグメントは累計2）",
+        "配信認証を更新して再生を続けます",
+    ];
+    for sentence in rows {
+        let mut view = screen();
+        view.set_notice_clock(raised);
+        match sentence {
+            "放送前のため再生できません（現在の再生を継続）"
+            | "放送終了のためライブ再生できません（現在の再生を継続）" =>
+            {
+                view.show_notice(sentence);
+            }
+            "配信窓の先頭から再開しました（累計1）" => {
+                view.apply_playback_at(catch_up_at(1, true), raised);
+            }
+            "ライブ端に追いつきました（飛ばしたセグメントは累計2）" => {
+                view.apply_playback_at(catch_up_at(2, false), raised);
+            }
+            "配信認証を更新して再生を続けます" => {
+                view.apply_playback_at(auth_update(), raised);
+            }
+            _ => {
+                view.apply_playback_at(
+                    radiko::app::playback::Update {
+                        notice: Some(sentence.into()),
+                        ..radiko::app::playback::Update::default()
+                    },
+                    raised,
+                );
+            }
+        }
+        assert_eq!(view.playback_notice, sentence, "raised {sentence}");
+        let quiet = radiko::app::playback::Update {
+            snapshot: Some(gap_snapshot(
+                ProbeMode::TimeFree,
+                PlaybackState::Playing,
+                None,
+                None,
+            )),
+            ..radiko::app::playback::Update::default()
+        };
+        view.apply_playback_at(quiet, raised + Duration::from_secs(2));
+        assert_eq!(view.playback_notice, sentence, "audio returned {sentence}");
+        let pending = radiko::app::playback::Update {
+            snapshot: Some(gap_snapshot(
+                ProbeMode::Live,
+                PlaybackState::Playing,
+                Some(Duration::from_secs(4)),
+                None,
+            )),
+            ..radiko::app::playback::Update::default()
+        };
+        view.apply_playback_at(pending, raised + Duration::from_millis(4900));
+        assert_eq!(view.playback_notice, sentence, "{sentence} at 4.9s");
+        view.apply_playback_at(
+            radiko::app::playback::Update {
+                snapshot: Some(gap_snapshot(
+                    ProbeMode::Live,
+                    PlaybackState::Playing,
+                    Some(Duration::from_secs(6)),
+                    None,
+                )),
+                ..radiko::app::playback::Update::default()
+            },
+            raised + Duration::from_millis(5100),
+        );
+        assert_eq!(view.playback_notice, RECEPTION_NOTICE, "{sentence} at 5.1s");
+    }
+}
+
+fn catch_up_at(skipped: u64, at_head: bool) -> radiko::app::playback::Update {
+    use radiko::api::stream::ProbeMode;
+    use radiko::player::state::PlaybackState;
+    let mut snapshot = gap_snapshot(ProbeMode::Live, PlaybackState::Playing, None, None);
+    snapshot.pipeline = Some(radiko::player::diagnostics::Snapshot {
+        stage: radiko::player::diagnostics::Stage::Waiting,
+        elapsed: Duration::from_secs(1),
+        acquisition_max: Duration::ZERO,
+        acquisition_max_pcm_start: Duration::ZERO,
+        acquisition_max_pcm_min: Duration::ZERO,
+        decode_max: Duration::ZERO,
+        decode_last: Duration::ZERO,
+        media_last: Duration::ZERO,
+        decoded_segments: 1,
+        waiting_pcm_segments: 0,
+        waiting_pcm_media: Duration::ZERO,
+        http: Some(radiko::api::stream::playback::RequestSnapshot {
+            stage: radiko::api::stream::playback::RequestStage::Idle,
+            response_status: Some(200),
+            elapsed: Duration::ZERO,
+            headers_max: Duration::ZERO,
+            body_max: Duration::ZERO,
+            attempts: 1,
+            retry_waits: 0,
+            network_failures: 0,
+            timeouts: 0,
+            connect_failures: 0,
+            reauthentications: 0,
+            skipped_segments: skipped,
+            sequence_resets: 0,
+            joined_window_head: at_head,
+        }),
+    });
+    radiko::app::playback::Update {
+        snapshot: Some(snapshot),
+        ..radiko::app::playback::Update::default()
     }
 }

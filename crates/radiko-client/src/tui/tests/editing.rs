@@ -395,6 +395,7 @@ fn live_enter_uses_the_selected_on_air_slot_without_searching() {
         position: None,
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for: None,
     });
     let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();

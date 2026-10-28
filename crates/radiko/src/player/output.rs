@@ -603,6 +603,11 @@ impl Output {
             sample_format,
         })
     }
+    fn queued_frames(&self) -> u64 {
+        let capacity = self.producer.buffer().capacity();
+        let free = self.producer.slots();
+        u64::try_from(capacity.saturating_sub(free)).unwrap_or(u64::MAX)
+    }
     fn check(&self) -> Result<(), OutputError> {
         if self.state.failed.load(Ordering::Acquire) {
             Err(OutputError::Device)
@@ -906,6 +911,10 @@ impl ContinuousOutput {
     }
     pub fn reconnecting_for(&self) -> Option<Duration> {
         self.watch.reconnecting_for()
+    }
+    /// Frames still sitting in the device ring. Zero means that buffer is empty.
+    pub fn queued_frames(&self) -> u64 {
+        self.output.queued_frames()
     }
     pub fn poll(&mut self) -> Result<bool, OutputError> {
         self.output.check()?;

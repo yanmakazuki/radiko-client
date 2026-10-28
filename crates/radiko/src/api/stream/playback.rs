@@ -2447,6 +2447,317 @@ mod tests {
         assert_eq!(lost.next, 11);
         assert_eq!(lost.http.skipped.get(), 0);
     }
+    struct GapSample {
+        at: Wait,
+        receiving: Option<Wait>,
+        reconnecting: Option<Wait>,
+    }
+    struct GapTrace {
+        anchor: Option<Wait>,
+        samples: Vec<GapSample>,
+        recovered: bool,
+    }
+    struct ClockedFetch {
+        clock: std::sync::Arc<crate::player::playback::ManualClock>,
+        until: Wait,
+        playlist: Vec<u8>,
+        stop: crate::player::output::StopToken,
+        skipped: Cell<u64>,
+        resets: Cell<u64>,
+        at_head: Cell<bool>,
+    }
+    impl Fetch for ClockedFetch {
+        fn note_skipped_segments(&self, count: u64) {
+            self.skipped.set(self.skipped.get().saturating_add(count));
+        }
+        fn note_sequence_reset(&self) {
+            self.resets.set(self.resets.get() + 1);
+        }
+        fn note_joined_window_head(&self, at_head: bool) {
+            self.at_head.set(at_head);
+        }
+        fn cancelled(&self) -> bool {
+            self.stop.is_cancelled()
+        }
+        fn get(
+            &self,
+            url: Url,
+            _: HeaderMap,
+            _: usize,
+            _: Option<(u64, u64)>,
+            _: bool,
+        ) -> Result<Reply, ProbeError> {
+            if url.path().ends_with(".aac") {
+                return Ok(Reply {
+                    headers: HeaderMap::new(),
+                    bytes: adts_frame(),
+                    url,
+                });
+            }
+            if self.clock.elapsed() < self.until {
+                return Err(ProbeError::Network);
+            }
+            Ok(Reply {
+                headers: HeaderMap::new(),
+                bytes: self.playlist.clone(),
+                url,
+            })
+        }
+    }
+    struct PlaylistSource {
+        inner: HlsStream<ClockedFetch>,
+        info: StreamInfo,
+        clock: std::sync::Arc<crate::player::playback::ManualClock>,
+    }
+    impl SegmentSource for PlaylistSource {
+        fn info(&self) -> &StreamInfo {
+            &self.info
+        }
+        fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+            use crate::player::playback::MonoClock;
+            self.inner.poll(self.clock.now())
+        }
+    }
+    struct HoldSink {
+        clock: std::sync::Arc<crate::player::playback::ManualClock>,
+        started: std::sync::Arc<std::sync::Mutex<Option<Wait>>>,
+        buffered_from: Cell<Option<u64>>,
+        rate: u32,
+        channels: u16,
+        accepted: u64,
+        maximum: u64,
+    }
+    impl HoldSink {
+        /// One `#EXTINF:5` of audio stays queued, then the device buffer is empty.
+        fn still_buffered(&self) -> bool {
+            let Some(from) = self.buffered_from.get() else {
+                return false;
+            };
+            self.clock.elapsed().as_millis() < u128::from(from.saturating_add(5_000))
+        }
+    }
+    impl crate::player::playback::AudioSink for HoldSink {
+        fn enqueue(
+            &mut self,
+            pcm: &crate::player::aac::DecodedPcm,
+            cursor: &mut usize,
+        ) -> Result<bool, crate::player::output::OutputError> {
+            if !self.still_buffered() {
+                let now = u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+                self.buffered_from.set(Some(now));
+                let mut started = self.started.lock().expect("anchor");
+                if started.is_none() {
+                    *started = Some(self.clock.elapsed());
+                }
+            }
+            self.accepted = self.accepted.saturating_add(pcm.summary.frames as u64);
+            *cursor = pcm.samples.len();
+            let _ = (self.rate, self.channels, self.maximum);
+            Ok(true)
+        }
+        fn accepted(&self) -> u64 {
+            self.accepted.min(self.maximum.saturating_sub(1))
+        }
+        fn summary(&self) -> crate::player::output::OutputSummary {
+            crate::player::output::OutputSummary {
+                frames: u64::from(self.buffered_from.get().is_some()),
+                underrun_frames: 0,
+                sample_rate: self.rate,
+                channels: self.channels,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
+            }
+        }
+        fn poll(&mut self) -> Result<bool, crate::player::output::OutputError> {
+            Ok(false)
+        }
+        fn finish(&mut self) {}
+        fn queued_frames(&self) -> u64 {
+            u64::from(self.still_buffered())
+        }
+    }
+    fn adts_frame() -> Vec<u8> {
+        use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, write_adts_header};
+        let mut encoder = AacEncoder::new(AacEncoderConfig::default());
+        let samples: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+        encoder.push_pcm(&samples, 1, 48_000).unwrap();
+        encoder.finish();
+        let packet = encoder.next_packet().unwrap();
+        let mut bytes = write_adts_header(&AdtsHeader {
+            object_type: 2,
+            sample_rate: 48_000,
+            channels: 1,
+            frame_length: packet.data.len() + 7,
+            header_len: 7,
+        });
+        bytes.extend(packet.data);
+        bytes
+    }
+    fn stream_info(live: bool) -> StreamInfo {
+        let start = chrono::Utc::now().fixed_offset() - chrono::Duration::minutes(30);
+        StreamInfo {
+            title: Some("合成".into()),
+            station: "TBS".into(),
+            mode: if live {
+                crate::api::stream::ProbeMode::Live
+            } else {
+                crate::api::stream::ProbeMode::TimeFree
+            },
+            starts_at: start,
+            ends_at: start + chrono::Duration::hours(3),
+            position: Wait::ZERO,
+        }
+    }
+    fn drive_playlist_outage(live: bool, seconds: u64, playlist: Vec<u8>) -> GapTrace {
+        use crate::player::output::StopToken;
+        use crate::player::playback::{ManualClock, MonoClock, play_with_clock};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::thread;
+        let clock = ManualClock::new();
+        let stop = StopToken::default();
+        let watchdog = stop.clone();
+        thread::spawn(move || {
+            thread::sleep(Wait::from_secs(20));
+            watchdog.cancel();
+        });
+        let mut hls = HlsStream::new(
+            ClockedFetch {
+                clock: clock.clone(),
+                until: Wait::from_secs(seconds),
+                playlist,
+                stop: stop.clone(),
+                skipped: Cell::new(0),
+                resets: Cell::new(0),
+                at_head: Cell::new(false),
+            },
+            Url::parse("https://radiko.jp/audio/media.m3u8").unwrap(),
+            HeaderMap::new(),
+            parsed(&media(10, 1, false, "a", false)),
+            Some("mp4a.40.2".into()),
+        )
+        .unwrap();
+        hls.live = live;
+        let pace = clock.clone();
+        let park_stop = stop.clone();
+        hls.sleeper = Some(Box::new(move |step| {
+            pace.park(step, &park_stop);
+            if park_stop.is_cancelled() {
+                Err(ProbeError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }));
+        let started = Arc::new(Mutex::new(None));
+        let started_sink = started.clone();
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let recorded = samples.clone();
+        let seen = clock.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let cancel = stop.clone();
+        let mut saw_gap = false;
+        let playback_clock: std::sync::Arc<dyn MonoClock> = clock.clone();
+        let sink_clock = clock.clone();
+        let playback_error = play_with_clock(
+            PlaylistSource {
+                inner: hls,
+                info: stream_info(live),
+                clock: clock.clone(),
+            },
+            stop,
+            playback_clock,
+            move |snapshot| {
+                if snapshot.receiving_for.is_some() || snapshot.reconnecting_for.is_some() {
+                    saw_gap = true;
+                }
+                let cleared = saw_gap
+                    && snapshot.segments >= 2
+                    && snapshot.receiving_for.is_none()
+                    && snapshot.reconnecting_for.is_none();
+                recorded.lock().expect("trace").push(GapSample {
+                    at: seen.elapsed(),
+                    receiving: snapshot.receiving_for,
+                    reconnecting: snapshot.reconnecting_for,
+                });
+                if cleared {
+                    finished.store(true, Ordering::Release);
+                    cancel.cancel();
+                }
+            },
+            move |pcm, maximum, _, _| {
+                Ok(HoldSink {
+                    clock: sink_clock.clone(),
+                    started: started_sink.clone(),
+                    buffered_from: Cell::new(None),
+                    rate: pcm.summary.sample_rate,
+                    channels: pcm.summary.channels,
+                    accepted: 0,
+                    maximum,
+                })
+            },
+        );
+        let anchor = *started.lock().expect("anchor");
+        if anchor.is_none() {
+            let detail = match &playback_error {
+                Ok(report) => format!("ended {:?}", report.reason),
+                Err(error) => error.to_string(),
+            };
+            panic!("playback never started: {detail}");
+        }
+        GapTrace {
+            anchor,
+            samples: std::mem::take(&mut *samples.lock().expect("trace")),
+            recovered: done.load(Ordering::Acquire),
+        }
+    }
+    #[test]
+    fn injected_clock_playlist_outage_drives_the_playback_loop_for_live_and_timefree() {
+        assert!(String::from_utf8_lossy(&media(10, 1, false, "a", false)).contains("#EXTINF:5,"));
+        let cases = [
+            (true, 22_u64, media(13, 3, false, "b", false), false),
+            (false, 22, media(11, 1, false, "b", false), false),
+            (true, 60, media(13, 6, false, "b", false), true),
+            (false, 60, media(11, 1, false, "b", false), true),
+        ];
+        for (live, seconds, playlist, reconnects) in cases {
+            let trace = drive_playlist_outage(live, seconds, playlist);
+            let anchor = trace.anchor.expect("playback started");
+            let first_receiving = trace
+                .samples
+                .iter()
+                .find(|sample| sample.receiving.is_some())
+                .unwrap_or_else(|| {
+                    panic!("受信待ち was not reported live={live} outage={seconds}")
+                });
+            assert_eq!(
+                first_receiving.at.saturating_sub(anchor),
+                Wait::from_secs(7),
+                "live={live} outage={seconds}"
+            );
+            assert!(
+                trace.samples.iter().all(|sample| {
+                    sample.receiving.is_none() && sample.reconnecting.is_none()
+                        || sample.at.saturating_sub(anchor) >= Wait::from_secs(7)
+                }),
+                "gap notice before 7s"
+            );
+            let first_reconnect = trace
+                .samples
+                .iter()
+                .find(|sample| sample.reconnecting.is_some());
+            if reconnects {
+                let sample = first_reconnect.expect("再接続中 was not reported");
+                assert_eq!(sample.at.saturating_sub(anchor), Wait::from_secs(30));
+                assert_eq!(sample.reconnecting, Some(Wait::from_secs(30)));
+                assert!(sample.receiving.is_none());
+            } else {
+                assert!(first_reconnect.is_none(), "22s outage showed 再接続中");
+            }
+            assert!(trace.recovered, "audio return did not clear the gap notice");
+        }
+    }
     #[test]
     fn timefree_lost_window_is_window_lost_and_does_not_skip_ahead() {
         let mut source = reader(

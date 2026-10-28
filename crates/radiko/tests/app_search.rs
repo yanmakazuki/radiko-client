@@ -76,6 +76,7 @@ fn draft_edit_cancel_and_stale_results_never_change_committed_data_or_playback()
             sample_format: OutputSampleFormat::F32,
         }),
         segments: 1,
+        receiving_for: None,
         reconnecting_for: None,
     });
     app.begin_edit();

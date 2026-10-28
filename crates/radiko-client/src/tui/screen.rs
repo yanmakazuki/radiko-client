@@ -30,7 +30,11 @@ impl Screen {
             chapter_notice: String::new(),
             playback_action: None,
             playback_notice: String::new(),
+            notice_hold: super::NoticeHold::Other,
+            notice_hold_until: None,
+            notice_clock: None,
             playback_stopped: false,
+            playback_ended: false,
             seen_reauthentications: 0,
             seen_skipped_segments: 0,
             seen_sequence_resets: 0,
@@ -56,7 +60,7 @@ impl Screen {
         if let Some(credentials) = self.login_requested.take() {
             if self.offline {
                 drop(credentials);
-                self.playback_notice = "オフライン確認ではログインしません".into();
+                self.show_notice("オフライン確認ではログインしません");
             } else {
                 self.auth_refresh = false;
                 authentication.cancel();
@@ -72,7 +76,7 @@ impl Screen {
         }
         if std::mem::take(&mut self.auth_refresh) {
             if self.offline {
-                self.playback_notice = "オフライン確認ではセッションを通信確認しません".into();
+                self.show_notice("オフライン確認ではセッションを通信確認しません");
             } else {
                 authentication.submit(self.app.authentication.begin()?);
             }
@@ -103,7 +107,7 @@ impl Screen {
                 PlaybackAction::Stop | PlaybackAction::Command(Command::Volume(_))
             )
         {
-            self.playback_notice = "オフライン確認では再生しません".into();
+            self.show_notice("オフライン確認では再生しません");
             return;
         }
         let volume = match &action {
@@ -126,22 +130,38 @@ impl Screen {
                     self.volume = volume;
                 }
             }
-            Err(reason) => self.playback_notice = reason.into(),
+            Err(reason) => self.show_notice(reason),
         }
     }
+    fn playback_now(&self) -> std::time::Instant {
+        self.notice_clock.unwrap_or_else(std::time::Instant::now)
+    }
     pub(super) fn apply_playback(&mut self, update: playback::Update) {
+        self.apply_playback_at(update, self.playback_now());
+    }
+    #[cfg(test)]
+    pub(super) fn set_notice_clock(&mut self, now: std::time::Instant) {
+        self.notice_clock = Some(now);
+    }
+    pub(super) fn apply_playback_at(&mut self, update: playback::Update, now: std::time::Instant) {
         if update.new_session {
             self.app.playback = None;
             self.playback_diagnostics.clear();
             self.pipeline_diagnostics.clear();
             self.playback_notice.clear();
+            self.notice_hold = super::NoticeHold::Other;
+            self.notice_hold_until = None;
             self.playback_stopped = false;
+            self.playback_ended = false;
             self.seen_reauthentications = 0;
             self.seen_skipped_segments = 0;
             self.seen_sequence_resets = 0;
         }
         if update.stopped {
             self.playback_stopped = true;
+        }
+        if update.ended {
+            self.playback_ended = true;
         }
         if let Some(snapshot) = &update.snapshot {
             self.pipeline_diagnostics = snapshot
@@ -160,10 +180,16 @@ impl Screen {
             self.playback_diagnostics =
                 format!("直近通知（終了時未集計）: {}", self.playback_diagnostics);
         }
+        let has_snapshot = update.snapshot.is_some();
         let reconnecting_for = update
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.reconnecting_for);
+        let receiving = update
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.receiving_for.is_some());
+        let snapshot_state = update.snapshot.as_ref().map(|snapshot| snapshot.state);
         let http = update
             .snapshot
             .as_ref()
@@ -192,36 +218,91 @@ impl Screen {
         }
         if let Some(count) = renewed {
             self.seen_reauthentications = count;
-            if !self.playback_stopped {
+            if !self.playback_stopped && !self.playback_ended {
                 self.playback_notice = "配信認証を更新して再生を続けます".into();
+                self.notice_hold = super::NoticeHold::AuthRenewal;
+                self.notice_hold_until = Some(now + super::NOTICE_HOLD);
             }
         }
         let at_head = http.is_some_and(|http| http.joined_window_head);
-        if let Some(elapsed) = reconnecting_for {
-            if !self.playback_stopped
-                && !self.playback_notice.contains("配信認証を更新")
-                && !self.playback_notice.contains("累計")
-                && !self.playback_notice.contains("番組終了")
+        let paused = snapshot_state == Some(radiko::player::state::PlaybackState::Paused);
+        let before_audio = snapshot_state == Some(radiko::player::state::PlaybackState::Buffering);
+        let held = self.notice_hold_until.is_some_and(|until| now < until)
+            && matches!(
+                self.notice_hold,
+                super::NoticeHold::AuthRenewal
+                    | super::NoticeHold::CatchUp
+                    | super::NoticeHold::Action
+            );
+        // An empty poll has no snapshot. Leaving the notice alone stops the
+        // once-a-second blink: most 50ms ticks carry no playback snapshot.
+        if has_snapshot {
+            let show_gap =
+                !self.playback_stopped && !self.playback_ended && !paused && !before_audio && !held;
+            if show_gap {
+                if let Some(elapsed) = reconnecting_for {
+                    self.playback_notice = radiko::player::playback::reconnect_notice(elapsed);
+                    self.notice_hold = super::NoticeHold::Reconnecting;
+                    self.notice_hold_until = None;
+                } else if receiving {
+                    self.playback_notice = radiko::player::playback::RECEPTION_NOTICE.into();
+                    self.notice_hold = super::NoticeHold::Receiving;
+                    self.notice_hold_until = None;
+                } else if matches!(
+                    self.notice_hold,
+                    super::NoticeHold::Receiving | super::NoticeHold::Reconnecting
+                ) {
+                    self.playback_notice.clear();
+                    self.notice_hold = super::NoticeHold::Other;
+                    self.notice_hold_until = None;
+                }
+            } else if !held
+                && matches!(
+                    self.notice_hold,
+                    super::NoticeHold::Receiving | super::NoticeHold::Reconnecting
+                )
             {
-                self.playback_notice = format!("再接続中…（{}秒）", elapsed.as_secs());
+                self.playback_notice.clear();
+                self.notice_hold = super::NoticeHold::Other;
+                self.notice_hold_until = None;
             }
-        } else if self.playback_notice.starts_with("再接続中") {
-            self.playback_notice.clear();
         }
         if let Some((skipped, resets)) = realign {
             self.seen_sequence_resets = resets;
             self.seen_skipped_segments = skipped;
-            if !self.playback_stopped && !self.playback_notice.contains("配信認証を更新") {
+            let protected = held
+                && matches!(
+                    self.notice_hold,
+                    super::NoticeHold::AuthRenewal | super::NoticeHold::Action
+                );
+            if !self.playback_stopped && !self.playback_ended && !protected {
                 self.playback_notice = if at_head {
                     format!("配信窓の先頭から再開しました（累計{skipped}）")
                 } else {
                     format!("ライブ端に追いつきました（飛ばしたセグメントは累計{skipped}）")
                 };
+                self.notice_hold = super::NoticeHold::CatchUp;
+                self.notice_hold_until = Some(now + super::NOTICE_HOLD);
             }
         }
         if let Some(notice) = update.notice {
             self.playback_notice = notice;
+            if self.playback_stopped || self.playback_ended {
+                self.notice_hold = super::NoticeHold::Other;
+                self.notice_hold_until = None;
+            } else {
+                self.hold_action(now);
+            }
         }
+    }
+    fn hold_action(&mut self, now: std::time::Instant) {
+        self.notice_hold = super::NoticeHold::Action;
+        self.notice_hold_until = Some(now + super::NOTICE_HOLD);
+    }
+    pub(super) fn show_notice(&mut self, notice: impl Into<String>) {
+        let now = self.playback_now();
+        self.playback_notice = notice.into();
+        self.hold_action(now);
     }
     pub(super) fn rows(&self) -> &[usize] {
         if self.live_mode {
@@ -473,7 +554,7 @@ impl Screen {
             KeyCode::Char('y') => {
                 self.logout_confirm = false;
                 if self.offline {
-                    self.playback_notice = "オフライン確認ではログアウトしません".into();
+                    self.show_notice("オフライン確認ではログアウトしません");
                 } else {
                     self.logout_requested = true;
                 }
@@ -592,7 +673,7 @@ impl Screen {
             AuthStatus::LoggingOut | AuthStatus::LoggingIn
         ) && matches!(key.code, KeyCode::Char('I' | 'O' | 'a'))
         {
-            self.playback_notice = "認証情報の更新処理中です".into();
+            self.show_notice("認証情報の更新処理中です");
             return Some(false);
         }
         if matches!(self.app.authentication.status, AuthStatus::LoggingOut)
@@ -604,7 +685,7 @@ impl Screen {
                     | KeyCode::Char('a' | 'O' | 'l' | 'g' | ' ')
             )
         {
-            self.playback_notice = "ログアウト処理中です".into();
+            self.show_notice("ログアウト処理中です");
             return Some(false);
         }
         None
@@ -710,28 +791,28 @@ impl Screen {
             }
             KeyCode::Char('a') => {
                 if self.offline {
-                    self.playback_notice = "オフライン確認ではセッションを通信確認しません".into();
+                    self.show_notice("オフライン確認ではセッションを通信確認しません");
                 } else {
                     self.auth_refresh = true;
                 }
             }
             KeyCode::Char('O') => {
                 if self.offline {
-                    self.playback_notice = "オフライン確認ではログアウトしません".into();
+                    self.show_notice("オフライン確認ではログアウトしません");
                 } else {
                     self.logout_confirm = true;
                 }
             }
             KeyCode::Char('I') => {
                 if self.offline {
-                    self.playback_notice = "オフライン確認ではログインしません".into();
+                    self.show_notice("オフライン確認ではログインしません");
                 } else {
                     self.login = Some(login::Editor::default());
                 }
             }
             KeyCode::Char('b') => {
                 if self.offline {
-                    self.playback_notice = "オフライン確認では保存条件を読み書きしません".into();
+                    self.show_notice("オフライン確認では保存条件を読み書きしません");
                 } else {
                     self.named_generation = self
                         .named_generation
@@ -750,7 +831,7 @@ impl Screen {
             }
             KeyCode::Char('c') => {
                 if self.offline {
-                    self.playback_notice = "オフライン確認ではチャプターを取得しません".into();
+                    self.show_notice("オフライン確認ではチャプターを取得しません");
                 } else if let Some(target) = self.selected().cloned() {
                     self.open_chapters(target)?;
                 }
@@ -783,7 +864,7 @@ impl Screen {
             }
             KeyCode::Enter => {
                 if self.offline {
-                    self.playback_notice = "オフライン確認では再生しません".into();
+                    self.show_notice("オフライン確認では再生しません");
                 } else if let Some(program) = self.selected() {
                     let request = if self.live_mode {
                         playback::live_request
@@ -798,17 +879,17 @@ impl Screen {
                                 PlaybackAction::Select(program.clone())
                             })
                         }
-                        Err(reason) => self.playback_notice = reason.into(),
+                        Err(reason) => self.show_notice(reason),
                     }
                 }
             }
             KeyCode::Char('l') if self.app.chapters.target.is_none() => {
                 if self.offline {
-                    self.playback_notice = "オフライン確認では再生しません".into();
+                    self.show_notice("オフライン確認では再生しません");
                 } else if let Some(program) = self.selected() {
                     match playback::live_request(program, Utc::now().fixed_offset()) {
                         Ok(_) => self.playback_action = Some(PlaybackAction::Live(program.clone())),
-                        Err(reason) => self.playback_notice = reason.into(),
+                        Err(reason) => self.show_notice(reason),
                     }
                 }
             }
@@ -816,10 +897,10 @@ impl Screen {
                 if let Some(snapshot) = &self.app.playback {
                     match seek::Editor::new(snapshot) {
                         Ok(editor) => self.seek = Some(editor),
-                        Err(reason) => self.playback_notice = reason.into(),
+                        Err(reason) => self.show_notice(reason),
                     }
                 } else {
-                    self.playback_notice = "再生中の番組はありません".into();
+                    self.show_notice("再生中の番組はありません");
                 }
             }
             KeyCode::Char('s') => self.playback_action = Some(PlaybackAction::Stop),
