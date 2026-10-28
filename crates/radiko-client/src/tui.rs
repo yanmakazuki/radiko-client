@@ -9,6 +9,7 @@ mod picker;
 mod scroll;
 mod seek;
 mod viewport;
+use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use radiko::{
@@ -114,6 +115,8 @@ struct Screen {
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
     seen_reauthentications: u64,
+    seen_skipped_segments: u64,
+    seen_sequence_resets: u64,
     playback_diagnostics: String,
     pipeline_diagnostics: String,
     volume: u32,
@@ -155,6 +158,8 @@ impl Screen {
             playback_action: None,
             playback_notice: String::new(),
             seen_reauthentications: 0,
+            seen_skipped_segments: 0,
+            seen_sequence_resets: 0,
             playback_diagnostics: String::new(),
             pipeline_diagnostics: String::new(),
             volume: 25,
@@ -231,6 +236,8 @@ impl Screen {
             self.pipeline_diagnostics.clear();
             self.playback_notice.clear();
             self.seen_reauthentications = 0;
+            self.seen_skipped_segments = 0;
+            self.seen_sequence_resets = 0;
         }
         if let Some(snapshot) = &update.snapshot {
             self.pipeline_diagnostics = snapshot
@@ -249,13 +256,23 @@ impl Screen {
             self.playback_diagnostics =
                 format!("直近通知（終了時未集計）: {}", self.playback_diagnostics);
         }
-        let renewed = update
+        let reconnecting_for = update
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.reconnecting_for);
+        let http = update
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.pipeline.as_ref())
-            .and_then(|pipeline| pipeline.http)
+            .and_then(|pipeline| pipeline.http);
+        let renewed = http
             .map(|http| http.reauthentications)
             .filter(|count| *count > self.seen_reauthentications);
+        let realign = http
+            .map(|http| (http.skipped_segments, http.sequence_resets))
+            .filter(|(skipped, resets)| {
+                *resets > self.seen_sequence_resets || *skipped > self.seen_skipped_segments
+            });
         if update.ended {
             if !self.pipeline_diagnostics.is_empty() {
                 self.pipeline_diagnostics = self
@@ -275,6 +292,33 @@ impl Screen {
                 && !self.playback_notice.contains("認証期限切れ")
             {
                 self.playback_notice = "配信認証を更新して再生を続けます".into();
+            }
+        }
+        let at_head = http.is_some_and(|http| http.joined_window_head);
+        if let Some(elapsed) = reconnecting_for {
+            if !self.playback_notice.contains("再生停止")
+                && !self.playback_notice.contains("認証期限切れ")
+                && !self.playback_notice.contains("配信認証を更新")
+                && !self.playback_notice.contains("累計")
+                && !self.playback_notice.contains("番組終了")
+            {
+                self.playback_notice = format!("再接続中…（{}秒）", elapsed.as_secs());
+            }
+        } else if self.playback_notice.starts_with("再接続中") {
+            self.playback_notice.clear();
+        }
+        if let Some((skipped, resets)) = realign {
+            self.seen_sequence_resets = resets;
+            self.seen_skipped_segments = skipped;
+            if !self.playback_notice.contains("再生停止")
+                && !self.playback_notice.contains("認証期限切れ")
+                && !self.playback_notice.contains("配信認証を更新")
+            {
+                self.playback_notice = if at_head {
+                    format!("配信窓の先頭から再開しました（累計{skipped}）")
+                } else {
+                    format!("ライブ端に追いつきました（飛ばしたセグメントは累計{skipped}）")
+                };
             }
         }
         if let Some(notice) = update.notice {
@@ -1485,7 +1529,7 @@ async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(
 }
 pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if args == ["--help"] {
-        println!("{USAGE}");
+        stdout_ln!("{USAGE}");
         return Ok(());
     }
     if args
@@ -2019,6 +2063,7 @@ mod tests {
             position: None,
             output: None,
             segments: 1,
+            reconnecting_for: None,
         });
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
         terminal
@@ -2457,6 +2502,7 @@ mod tests {
                 position: None,
                 output: None,
                 segments: 1,
+                reconnecting_for: None,
                 pipeline: Some(Snapshot {
                     stage: Stage::Acquisition,
                     elapsed: Duration::from_millis(1),
@@ -2481,6 +2527,9 @@ mod tests {
                         timeouts: 0,
                         connect_failures: 0,
                         reauthentications: 1,
+                        skipped_segments: 0,
+                        sequence_resets: 0,
+                        joined_window_head: false,
                     }),
                 }),
             }),
@@ -2506,6 +2555,221 @@ mod tests {
         let shown = text(&terminal).replace(' ', "");
         assert!(shown.contains("再生側で認証失敗"), "{shown}");
         assert!(!shown.contains("配信認証を更新して継続"), "{shown}");
+    }
+    #[test]
+    fn live_playlist_catch_up_is_shown_in_the_notice_and_http_diagnostics() {
+        use radiko::player::diagnostics::{Snapshot, Stage};
+        let mut screen = screen();
+        let now = Utc::now().fixed_offset();
+        let http = |skipped, resets, at_head| radiko::api::stream::playback::RequestSnapshot {
+            stage: radiko::api::stream::playback::RequestStage::Idle,
+            response_status: Some(200),
+            elapsed: Duration::ZERO,
+            headers_max: Duration::ZERO,
+            body_max: Duration::ZERO,
+            attempts: 1,
+            retry_waits: 0,
+            network_failures: 0,
+            timeouts: 0,
+            connect_failures: 0,
+            reauthentications: 0,
+            skipped_segments: skipped,
+            sequence_resets: resets,
+            joined_window_head: at_head,
+        };
+        let update = |skipped, resets, at_head| radiko::app::playback::Update {
+            snapshot: Some(radiko::player::state::PlaybackSnapshot {
+                info: radiko::api::stream::playback::StreamInfo {
+                    title: Some("枠".into()),
+                    station: "TBS".into(),
+                    mode: radiko::api::stream::ProbeMode::Live,
+                    starts_at: now,
+                    ends_at: now + chrono::Duration::hours(1),
+                    position: Duration::ZERO,
+                },
+                state: PlaybackState::Playing,
+                pending: None,
+                volume: 25,
+                position: None,
+                output: None,
+                segments: 2,
+                reconnecting_for: None,
+                pipeline: Some(Snapshot {
+                    stage: Stage::Acquisition,
+                    elapsed: Duration::from_millis(1),
+                    acquisition_max: Duration::ZERO,
+                    acquisition_max_pcm_start: Duration::ZERO,
+                    acquisition_max_pcm_min: Duration::ZERO,
+                    decode_max: Duration::ZERO,
+                    decode_last: Duration::ZERO,
+                    media_last: Duration::ZERO,
+                    decoded_segments: 2,
+                    waiting_pcm_segments: 0,
+                    waiting_pcm_media: Duration::ZERO,
+                    http: Some(http(skipped, resets, at_head)),
+                }),
+            }),
+            ..radiko::app::playback::Update::default()
+        };
+        screen.apply_playback(update(2, 0, true));
+        assert_eq!(
+            screen.playback_notice,
+            "配信窓の先頭から再開しました（累計2）"
+        );
+        assert!(screen.pipeline_diagnostics.contains("飛ばしたセグメント2"));
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let shown: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(shown.contains("配信窓の先頭から再開しました"), "{shown}");
+        assert!(shown.contains("累計2"), "{shown}");
+        assert!(shown.contains("飛ばしたセグメント2"), "{shown}");
+        screen.apply_playback(update(4, 0, false));
+        assert_eq!(
+            screen.playback_notice,
+            "ライブ端に追いつきました（飛ばしたセグメントは累計4）"
+        );
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let shown: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(shown.contains("ライブ端に追いつきました"), "{shown}");
+        assert!(shown.contains("飛ばしたセグメント4"), "{shown}");
+        screen.apply_playback(update(4, 1, true));
+        assert_eq!(
+            screen.playback_notice,
+            "配信窓の先頭から再開しました（累計4）"
+        );
+        assert!(screen.pipeline_diagnostics.contains("通し番号の巻き戻り1"));
+        screen.playback_notice = "配信認証を更新して再生を続けます".into();
+        screen.apply_playback(update(5, 1, false));
+        assert_eq!(screen.playback_notice, "配信認証を更新して再生を続けます");
+        assert!(screen.pipeline_diagnostics.contains("飛ばしたセグメント5"));
+        screen.apply_playback(radiko::app::playback::Update {
+            new_session: true,
+            ..radiko::app::playback::Update::default()
+        });
+        assert!(screen.playback_notice.is_empty());
+        screen.apply_playback(update(2, 0, false));
+        assert_eq!(
+            screen.playback_notice,
+            "ライブ端に追いつきました（飛ばしたセグメントは累計2）"
+        );
+    }
+    #[test]
+    fn reconnecting_notice_is_shown_and_yields_to_catch_up_and_stop() {
+        use radiko::player::diagnostics::{Snapshot, Stage};
+        let mut screen = screen();
+        let now = Utc::now().fixed_offset();
+        let snapshot =
+            |reconnecting_for, skipped, at_head| radiko::player::state::PlaybackSnapshot {
+                info: radiko::api::stream::playback::StreamInfo {
+                    title: Some("枠".into()),
+                    station: "TBS".into(),
+                    mode: radiko::api::stream::ProbeMode::Live,
+                    starts_at: now,
+                    ends_at: now + chrono::Duration::hours(1),
+                    position: Duration::ZERO,
+                },
+                state: PlaybackState::Playing,
+                pending: None,
+                volume: 25,
+                position: None,
+                output: None,
+                segments: 1,
+                reconnecting_for,
+                pipeline: Some(Snapshot {
+                    stage: Stage::Waiting,
+                    elapsed: Duration::from_secs(1),
+                    acquisition_max: Duration::ZERO,
+                    acquisition_max_pcm_start: Duration::ZERO,
+                    acquisition_max_pcm_min: Duration::ZERO,
+                    decode_max: Duration::ZERO,
+                    decode_last: Duration::ZERO,
+                    media_last: Duration::ZERO,
+                    decoded_segments: 1,
+                    waiting_pcm_segments: 0,
+                    waiting_pcm_media: Duration::ZERO,
+                    http: Some(radiko::api::stream::playback::RequestSnapshot {
+                        stage: radiko::api::stream::playback::RequestStage::Idle,
+                        response_status: Some(200),
+                        elapsed: Duration::ZERO,
+                        headers_max: Duration::ZERO,
+                        body_max: Duration::ZERO,
+                        attempts: 1,
+                        retry_waits: 0,
+                        network_failures: 0,
+                        timeouts: 0,
+                        connect_failures: 0,
+                        reauthentications: 0,
+                        skipped_segments: skipped,
+                        sequence_resets: 0,
+                        joined_window_head: at_head,
+                    }),
+                }),
+            };
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(snapshot(Some(Duration::from_secs(42)), 0, false)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(screen.playback_notice, "再接続中…（42秒）");
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut screen, now))
+            .unwrap();
+        let shown: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(shown.contains("再接続中…（42秒）"), "{shown}");
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(snapshot(None, 2, true)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(
+            screen.playback_notice,
+            "配信窓の先頭から再開しました（累計2）"
+        );
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(snapshot(None, 5, false)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(
+            screen.playback_notice,
+            "ライブ端に追いつきました（飛ばしたセグメントは累計5）"
+        );
+        screen.playback_notice =
+            "再生停止: 音声コールバックが進まないため出力を停止しました".into();
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(snapshot(Some(Duration::from_secs(9)), 5, false)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert!(screen.playback_notice.contains("再生停止"));
+        screen.playback_notice = "配信認証を更新して再生を続けます".into();
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(snapshot(Some(Duration::from_secs(9)), 5, false)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(screen.playback_notice, "配信認証を更新して再生を続けます");
     }
     #[test]
     fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
@@ -2541,6 +2805,7 @@ mod tests {
             position: None,
             output: None,
             segments: 1,
+            reconnecting_for: None,
             pipeline: Some(Snapshot {
                 stage: Stage::Backpressure,
                 elapsed: Duration::from_millis(4000),
@@ -2565,6 +2830,9 @@ mod tests {
                     timeouts: 1,
                     connect_failures: 1,
                     reauthentications: 0,
+                    skipped_segments: 0,
+                    sequence_resets: 0,
+                    joined_window_head: false,
                 }),
             }),
         });
@@ -2613,6 +2881,7 @@ mod tests {
                 position: None,
                 output: None,
                 segments: 0,
+                reconnecting_for: None,
                 pipeline: None,
             });
         screen.apply_playback(playback::Update {
@@ -3046,6 +3315,7 @@ mod tests {
                     sample_format: radiko::player::output::OutputSampleFormat::F32,
                 }),
                 segments: 1,
+                reconnecting_for: None,
             });
             screen
                 .key(
@@ -3130,6 +3400,7 @@ mod tests {
             position: Some(Duration::from_secs(8)),
             output: None,
             segments: 1,
+            reconnecting_for: None,
         });
         screen
             .key(
@@ -3403,6 +3674,7 @@ mod tests {
             volume: 25,
             output: None,
             segments: 1,
+            reconnecting_for: None,
         });
         for code in [KeyCode::Char('g'), KeyCode::Char('1'), KeyCode::Char('5')] {
             screen

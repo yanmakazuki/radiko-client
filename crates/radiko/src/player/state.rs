@@ -20,6 +20,8 @@ pub struct PlaybackSnapshot {
     pub output: Option<OutputSummary>,
     pub segments: u64,
     pub pipeline: Option<super::diagnostics::Snapshot>,
+    /// Set while playback is waiting through a suspension or a long input gap.
+    pub reconnecting_for: Option<Duration>,
 }
 /// Counters describe only the current output generation, not accumulated listening time.
 pub fn output_diagnostics(output: Option<&OutputSummary>, segments: u64) -> String {
@@ -67,6 +69,7 @@ impl PlaybackSnapshot {
             output,
             segments,
             pipeline: None,
+            reconnecting_for: None,
         }
     }
 }

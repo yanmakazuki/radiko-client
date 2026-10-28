@@ -20,7 +20,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::fmt;
+use std::fmt::{self, Write};
 
 const API: &str = "https://api.radiko.jp";
 const META: &str = "https://api.annex-cf.radiko.jp/v1/programs/list";
@@ -55,7 +55,10 @@ pub enum ProbeError {
     AvailabilityUnknown,
     Unavailable,
     InvalidPlaylist,
+    /// Time-free playback missed segments while the network was down. Not a malformed playlist.
+    WindowLost,
     NoEndpoint,
+    ReconnectGaveUp,
 }
 impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -100,12 +103,16 @@ impl fmt::Display for ProbeError {
             Self::InvalidPlaylist => {
                 f.write_str("HLSプレイリストまたはサンプルの構造が不正・未対応です")
             }
+            Self::WindowLost => f.write_str(Self::WINDOW_LOST),
             Self::NoEndpoint => f.write_str("対象モードと地域に対応する配信先がありません"),
+            Self::ReconnectGaveUp => f.write_str(crate::reconnect::GAVE_UP),
         }
     }
 }
 impl std::error::Error for ProbeError {}
 impl ProbeError {
+    pub(crate) const WINDOW_LOST: &'static str =
+        "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
     fn at(self, stage: &'static str) -> Self {
         Self::At(stage, Box::new(self))
     }
@@ -715,7 +722,12 @@ fn playlist_url(
 ) -> Result<Url, ProbeError> {
     let mut random = [0u8; 16];
     getrandom::getrandom(&mut random).map_err(|_| ProbeError::Network)?;
-    let lsid: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let lsid = random
+        .iter()
+        .fold(String::with_capacity(32), |mut lsid, byte| {
+            let _ = write!(lsid, "{byte:02x}");
+            lsid
+        });
     let mut pairs = target.query_pairs_mut();
     pairs
         .append_pair("station_id", station)
@@ -979,7 +991,9 @@ mod tests {
             ProbeError::InvalidPlaylist => {
                 "HLSプレイリストまたはサンプルの構造が不正・未対応です".into()
             }
+            ProbeError::WindowLost => ProbeError::WINDOW_LOST.into(),
             ProbeError::NoEndpoint => "対象モードと地域に対応する配信先がありません".into(),
+            ProbeError::ReconnectGaveUp => crate::reconnect::GAVE_UP.into(),
         }
     }
     #[test]
@@ -1012,7 +1026,9 @@ mod tests {
             ProbeError::AvailabilityUnknown,
             ProbeError::Unavailable,
             ProbeError::InvalidPlaylist,
+            ProbeError::WindowLost,
             ProbeError::NoEndpoint,
+            ProbeError::ReconnectGaveUp,
         ];
         for error in samples {
             let text = error.to_string();

@@ -2,6 +2,7 @@
 use super::*;
 use crate::api::http::Reply;
 pub use crate::api::http::{RequestMeasurements, RequestSnapshot, RequestStage};
+use crate::reconnect::{BACKOFF_MAX, BACKOFF_START, LIMIT as RECONNECT_LIMIT};
 use std::time::{Duration as Wait, Instant};
 
 #[derive(Clone, Debug)]
@@ -132,7 +133,7 @@ pub fn prepare_at_controlled(
     )?;
     let mut last_error = ProbeError::NoEndpoint;
     for endpoint in request.endpoints {
-        match load_media(&http, endpoint, &request.auth.headers) {
+        match load_media(&http, endpoint.clone(), &request.auth.headers) {
             Ok((url, media, codec)) => {
                 if !position.is_zero() {
                     let target = request
@@ -153,6 +154,9 @@ pub fn prepare_at_controlled(
                     }
                 }
                 let mut hls = HlsStream::new(http, url, request.auth.headers, media, codec)?;
+                hls.live = mode == ProbeMode::Live;
+                // `load_media` follows redirects and a master playlist. Keep the playlist-create URL.
+                hls.source = endpoint.clone();
                 hls.refresh = Some(playback_refresh(session.token().to_owned()));
                 return Ok(PreparedStream {
                     info: StreamInfo {
@@ -177,53 +181,74 @@ pub fn prepare_at_controlled(
 
 fn load_media(
     http: &impl Fetch,
-    mut url: Url,
+    url: Url,
     headers: &HeaderMap,
 ) -> Result<(Url, m3u8_rs::MediaPlaylist, Option<String>), ProbeError> {
+    let (reply, codec) = resolve_media(http, url, headers)?;
+    let Playlist::MediaPlaylist(media) = parse_hls(&reply.bytes)? else {
+        return Err(ProbeError::InvalidPlaylist);
+    };
+    Ok((reply.url, media, codec))
+}
+/// Follow redirects and at most four master playlists. The returned reply is a media playlist.
+fn resolve_media(
+    http: &impl Fetch,
+    mut url: Url,
+    headers: &HeaderMap,
+) -> Result<(Reply, Option<String>), ProbeError> {
     let mut codec = None;
     for _ in 0..4 {
         let reply = http.get(url, headers.clone(), TEXT_LIMIT, None, true)?;
-        url = reply.url;
+        url = reply.url.clone();
         match parse_hls(&reply.bytes)? {
             Playlist::MediaPlaylist(media) => {
                 validate_media(&media)?;
-                return Ok((url, media, codec));
+                return Ok((reply, codec));
             }
             Playlist::MasterPlaylist(master) => {
-                if master
-                    .session_key
-                    .iter()
-                    .any(|k| k.0.method != KeyMethod::None)
-                {
-                    return Err(ProbeError::InvalidPlaylist);
-                }
-                let variant = master
-                    .variants
-                    .iter()
-                    .filter(|v| !v.is_i_frame)
-                    .min_by_key(|v| v.bandwidth)
-                    .ok_or(ProbeError::InvalidPlaylist)?;
-                codec = variant.codecs.as_deref().and_then(safe_codec);
-                let alternative = master
-                    .alternatives
-                    .iter()
-                    .filter(|a| {
-                        a.media_type == AlternativeMediaType::Audio
-                            && Some(&a.group_id) == variant.audio.as_ref()
-                            && a.uri.is_some()
-                    })
-                    .max_by_key(|a| (a.default, a.autoselect));
-                url = url
-                    .join(
-                        alternative
-                            .and_then(|a| a.uri.as_deref())
-                            .unwrap_or(&variant.uri),
-                    )
-                    .map_err(|_| ProbeError::UnsafeUrl)?;
+                let (next, variant_codec) = media_variant(&url, &master)?;
+                codec = variant_codec;
+                url = next;
             }
         }
     }
     Err(ProbeError::InvalidPlaylist)
+}
+fn media_variant(
+    url: &Url,
+    master: &m3u8_rs::MasterPlaylist,
+) -> Result<(Url, Option<String>), ProbeError> {
+    if master
+        .session_key
+        .iter()
+        .any(|k| k.0.method != KeyMethod::None)
+    {
+        return Err(ProbeError::InvalidPlaylist);
+    }
+    let variant = master
+        .variants
+        .iter()
+        .filter(|v| !v.is_i_frame)
+        .min_by_key(|v| v.bandwidth)
+        .ok_or(ProbeError::InvalidPlaylist)?;
+    let codec = variant.codecs.as_deref().and_then(safe_codec);
+    let alternative = master
+        .alternatives
+        .iter()
+        .filter(|a| {
+            a.media_type == AlternativeMediaType::Audio
+                && Some(&a.group_id) == variant.audio.as_ref()
+                && a.uri.is_some()
+        })
+        .max_by_key(|a| (a.default, a.autoselect));
+    let next = url
+        .join(
+            alternative
+                .and_then(|a| a.uri.as_deref())
+                .unwrap_or(&variant.uri),
+        )
+        .map_err(|_| ProbeError::UnsafeUrl)?;
+    Ok((next, codec))
 }
 fn segment_time(media: &m3u8_rs::MediaPlaylist, index: usize) -> Option<DateTime<FixedOffset>> {
     let mut time = None;
@@ -269,9 +294,30 @@ fn validate_media(media: &m3u8_rs::MediaPlaylist) -> Result<(), ProbeError> {
     Ok(())
 }
 
+/// Earliest segment whose start is within three target durations of the playlist end.
+/// A short live window therefore joins at `MEDIA-SEQUENCE`. A longer one joins near the edge.
+fn live_join_index(media: &m3u8_rs::MediaPlaylist) -> usize {
+    let horizon = f64::from(u32::try_from(media.target_duration).unwrap_or(u32::MAX)) * 3.0;
+    let mut from_end = 0.0;
+    let mut index = media.segments.len().saturating_sub(1);
+    for (i, segment) in media.segments.iter().enumerate().rev() {
+        let start_from_end = from_end + f64::from(segment.duration);
+        if start_from_end > horizon && i + 1 < media.segments.len() {
+            break;
+        }
+        from_end = start_from_end;
+        index = i;
+        if start_from_end > horizon {
+            break;
+        }
+    }
+    index
+}
+
 const REAUTH_INTERVAL: Wait = Wait::from_secs(20);
 
 type RefreshFn<F> = Box<dyn FnMut(&F) -> Result<HeaderMap, ProbeError> + Send>;
+type RetrySleeper = Box<dyn FnMut(Wait) -> Result<(), ProbeError> + Send>;
 
 fn playback_refresh<F: Fetch + 'static>(token: String) -> RefreshFn<F> {
     Box::new(move |http| {
@@ -289,18 +335,31 @@ fn playback_refresh<F: Fetch + 'static>(token: String) -> RefreshFn<F> {
 
 struct HlsStream<F> {
     http: F,
+    /// Current media playlist. After a redirect this is the chunklist, not the playlist-create URL.
     url: Url,
+    /// Playlist-create URL from before redirects and master resolution.
+    source: Url,
     headers: HeaderMap,
     media: m3u8_rs::MediaPlaylist,
     codec: Option<String>,
     next: u64,
+    /// Sequence of the segment most recently returned. Used to recognize a slightly older live window.
+    last_played: Option<u64>,
+    /// Live windows catch up instead of stopping when the next sequence leaves the playlist.
+    live: bool,
     discontinuity: Option<u64>,
+    pending_discontinuity: bool,
     reload_at: Instant,
     initialization: Option<(Url, std::sync::Arc<[u8]>)>,
     refresh: Option<RefreshFn<F>>,
     /// One renewal is enough for the current failure. Cleared after a successful poll.
     auth_episode: bool,
     last_reauth: Option<Instant>,
+    /// Grows while a played stream is retrying a transport failure. Reset when a segment is returned.
+    backoff: Wait,
+    reconnect_waited: Wait,
+    /// Tests advance this instead of sleeping. Production leaves it empty and sleeps.
+    sleeper: Option<RetrySleeper>,
 }
 enum Renew {
     Unavailable,
@@ -317,19 +376,27 @@ impl<F: Fetch> HlsStream<F> {
     ) -> Result<Self, ProbeError> {
         validate_media(&media)?;
         let next = media.media_sequence;
+        let source = url.clone();
         Ok(Self {
             http,
             url,
+            source,
             headers,
             codec,
             next,
+            last_played: None,
+            live: false,
             discontinuity: None,
+            pending_discontinuity: false,
             reload_at: Instant::now(),
             media,
             initialization: None,
             refresh: None,
             auth_episode: false,
             last_reauth: None,
+            backoff: BACKOFF_START,
+            reconnect_waited: Wait::ZERO,
+            sleeper: None,
         })
     }
     fn poll(&mut self, now: Instant) -> Result<Next, ProbeError> {
@@ -337,11 +404,19 @@ impl<F: Fetch> HlsStream<F> {
         if result.is_ok() {
             self.auth_episode = false;
         }
+        if matches!(result, Ok(Next::Segment(_))) {
+            self.backoff = BACKOFF_START;
+            self.reconnect_waited = Wait::ZERO;
+        }
         result
     }
     fn poll_at(&mut self, now: Instant) -> Result<Next, ProbeError> {
         if self.next < self.media.media_sequence {
-            return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
+            if self.live {
+                self.realign(Self::forward_gap_is_reset(self.next, &self.media))?;
+            } else {
+                return Err(ProbeError::WindowLost);
+            }
         }
         if self.current_index()?.is_some() {
             return self.read_segment(now);
@@ -365,7 +440,11 @@ impl<F: Fetch> HlsStream<F> {
     }
     fn current_index(&self) -> Result<Option<usize>, ProbeError> {
         if self.next < self.media.media_sequence {
-            return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
+            return Err(if self.live {
+                ProbeError::InvalidPlaylist
+            } else {
+                ProbeError::WindowLost
+            });
         }
         let index = usize::try_from(self.next - self.media.media_sequence)
             .map_err(|_| ProbeError::InvalidPlaylist)?;
@@ -398,11 +477,14 @@ impl<F: Fetch> HlsStream<F> {
             .checked_add(discontinuity)
             .ok_or(ProbeError::InvalidPlaylist)?;
         let starts_at = segment_time(&self.media, index);
-        let reset = self
-            .discontinuity
-            .is_some_and(|previous| previous != sequence);
+        let reset = self.pending_discontinuity
+            || self
+                .discontinuity
+                .is_some_and(|previous| previous != sequence);
+        self.pending_discontinuity = false;
         let codec = self.codec.clone();
         self.discontinuity = Some(sequence);
+        self.last_played = Some(self.next);
         self.next = self
             .next
             .checked_add(1)
@@ -469,58 +551,84 @@ impl<F: Fetch> HlsStream<F> {
         now: Instant,
     ) -> Result<Option<(Vec<u8>, Url)>, ProbeError> {
         const STAGE: &str = "HLS初期化情報取得";
-        match self
-            .http
-            .get(url.clone(), HeaderMap::new(), TEXT_LIMIT, None, true)
-        {
-            Ok(reply) => Ok(Some((reply.bytes, url))),
-            Err(ProbeError::Authentication) => {
-                self.recover_media(STAGE, now)?;
-                let Some(index) = self.current_index()? else {
-                    return Err(ProbeError::InvalidPlaylist.at(STAGE));
-                };
-                let Some(url) = self.init_url(index)? else {
-                    return Ok(None);
-                };
-                match self
-                    .http
-                    .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
-                {
-                    Ok(reply) => Ok(Some((reply.bytes, url))),
-                    Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
-                    Err(error) => Err(error.at(STAGE)),
+        let mut url = url;
+        loop {
+            match self
+                .http
+                .get(url.clone(), HeaderMap::new(), TEXT_LIMIT, None, true)
+            {
+                Ok(reply) => return Ok(Some((reply.bytes, url))),
+                Err(ProbeError::Authentication) => {
+                    self.recover_media(STAGE, now)?;
+                    let Some(index) = self.current_index()? else {
+                        return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                    };
+                    let Some(url) = self.init_url(index)? else {
+                        return Ok(None);
+                    };
+                    return match self.http.get(
+                        url.clone(),
+                        self.headers.clone(),
+                        TEXT_LIMIT,
+                        None,
+                        true,
+                    ) {
+                        Ok(reply) => Ok(Some((reply.bytes, url))),
+                        Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
+                        Err(error) => Err(error.at(STAGE)),
+                    };
                 }
+                Err(error) if self.can_retry(&error) => {
+                    self.wait_backoff()?;
+                    let reply = self.fetch_playlist()?;
+                    self.install_playlist(reply, now)?;
+                    let Some(index) = self.current_index()? else {
+                        return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                    };
+                    let Some(next) = self.init_url(index)? else {
+                        self.initialization = None;
+                        return Ok(None);
+                    };
+                    url = next;
+                }
+                Err(error) => return Err(error.at(STAGE)),
             }
-            Err(error) => Err(error.at(STAGE)),
         }
     }
     fn fetch_segment_bytes(&mut self, now: Instant) -> Result<(Vec<u8>, usize), ProbeError> {
         const STAGE: &str = "HLS音声取得";
-        let Some(index) = self.current_index()? else {
-            return Err(ProbeError::InvalidPlaylist);
-        };
-        let url = self.segment_url(index)?;
-        match self
-            .http
-            .get(url, HeaderMap::new(), SAMPLE_LIMIT, None, true)
-        {
-            Ok(reply) => Ok((reply.bytes, index)),
-            Err(ProbeError::Authentication) => {
-                self.recover_media(STAGE, now)?;
-                let Some(index) = self.current_index()? else {
-                    return Err(ProbeError::InvalidPlaylist.at(STAGE));
-                };
-                let url = self.segment_url(index)?;
-                match self
-                    .http
-                    .get(url, self.headers.clone(), SAMPLE_LIMIT, None, true)
-                {
-                    Ok(reply) => Ok((reply.bytes, index)),
-                    Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
-                    Err(error) => Err(error.at(STAGE)),
+        loop {
+            let Some(index) = self.current_index()? else {
+                return Err(ProbeError::InvalidPlaylist);
+            };
+            let url = self.segment_url(index)?;
+            match self
+                .http
+                .get(url, HeaderMap::new(), SAMPLE_LIMIT, None, true)
+            {
+                Ok(reply) => return Ok((reply.bytes, index)),
+                Err(ProbeError::Authentication) => {
+                    self.recover_media(STAGE, now)?;
+                    let Some(index) = self.current_index()? else {
+                        return Err(ProbeError::InvalidPlaylist.at(STAGE));
+                    };
+                    let url = self.segment_url(index)?;
+                    return match self
+                        .http
+                        .get(url, self.headers.clone(), SAMPLE_LIMIT, None, true)
+                    {
+                        Ok(reply) => Ok((reply.bytes, index)),
+                        Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
+                        Err(error) => Err(error.at(STAGE)),
+                    };
                 }
+                Err(error) if self.can_retry(&error) => {
+                    self.wait_backoff()?;
+                    let reply = self.fetch_playlist()?;
+                    self.install_playlist(reply, now)?;
+                }
+                Err(error) => return Err(error.at(STAGE)),
             }
-            Err(error) => Err(error.at(STAGE)),
         }
     }
     fn segment_url(&self, index: usize) -> Result<Url, ProbeError> {
@@ -598,29 +706,102 @@ impl<F: Fetch> HlsStream<F> {
                 other => other.at(stage),
             })
     }
+    /// Live playback already returned a segment, and this playlist URL itself has expired.
+    fn live_playlist_expired(&self, error: &ProbeError) -> bool {
+        self.live
+            && self.last_played.is_some()
+            && matches!(
+                error,
+                ProbeError::NotFound | ProbeError::Authentication | ProbeError::Denied
+            )
+    }
     fn fetch_playlist(&mut self) -> Result<Reply, ProbeError> {
         const STAGE: &str = "HLS一覧更新";
-        let url = self.url.clone();
-        match self
-            .http
-            .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
-        {
-            Ok(reply) => Ok(reply),
-            Err(ProbeError::Authentication) => match self.renew(STAGE)? {
-                Renew::Unavailable => Err(ProbeError::Authentication.at(STAGE)),
-                Renew::Refreshed | Renew::Reused => {
-                    match self
-                        .http
-                        .get(url, self.headers.clone(), TEXT_LIMIT, None, true)
-                    {
-                        Ok(reply) => Ok(reply),
-                        Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(STAGE)),
-                        Err(error) => Err(error.at(STAGE)),
+        loop {
+            let url = self.url.clone();
+            match self
+                .http
+                .get(url.clone(), self.headers.clone(), TEXT_LIMIT, None, true)
+            {
+                Ok(reply) => return Ok(reply),
+                Err(ProbeError::Authentication)
+                    if !self.live_playlist_expired(&ProbeError::Authentication) =>
+                {
+                    match self.renew(STAGE)? {
+                        Renew::Unavailable => return Err(ProbeError::Authentication.at(STAGE)),
+                        Renew::Refreshed | Renew::Reused => {
+                            match self
+                                .http
+                                .get(url, self.headers.clone(), TEXT_LIMIT, None, true)
+                            {
+                                Ok(reply) => return Ok(reply),
+                                Err(ProbeError::Authentication) => {
+                                    return Err(ProbeError::AuthExpired.at(STAGE));
+                                }
+                                Err(error) if self.can_retry(&error) => self.wait_backoff()?,
+                                Err(error) => return Err(error.at(STAGE)),
+                            }
+                        }
                     }
                 }
-            },
-            Err(error) => Err(error.at(STAGE)),
+                Err(error) if self.live_playlist_expired(&error) => {
+                    match self.recover_expired_playlist(STAGE, &error) {
+                        Ok(reply) => return Ok(reply),
+                        Err(error) if playlist_refresh_retryable(&error) => self.wait_backoff()?,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if self.can_retry(&error) => self.wait_backoff()?,
+                Err(error) => return Err(error.at(STAGE)),
+            }
         }
+    }
+    /// Mint a new chunklist from the playlist-create URL. A repeated 404 stays inside the reconnect limit.
+    fn recover_expired_playlist(
+        &mut self,
+        stage: &'static str,
+        error: &ProbeError,
+    ) -> Result<Reply, ProbeError> {
+        if matches!(error, ProbeError::Authentication | ProbeError::Denied) {
+            self.renew_for_expired_playlist(stage, error)?;
+            return self.source_playlist(stage, true);
+        }
+        self.source_playlist(stage, false)
+    }
+    fn renew_for_expired_playlist(
+        &mut self,
+        stage: &'static str,
+        error: &ProbeError,
+    ) -> Result<(), ProbeError> {
+        if self.refresh.is_none() {
+            return Err(match error {
+                ProbeError::Denied => ProbeError::Denied.at(stage),
+                _ => ProbeError::Authentication.at(stage),
+            });
+        }
+        self.renew(stage).map(|_| ())
+    }
+    fn source_playlist(&mut self, stage: &'static str, renewed: bool) -> Result<Reply, ProbeError> {
+        match self.refresh_from_source() {
+            Ok(reply) => Ok(reply),
+            Err(ProbeError::Authentication) if !renewed => {
+                self.renew_for_expired_playlist(stage, &ProbeError::Authentication)?;
+                match self.refresh_from_source() {
+                    Ok(reply) => Ok(reply),
+                    Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(stage)),
+                    Err(error) => finish_source_error(stage, error),
+                }
+            }
+            Err(ProbeError::Authentication) => Err(ProbeError::AuthExpired.at(stage)),
+            Err(error) => finish_source_error(stage, error),
+        }
+    }
+    fn refresh_from_source(&mut self) -> Result<Reply, ProbeError> {
+        let (reply, codec) = resolve_media(&self.http, self.source.clone(), &self.headers)?;
+        if let Some(codec) = codec {
+            self.codec = Some(codec);
+        }
+        Ok(reply)
     }
     // Sequence numbers, not changing signed URLs, decide which segment is new.
     fn install_playlist(&mut self, reply: Reply, now: Instant) -> Result<Wait, ProbeError> {
@@ -628,19 +809,156 @@ impl<F: Fetch> HlsStream<F> {
             return Err(ProbeError::InvalidPlaylist);
         };
         validate_media(&media)?;
-        if media.media_sequence < self.media.media_sequence {
+        let previous_sequence = self.media.media_sequence;
+        let rewound = media.media_sequence < previous_sequence;
+        if rewound && !self.live {
             return Err(ProbeError::InvalidPlaylist);
         }
-        let changed = media.media_sequence != self.media.media_sequence
+        let changed = media.media_sequence != previous_sequence
             || media.segments.len() != self.media.segments.len();
         let wait = Wait::from_secs(media.target_duration).div_f64(if changed { 1.0 } else { 2.0 });
         self.reload_at = now + wait;
         self.media = media;
+        // Keep `source`. A later refresh must be able to leave this redirected chunklist.
         self.url = reply.url;
-        if self.next < self.media.media_sequence {
-            return Err(ProbeError::InvalidPlaylist.at("未取得セグメントが配信窓から消失"));
+        if self.live {
+            if let Some(reset) = self.live_realignment(previous_sequence) {
+                self.realign(reset)?;
+            }
+        } else if self.next < self.media.media_sequence {
+            return Err(ProbeError::WindowLost);
         }
         Ok(wait)
+    }
+    /// `Some(true)` restarts the timeline. `Some(false)` catches up inside one window.
+    /// `None` keeps the next sequence. A live playlist that is only slightly older is `None`.
+    fn live_realignment(&self, previous_sequence: u64) -> Option<bool> {
+        let start = self.media.media_sequence;
+        let len = self.media.segments.len() as u64;
+        let end = start.checked_add(len)?;
+        if start < previous_sequence {
+            if self.rewind_is_stale(start, end, len) {
+                return None;
+            }
+            return Some(true);
+        }
+        if self.next < start {
+            return Some(Self::forward_gap_is_reset(self.next, &self.media));
+        }
+        None
+    }
+    /// A backward playlist is stale when its tail is at most one window behind the last
+    /// played sequence, or when the window still covers that sequence. Anything older is a restart.
+    fn rewind_is_stale(&self, start: u64, end: u64, len: u64) -> bool {
+        let contains_next = start <= self.next && self.next < end;
+        if contains_next || end == self.next {
+            return true;
+        }
+        let Some(last_played) = self.last_played else {
+            return false;
+        };
+        let tail = end.saturating_sub(1);
+        if start < last_played && end > last_played {
+            return true;
+        }
+        last_played >= tail && last_played - tail <= len
+    }
+    /// The advertised window is the only scale for "the same stream moved on".
+    /// A gap larger than that window is a new timeline, not a count of missed segments.
+    fn forward_gap_is_reset(next: u64, media: &m3u8_rs::MediaPlaylist) -> bool {
+        media.media_sequence.saturating_sub(next) > media.segments.len() as u64
+    }
+    fn realign(&mut self, reset: bool) -> Result<(), ProbeError> {
+        let index = live_join_index(&self.media);
+        let offset = u64::try_from(index).map_err(|_| ProbeError::InvalidPlaylist)?;
+        let target = self
+            .media
+            .media_sequence
+            .checked_add(offset)
+            .ok_or(ProbeError::InvalidPlaylist)?;
+        let skipped = if reset {
+            offset
+        } else {
+            target
+                .checked_sub(self.next)
+                .ok_or(ProbeError::InvalidPlaylist)?
+        };
+        if skipped > 0 {
+            self.http.note_skipped_segments(skipped);
+        }
+        if reset {
+            self.http.note_sequence_reset();
+        }
+        self.http.note_joined_window_head(index == 0);
+        self.next = target;
+        self.pending_discontinuity = true;
+        self.initialization = None;
+        Ok(())
+    }
+    /// Startup failures stay immediate. A segment already handed to the player may be retried.
+    fn can_retry(&self, error: &ProbeError) -> bool {
+        self.last_played.is_some() && retryable_transport(error)
+    }
+    fn wait_backoff(&mut self) -> Result<(), ProbeError> {
+        if self.http.cancelled() {
+            return Err(ProbeError::Cancelled);
+        }
+        if self.reconnect_waited >= RECONNECT_LIMIT || self.backoff.is_zero() {
+            return Err(ProbeError::ReconnectGaveUp);
+        }
+        let room = RECONNECT_LIMIT - self.reconnect_waited;
+        let step = self.backoff.min(BACKOFF_MAX).min(room);
+        if step.is_zero() {
+            return Err(ProbeError::ReconnectGaveUp);
+        }
+        if let Some(sleeper) = self.sleeper.as_mut() {
+            sleeper(step)?;
+        } else {
+            self.sleep_interruptible(step)?;
+        }
+        self.reconnect_waited = self.reconnect_waited.saturating_add(step);
+        self.backoff = self.backoff.saturating_mul(2).min(BACKOFF_MAX);
+        Ok(())
+    }
+    fn sleep_interruptible(&self, delay: Wait) -> Result<(), ProbeError> {
+        let end = Instant::now() + delay;
+        while Instant::now() < end {
+            if self.http.cancelled() {
+                return Err(ProbeError::Cancelled);
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(Wait::from_millis(10)));
+        }
+        if self.http.cancelled() {
+            return Err(ProbeError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
+fn retryable_transport(error: &ProbeError) -> bool {
+    match error {
+        ProbeError::At(_, inner) => retryable_transport(inner),
+        ProbeError::Network | ProbeError::Http(408) | ProbeError::Http(500..=599) => true,
+        _ => false,
+    }
+}
+/// Failures of a live playlist re-resolution that stay inside the reconnect limit.
+fn playlist_refresh_retryable(error: &ProbeError) -> bool {
+    matches!(
+        error,
+        ProbeError::NotFound
+            | ProbeError::Denied
+            | ProbeError::Network
+            | ProbeError::Http(408)
+            | ProbeError::Http(500..=599)
+    )
+}
+fn finish_source_error(stage: &'static str, error: ProbeError) -> Result<Reply, ProbeError> {
+    if playlist_refresh_retryable(&error) {
+        Err(error)
+    } else {
+        Err(error.at(stage))
     }
 }
 
@@ -648,11 +966,22 @@ impl<F: Fetch> HlsStream<F> {
 mod tests {
     use super::*;
     use crate::api::http::Reply;
-    use std::{cell::RefCell, collections::VecDeque};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+    };
     struct Mock {
         steps: RefCell<VecDeque<(String, Vec<u8>)>>,
+        skipped: Cell<u64>,
+        resets: Cell<u64>,
     }
     impl Fetch for Mock {
+        fn note_skipped_segments(&self, count: u64) {
+            self.skipped.set(self.skipped.get().saturating_add(count));
+        }
+        fn note_sequence_reset(&self) {
+            self.resets.set(self.resets.get().saturating_add(1));
+        }
         fn get(
             &self,
             url: Url,
@@ -705,6 +1034,8 @@ mod tests {
         HlsStream::new(
             Mock {
                 steps: RefCell::new(steps.into_iter().map(|(p, b)| (p.into(), b)).collect()),
+                skipped: Cell::new(0),
+                resets: Cell::new(0),
             },
             Url::parse("https://radiko.jp/audio/media.m3u8").unwrap(),
             HeaderMap::new(),
@@ -913,9 +1244,291 @@ mod tests {
                 source.poll(Instant::now()).unwrap(),
                 Next::Segment(_)
             ));
-            assert!(source.poll(Instant::now()).is_err());
+            let error = expect_err(source.poll(Instant::now()));
+            if first < 10 {
+                assert!(matches!(error, ProbeError::InvalidPlaylist));
+            } else {
+                assert!(matches!(error, ProbeError::WindowLost));
+                assert_eq!(error.to_string(), ProbeError::WINDOW_LOST);
+            }
+            assert_eq!(source.next, 11);
+            assert_eq!(source.http.skipped.get(), 0);
+            assert_eq!(source.http.resets.get(), 0);
             assert!(source.http.steps.borrow().is_empty());
         }
+    }
+    fn live_reader(initial: &[u8], steps: Vec<(&str, Vec<u8>)>) -> HlsStream<Mock> {
+        let mut source = reader(initial, steps);
+        source.live = true;
+        source
+    }
+    fn segment_at(source: &mut HlsStream<Mock>, now: Instant) -> Segment {
+        match source.poll(now) {
+            Ok(Next::Segment(segment)) => segment,
+            Ok(Next::Pending(_)) => panic!("expected a segment, playlist reload is still waiting"),
+            Ok(Next::End) => panic!("expected a segment, playlist ended"),
+            Err(error) => panic!("expected a segment, got {error}"),
+        }
+    }
+    fn segment(source: &mut HlsStream<Mock>) -> Segment {
+        segment_at(source, Instant::now())
+    }
+    #[test]
+    fn live_sequence_advances_normally_without_skipping_or_resetting_the_decoder() {
+        let mut source = live_reader(
+            &media(10, 2, false, "old", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/s11.aac", vec![11]),
+                ("/audio/media.m3u8", media(11, 2, false, "new", false)),
+                ("/audio/s12.aac", vec![12]),
+            ],
+        );
+        for (n, reset) in [(10u8, false), (11, false), (12, false)] {
+            let segment = segment(&mut source);
+            assert_eq!(segment.bytes, [n]);
+            assert_eq!(segment.discontinuity, reset);
+        }
+        assert_eq!(source.next, 13);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn live_window_running_ahead_joins_the_playlist_head_and_marks_a_discontinuity() {
+        let mut source = live_reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/media.m3u8", media(13, 3, false, "b", false)),
+                ("/audio/s13.aac", vec![13]),
+                ("/audio/s14.aac", vec![14]),
+            ],
+        );
+        let first = segment(&mut source);
+        assert_eq!(first.bytes, [10]);
+        assert!(!first.discontinuity);
+        let caught = segment(&mut source);
+        assert_eq!(caught.bytes, [13]);
+        assert!(caught.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert_eq!(source.http.resets.get(), 0);
+        let following = segment(&mut source);
+        assert_eq!(following.bytes, [14]);
+        assert!(!following.discontinuity);
+        assert_eq!(source.next, 15);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn live_window_longer_than_three_target_durations_joins_near_the_edge() {
+        let mut source = live_reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/media.m3u8", media(12, 6, false, "b", false)),
+                ("/audio/s15.aac", vec![15]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [10]);
+        let caught = segment(&mut source);
+        assert_eq!(caught.bytes, [15]);
+        assert!(caught.discontinuity);
+        assert_eq!(source.next, 16);
+        assert_eq!(source.http.skipped.get(), 4);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn live_playlist_one_sequence_older_waits_for_13_without_replaying_11() {
+        let mut source = live_reader(
+            &media(11, 1, false, "a", false),
+            vec![
+                ("/audio/s11.aac", vec![11]),
+                ("/audio/media.m3u8", media(12, 1, false, "b", false)),
+                ("/audio/s12.aac", vec![12]),
+                ("/audio/media.m3u8", media(11, 2, false, "old", false)),
+                ("/audio/media.m3u8", media(13, 2, false, "c", false)),
+                ("/audio/s13.aac", vec![13]),
+                ("/audio/s14.aac", vec![14]),
+            ],
+        );
+        let first = segment(&mut source);
+        assert_eq!(first.bytes, [11]);
+        assert!(!first.discontinuity);
+        let second = segment(&mut source);
+        assert_eq!(second.bytes, [12]);
+        assert!(!second.discontinuity);
+        assert_eq!(source.next, 13);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 13);
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        let reload_at = source.reload_at;
+        let continued = segment_at(&mut source, reload_at);
+        assert_eq!(continued.bytes, [13]);
+        assert!(!continued.discontinuity);
+        let following = segment(&mut source);
+        assert_eq!(following.bytes, [14]);
+        assert!(!following.discontinuity);
+        assert_eq!(source.next, 15);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn one_segment_window_one_older_waits_and_then_continues() {
+        let mut source = live_reader(
+            &media(12, 1, false, "a", false),
+            vec![
+                ("/audio/s12.aac", vec![12]),
+                ("/audio/media.m3u8", media(11, 1, false, "old", false)),
+                ("/audio/media.m3u8", media(13, 1, false, "next", false)),
+                ("/audio/s13.aac", vec![13]),
+            ],
+        );
+        let played = segment(&mut source);
+        assert_eq!(played.bytes, [12]);
+        assert!(!played.discontinuity);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 13);
+        assert_eq!(source.last_played, Some(12));
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        let reload_at = source.reload_at;
+        let continued = segment_at(&mut source, reload_at);
+        assert_eq!(continued.bytes, [13]);
+        assert!(!continued.discontinuity);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn six_segment_window_slid_back_by_one_does_not_replay_or_reset() {
+        let mut source = live_reader(
+            &media(12, 6, false, "a", false),
+            vec![
+                ("/audio/s12.aac", vec![12]),
+                ("/audio/s13.aac", vec![13]),
+                ("/audio/s14.aac", vec![14]),
+                ("/audio/s15.aac", vec![15]),
+                ("/audio/s16.aac", vec![16]),
+                ("/audio/s17.aac", vec![17]),
+                ("/audio/media.m3u8", media(11, 6, false, "old", false)),
+                ("/audio/media.m3u8", media(18, 1, false, "next", false)),
+                ("/audio/s18.aac", vec![18]),
+            ],
+        );
+        for n in 12u8..=17 {
+            let played = segment(&mut source);
+            assert_eq!(played.bytes, [n]);
+            assert!(!played.discontinuity);
+        }
+        assert_eq!(source.next, 18);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 18);
+        assert_eq!(source.last_played, Some(17));
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        let reload_at = source.reload_at;
+        let continued = segment_at(&mut source, reload_at);
+        assert_eq!(continued.bytes, [18]);
+        assert!(!continued.discontinuity);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn stale_tail_exactly_one_window_behind_is_ignored_and_one_older_resets() {
+        let mut source = live_reader(
+            &media(17, 1, false, "a", false),
+            vec![
+                ("/audio/s17.aac", vec![17]),
+                ("/audio/media.m3u8", media(6, 6, false, "edge", false)),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [17]);
+        let stale_at = source.reload_at;
+        assert!(matches!(source.poll(stale_at), Ok(Next::Pending(_))));
+        assert_eq!(source.next, 18);
+        assert!(!source.pending_discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+
+        let mut source = live_reader(
+            &media(17, 1, false, "a", false),
+            vec![
+                ("/audio/s17.aac", vec![17]),
+                ("/audio/media.m3u8", media(5, 6, false, "older", false)),
+                ("/audio/s8.aac", vec![8]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [17]);
+        let restarted = segment(&mut source);
+        assert_eq!(restarted.bytes, [8]);
+        assert!(restarted.discontinuity);
+        assert_eq!(source.http.resets.get(), 1);
+        assert_eq!(source.next, 9);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn nonoverlapping_live_rewind_restarts_as_a_reset() {
+        let mut source = live_reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/media.m3u8", media(3, 1, false, "b", false)),
+                ("/audio/s3.aac", vec![3]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [10]);
+        let restarted = segment(&mut source);
+        assert_eq!(restarted.bytes, [3]);
+        assert!(restarted.discontinuity);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 1);
+        assert_eq!(source.next, 4);
+        assert!(source.http.steps.borrow().is_empty());
+
+        let mut source = live_reader(
+            &media(30, 1, false, "a", false),
+            vec![
+                ("/audio/s30.aac", vec![30]),
+                ("/audio/media.m3u8", media(0, 6, false, "b", false)),
+                ("/audio/s3.aac", vec![3]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [30]);
+        let edge = segment(&mut source);
+        assert_eq!(edge.bytes, [3]);
+        assert!(edge.discontinuity);
+        assert_eq!(source.next, 4);
+        assert_eq!(source.http.skipped.get(), 3);
+        assert_eq!(source.http.resets.get(), 1);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn live_sequence_jump_past_the_playlist_length_resets_without_counting_skipped_segments() {
+        let mut source = live_reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/media.m3u8", media(1_000_000, 3, false, "b", false)),
+                ("/audio/s1000000.aac", vec![7]),
+            ],
+        );
+        assert_eq!(segment(&mut source).bytes, [10]);
+        let restarted = segment(&mut source);
+        assert_eq!(restarted.bytes, [7]);
+        assert!(restarted.discontinuity);
+        assert_eq!(source.next, 1_000_001);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 1);
+        assert!(source.http.steps.borrow().is_empty());
     }
     #[test]
     fn unsupported_encryption_and_ranges_are_rejected_before_segment_requests() {
@@ -936,7 +1549,6 @@ mod tests {
         assert!(validate_media(&parsed(overflow.as_bytes())).is_err());
     }
 
-    use std::cell::Cell;
     struct Step {
         path: &'static str,
         query: Option<&'static str>,
@@ -1564,5 +2176,478 @@ mod tests {
         assert_eq!(source.http.auth_calls.get(), 1);
         assert!(matches!(source.poll(Instant::now()).unwrap(), Next::End));
         assert!(source.http.steps.borrow().is_empty());
+    }
+
+    struct OutageFetch {
+        waited: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        until: Wait,
+        playlist: Vec<u8>,
+        authentication: bool,
+        cancel: bool,
+        calls: Cell<usize>,
+        audio: RefCell<Vec<String>>,
+        skipped: Cell<u64>,
+        resets: Cell<u64>,
+        at_head: Cell<bool>,
+    }
+    impl Fetch for OutageFetch {
+        fn note_skipped_segments(&self, count: u64) {
+            self.skipped.set(self.skipped.get().saturating_add(count));
+        }
+        fn note_sequence_reset(&self) {
+            self.resets.set(self.resets.get() + 1);
+        }
+        fn note_joined_window_head(&self, at_head: bool) {
+            self.at_head.set(at_head);
+        }
+        fn cancelled(&self) -> bool {
+            self.cancel
+        }
+        fn get(
+            &self,
+            url: Url,
+            _: HeaderMap,
+            _: usize,
+            _: Option<(u64, u64)>,
+            _: bool,
+        ) -> Result<Reply, ProbeError> {
+            if url.path().ends_with(".aac") {
+                self.audio.borrow_mut().push(url.path().to_owned());
+                return Ok(Reply {
+                    headers: HeaderMap::new(),
+                    bytes: vec![1],
+                    url,
+                });
+            }
+            self.calls.set(self.calls.get() + 1);
+            if self.authentication {
+                return Err(ProbeError::Authentication);
+            }
+            let waited = Wait::from_millis(self.waited.load(std::sync::atomic::Ordering::Relaxed));
+            if waited < self.until {
+                return Err(ProbeError::Network);
+            }
+            Ok(Reply {
+                headers: HeaderMap::new(),
+                bytes: self.playlist.clone(),
+                url,
+            })
+        }
+    }
+    fn outage(
+        live: bool,
+        until: Wait,
+        playlist: Vec<u8>,
+        authentication: bool,
+        cancel: bool,
+    ) -> HlsStream<OutageFetch> {
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = waited.clone();
+        let mut source = HlsStream::new(
+            OutageFetch {
+                waited,
+                until,
+                playlist,
+                authentication,
+                cancel,
+                calls: Cell::new(0),
+                audio: RefCell::new(Vec::new()),
+                skipped: Cell::new(0),
+                resets: Cell::new(0),
+                at_head: Cell::new(false),
+            },
+            Url::parse("https://radiko.jp/audio/media.m3u8").unwrap(),
+            HeaderMap::new(),
+            parsed(&media(10, 1, false, "a", false)),
+            Some("mp4a.40.2".into()),
+        )
+        .unwrap();
+        source.live = live;
+        source.sleeper = Some(Box::new(move |step| {
+            clock.fetch_add(
+                u64::try_from(step.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(())
+        }));
+        let Next::Segment(first) = source.poll(Instant::now()).unwrap() else {
+            panic!("the first segment is already in the playlist");
+        };
+        assert_eq!(first.bytes, vec![1]);
+        assert!(!first.discontinuity);
+        source
+    }
+    fn next_segment<F: Fetch>(source: &mut HlsStream<F>) -> Segment {
+        match source.poll(Instant::now()) {
+            Ok(Next::Segment(segment)) => segment,
+            Ok(Next::Pending(_)) => panic!("expected a segment, playlist reload is still waiting"),
+            Ok(Next::End) => panic!("expected a segment, playlist ended"),
+            Err(error) => panic!("expected a segment, got {error}"),
+        }
+    }
+    fn expect_err(result: Result<Next, ProbeError>) -> ProbeError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected a playlist error"),
+        }
+    }
+    fn waited(source: &HlsStream<OutageFetch>) -> Wait {
+        Wait::from_millis(
+            source
+                .http
+                .waited
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    #[test]
+    fn live_outage_of_twenty_seconds_rejoins_the_window_head_with_the_cumulative_skip() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(20),
+            media(13, 3, false, "b", false),
+            false,
+            false,
+        );
+        let segment = next_segment(&mut source);
+        assert_eq!(segment.bytes, vec![1]);
+        assert!(segment.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert!(source.http.at_head.get());
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(waited(&source) >= Wait::from_secs(20));
+        assert!(waited(&source) < crate::reconnect::LIMIT);
+        assert_eq!(source.next, 14);
+        let audio = source.http.audio.borrow().clone();
+        assert!(audio.iter().any(|path| path.ends_with("/s10.aac")));
+        assert!(audio.iter().any(|path| path.ends_with("/s13.aac")));
+        assert!(
+            audio
+                .iter()
+                .all(|path| !path.ends_with("/s11.aac") && !path.ends_with("/s12.aac"))
+        );
+    }
+    #[test]
+    fn live_outage_of_ninety_seconds_rejoins_near_the_live_edge() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(90),
+            media(13, 6, false, "b", false),
+            false,
+            false,
+        );
+        let segment = next_segment(&mut source);
+        assert!(segment.discontinuity);
+        assert_eq!(source.http.skipped.get(), 5);
+        assert!(!source.http.at_head.get());
+        assert_eq!(source.next, 17);
+        assert!(waited(&source) >= Wait::from_secs(90));
+        assert!(waited(&source) < crate::reconnect::LIMIT);
+    }
+    #[test]
+    fn playlist_retry_waits_grow_until_the_cap_and_the_limit_uses_the_reselect_wording() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(10_000),
+            media(13, 3, false, "b", false),
+            false,
+            false,
+        );
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = steps.clone();
+        let clock = source.http.waited.clone();
+        source.sleeper = Some(Box::new(move |step| {
+            recorded.lock().unwrap().push(step);
+            clock.fetch_add(
+                u64::try_from(step.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(())
+        }));
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::ReconnectGaveUp));
+        assert!(error.to_string().contains("番組を選び直して"));
+        assert!(waited(&source) >= crate::reconnect::LIMIT);
+        assert_eq!(source.next, 11);
+        assert_eq!(source.http.skipped.get(), 0);
+        let steps = steps.lock().unwrap().clone();
+        assert_eq!(
+            steps[..4],
+            [
+                Wait::from_secs(1),
+                Wait::from_secs(2),
+                Wait::from_secs(4),
+                Wait::from_secs(8),
+            ]
+        );
+        assert!(steps[4..].iter().all(|step| *step <= Wait::from_secs(10)));
+        assert!(steps.iter().any(|step| *step == Wait::from_secs(10)));
+    }
+    #[test]
+    fn authentication_failure_during_playback_is_not_retried() {
+        let mut source = outage(true, Wait::ZERO, Vec::new(), true, false);
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(
+            matches!(error, ProbeError::At(_, inner) if matches!(inner.as_ref(), ProbeError::Authentication))
+        );
+        assert_eq!(source.http.calls.get(), 1);
+        assert_eq!(waited(&source), Wait::ZERO);
+        assert_eq!(source.next, 11);
+    }
+    #[test]
+    fn cancellation_interrupts_a_playlist_retry_without_waiting() {
+        let mut source = outage(
+            true,
+            Wait::from_secs(20),
+            media(13, 1, false, "b", false),
+            false,
+            true,
+        );
+        source.sleeper = None;
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::Cancelled));
+        assert_eq!(waited(&source), Wait::ZERO);
+    }
+    #[test]
+    fn timefree_outage_resumes_the_same_sequence_and_a_lost_window_does_not_skip() {
+        let mut source = outage(
+            false,
+            Wait::from_secs(20),
+            media(11, 1, false, "b", false),
+            false,
+            false,
+        );
+        let segment = next_segment(&mut source);
+        assert!(!segment.discontinuity);
+        assert_eq!(source.next, 12);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert!(
+            source
+                .http
+                .audio
+                .borrow()
+                .iter()
+                .any(|path| path.ends_with("/s11.aac"))
+        );
+        let mut lost = outage(
+            false,
+            Wait::from_secs(60),
+            media(30, 1, false, "b", false),
+            false,
+            false,
+        );
+        let error = expect_err(lost.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::WindowLost));
+        assert_eq!(error.to_string(), ProbeError::WINDOW_LOST);
+        assert!(!matches!(error, ProbeError::InvalidPlaylist));
+        assert!(
+            !error
+                .to_string()
+                .contains("HLSプレイリストまたはサンプルの構造が不正")
+        );
+        assert_eq!(lost.next, 11);
+        assert_eq!(lost.http.skipped.get(), 0);
+    }
+    #[test]
+    fn timefree_lost_window_is_window_lost_and_does_not_skip_ahead() {
+        let mut source = reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![1]),
+                ("/audio/media.m3u8", media(12, 1, false, "b", false)),
+            ],
+        );
+        assert!(matches!(
+            source.poll(Instant::now()).unwrap(),
+            Next::Segment(_)
+        ));
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::WindowLost));
+        assert_eq!(
+            error.to_string(),
+            "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください"
+        );
+        assert_eq!(error.to_string(), ProbeError::WINDOW_LOST);
+        assert!(
+            !error
+                .to_string()
+                .contains("HLSプレイリストまたはサンプルの構造が不正・未対応です")
+        );
+        assert_eq!(source.next, 11);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    struct ExpiredFetch {
+        requests: RefCell<Vec<String>>,
+        media: Vec<u8>,
+        fail_source: bool,
+        skipped: Cell<u64>,
+        resets: Cell<u64>,
+        at_head: Cell<bool>,
+    }
+    impl Fetch for ExpiredFetch {
+        fn note_skipped_segments(&self, count: u64) {
+            self.skipped.set(self.skipped.get().saturating_add(count));
+        }
+        fn note_sequence_reset(&self) {
+            self.resets.set(self.resets.get() + 1);
+        }
+        fn note_joined_window_head(&self, at_head: bool) {
+            self.at_head.set(at_head);
+        }
+        fn get(
+            &self,
+            url: Url,
+            _: HeaderMap,
+            _: usize,
+            _: Option<(u64, u64)>,
+            _: bool,
+        ) -> Result<Reply, ProbeError> {
+            self.requests.borrow_mut().push(url.path().to_owned());
+            if url.path().ends_with(".aac") {
+                return Ok(Reply {
+                    headers: HeaderMap::new(),
+                    bytes: vec![1],
+                    url,
+                });
+            }
+            // The stored refresh target is the post-redirect chunklist.
+            if url.path() == "/live/chunklist.m3u8" {
+                return Err(ProbeError::NotFound);
+            }
+            if self.fail_source || url.path() != "/v2/api/ts/playlist.m3u8" {
+                if url.path() == "/v2/api/ts/chunklist-new.m3u8" && !self.fail_source {
+                    return Ok(Reply {
+                        headers: HeaderMap::new(),
+                        bytes: self.media.clone(),
+                        url,
+                    });
+                }
+                return Err(ProbeError::NotFound);
+            }
+            Ok(Reply {
+                headers: HeaderMap::new(),
+                bytes: b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=64000,CODECS=\"mp4a.40.2\"\nchunklist-new.m3u8\n".to_vec(),
+                url,
+            })
+        }
+    }
+    fn expired_playback(
+        recovered: Vec<u8>,
+        fail_source: bool,
+        live: bool,
+    ) -> HlsStream<ExpiredFetch> {
+        let mut source = HlsStream::new(
+            ExpiredFetch {
+                requests: RefCell::new(Vec::new()),
+                media: recovered,
+                fail_source,
+                skipped: Cell::new(0),
+                resets: Cell::new(0),
+                at_head: Cell::new(false),
+            },
+            Url::parse("https://radiko.jp/live/chunklist.m3u8?session=old").unwrap(),
+            HeaderMap::new(),
+            parsed(&media(10, 1, false, "a", false)),
+            Some("mp4a.40.2".into()),
+        )
+        .unwrap();
+        source.source =
+            Url::parse("https://radiko.jp/v2/api/ts/playlist.m3u8?station_id=YFM").unwrap();
+        source.live = live;
+        let Next::Segment(first) = source.poll(Instant::now()).unwrap() else {
+            panic!("the first segment is already buffered");
+        };
+        assert_eq!(first.bytes, vec![1]);
+        source
+    }
+    #[test]
+    fn resumed_live_playlist_404_rereads_the_original_url_and_catches_up() {
+        let mut source = expired_playback(media(13, 3, false, "b", false), false, true);
+        source.sleeper = Some(Box::new(|_| panic!("the first reacquire must not wait")));
+        let segment = next_segment(&mut source);
+        assert!(segment.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert!(source.http.at_head.get());
+        assert_eq!(source.http.resets.get(), 0);
+        assert_eq!(source.next, 14);
+        let requests = source.http.requests.borrow().clone();
+        assert!(requests.iter().any(|path| path == "/live/chunklist.m3u8"));
+        assert!(
+            requests
+                .iter()
+                .any(|path| path == "/v2/api/ts/playlist.m3u8")
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|path| path == "/v2/api/ts/chunklist-new.m3u8")
+        );
+        assert!(requests.iter().any(|path| path.ends_with("/s13.aac")));
+        assert!(requests.iter().all(|path| !path.ends_with("/s11.aac")));
+    }
+    #[test]
+    fn continued_live_playlist_404_stops_with_the_reconnect_limit() {
+        let mut source = expired_playback(Vec::new(), true, true);
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = waited.clone();
+        source.sleeper = Some(Box::new(move |step| {
+            clock.fetch_add(
+                u64::try_from(step.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(())
+        }));
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::ReconnectGaveUp));
+        assert_eq!(error.to_string(), crate::reconnect::GAVE_UP);
+        assert!(
+            Wait::from_millis(waited.load(std::sync::atomic::Ordering::Relaxed))
+                >= crate::reconnect::LIMIT
+        );
+        assert_eq!(source.next, 11);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        let requests = source.http.requests.borrow().clone();
+        assert!(requests.iter().any(|path| path == "/live/chunklist.m3u8"));
+        assert!(
+            requests
+                .iter()
+                .any(|path| path == "/v2/api/ts/playlist.m3u8")
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|path| path != "/v2/api/ts/chunklist-new.m3u8")
+        );
+    }
+    #[test]
+    fn reacquired_live_sequence_series_resets_without_counting_the_gap() {
+        let mut source = expired_playback(media(1_000_000, 3, false, "b", false), false, true);
+        source.sleeper = Some(Box::new(|_| panic!("a new sequence series must not wait")));
+        let segment = next_segment(&mut source);
+        assert!(segment.discontinuity);
+        assert_eq!(source.http.resets.get(), 1);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.next, 1_000_001);
+    }
+    #[test]
+    fn timefree_playlist_404_stays_not_found_and_does_not_reread_the_source() {
+        let mut source = expired_playback(Vec::new(), true, false);
+        let error = expect_err(source.poll(Instant::now()));
+        assert_eq!(
+            error.to_string(),
+            "HLS一覧更新: 対象の番組または配信が見つかりません"
+        );
+        assert!(matches!(error, ProbeError::At(_, _)));
+        assert_eq!(source.next, 11);
+        assert_eq!(source.http.skipped.get(), 0);
+        let requests = source.http.requests.borrow().clone();
+        assert!(requests.iter().any(|path| path == "/live/chunklist.m3u8"));
+        assert!(
+            requests
+                .iter()
+                .all(|path| path != "/v2/api/ts/playlist.m3u8")
+        );
     }
 }
