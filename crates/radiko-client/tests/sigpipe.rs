@@ -9,6 +9,13 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
+
+/// `pipe` から `FD_CLOEXEC` を付けるまでのあいだに、他のテストが `spawn` しないようにする。
+fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: Mutex<()> = Mutex::new(());
+    GUARD.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_radiko-client")
@@ -23,17 +30,33 @@ fn chapters_fixture() -> String {
 
 /// 読み口を、子プロセスが書くより前に閉じた標準出力。
 fn stdout_closed_before_start() -> Stdio {
-    let mut fds = [0; 2];
-    // SAFETY: 成功した pipe(2) の二つの fd を、それぞれ一度だけ OwnedFd に渡す。
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "pipe");
-    let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    drop(reader);
+    let (_reader, writer) = cloexec_pipe();
     Stdio::from(writer)
 }
 
+/// 両方の端に `FD_CLOEXEC` を付けたパイプ。
+///
+/// `pipe` の直後は端が子プロセスへ引き継がれる。並列テストがそこへ `spawn` すると、
+/// 閉じたはずの読み口が残り、短い `--help` が壊れたパイプにならず終了 0 になる。
+fn cloexec_pipe() -> (OwnedFd, OwnedFd) {
+    let _guard = fork_guard();
+    let mut fds = [0; 2];
+    // SAFETY: 成功した pipe(2) の二つの fd を、CLOEXEC を付けてからそれぞれ一度だけ OwnedFd に渡す。
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    assert_eq!(rc, 0, "pipe");
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD");
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        assert_eq!(rc, 0, "FD_CLOEXEC");
+    }
+    let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    (reader, writer)
+}
+
 fn spawn(args: &[String], stdout: Stdio) -> std::process::Child {
+    let _guard = fork_guard();
     Command::new(binary())
         .args(args)
         .stdin(Stdio::null())
@@ -173,6 +196,7 @@ fn head_pipeline(args: &[String]) -> (i32, String, String) {
     let scratch = tempfile::tempdir().unwrap();
     let status = scratch.path().join("status");
     let first = scratch.path().join("first");
+    let _guard = fork_guard();
     let output = Command::new("bash")
         .arg("-c")
         .arg(
@@ -249,6 +273,7 @@ fn head_dash_one_does_not_panic_for_every_command() {
 }
 
 fn captured(args: &[String]) -> (i32, String, String) {
+    let _guard = fork_guard();
     let output = Command::new(binary())
         .args(args)
         .stdin(Stdio::null())
@@ -319,11 +344,7 @@ fn read_one_line_then_close_matches_head_without_a_panic() {
         "searches".into(),
         "restore".into(),
     ];
-    let mut fds = [0; 2];
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "pipe");
-    let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let (reader, writer) = cloexec_pipe();
     let child = spawn(&args, Stdio::from(writer));
     let mut reader = File::from(reader);
     let mut line = Vec::new();

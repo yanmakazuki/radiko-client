@@ -14,6 +14,8 @@ YFM のライブを Linux aarch64、PipeWire で再生し、`kill -STOP` の 60 
 
 確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 360 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 360 件成功、失敗 0、ignored 4 件はそのままである。実配信での STOP/CONT のやり直しは、この環境では確認していない。
 
+同日の macOS 15、Rust 1.85.0 の CI では、`closed_stdout_exits_141_without_a_panic_for_every_stdout_command` の `--help` だけが終了 0 になり、他の 4 件は成功した。閉じたパイプの読み口が `FD_CLOEXEC` を付ける前に、同じテストプロセスの別スレッドの `spawn` へ引き継がれていた。パイプ作成から `FD_CLOEXEC` までと、このファイルの `spawn` を同じロックで直列にした。Linux では同じテストを再実行して成功した。macOS の再実行は CI で見る。
+
 ## 2026年10月27日：タイムフリーの続きが取れないときの文言を確定する
 
 タイムフリーで続きが取れなくなったときの `ProbeError::WindowLost` は、yanma さん確認済みの「通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください」である。分類、先へ飛ばさないこと、再接続の対象にしないことは変えていない。
