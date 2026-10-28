@@ -76,9 +76,7 @@ impl fmt::Display for ProbeError {
             Self::Authentication => {
                 f.write_str("配信認証が拒否されました。sessionで会員認証を確認してください")
             }
-            Self::AuthExpired => f.write_str(
-                "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください",
-            ),
+            Self::AuthExpired => f.write_str(Self::AUTH_EXPIRED),
             Self::Denied => f.write_str(
                 "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）",
             ),
@@ -113,6 +111,8 @@ impl std::error::Error for ProbeError {}
 impl ProbeError {
     pub(crate) const WINDOW_LOST: &'static str =
         "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
+    pub(crate) const AUTH_EXPIRED: &'static str =
+        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください";
     fn at(self, stage: &'static str) -> Self {
         Self::At(stage, Box::new(self))
     }

@@ -70,6 +70,8 @@ pub struct Update {
     pub new_session: bool,
     pub snapshot: Option<PlaybackSnapshot>,
     pub notice: Option<String>,
+    /// `notice` is a playback failure. Reconnect and catch-up must not replace it.
+    pub stopped: bool,
     pub ended: bool,
     pub final_diagnostics: Option<String>,
 }
@@ -345,12 +347,13 @@ impl Service {
                         ));
                     }
                     // Preserve an undelivered snapshot so the UI can retain diagnostics on failure.
-                    update.notice = Some(match result {
+                    update.stopped = result.is_err();
+                    update.notice = Some(match &result {
                         Ok(report) => match report.reason {
                             playback::EndReason::ProgramEnd => "番組終了".into(),
                             _ => "停止しました".into(),
                         },
-                        Err(error) => format!("再生停止: {error}"),
+                        Err(error) => playback::failure_notice(error),
                     });
                 }
                 // Output is already dropped. Join only so a later session does not accumulate
@@ -1056,5 +1059,92 @@ mod tests {
         let elapsed = disconnected.expect("in-flight response was not cancelled");
         assert!(elapsed < Duration::from_secs(2));
         server.join().unwrap();
+    }
+    #[test]
+    fn failed_session_sets_stopped_and_publishes_the_window_lost_sentence() {
+        use crate::api::stream::playback::{Next, Segment};
+        struct FailAfter {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for FailAfter {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, crate::api::stream::ProbeError> {
+                if let Some(bytes) = self.bytes.take() {
+                    return Ok(Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: Some("mp4a.40.2".into()),
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }));
+                }
+                Err(crate::api::stream::ProbeError::WindowLost)
+            }
+        }
+        struct HoldSink;
+        impl crate::player::playback::AudioSink for HoldSink {
+            fn enqueue(
+                &mut self,
+                pcm: &crate::player::aac::DecodedPcm,
+                cursor: &mut usize,
+            ) -> Result<bool, crate::player::output::OutputError> {
+                *cursor = pcm.samples.len();
+                Ok(true)
+            }
+            fn accepted(&self) -> u64 {
+                0
+            }
+            fn summary(&self) -> crate::player::output::OutputSummary {
+                crate::player::output::OutputSummary {
+                    frames: 0,
+                    underrun_frames: 0,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    sample_format: crate::player::output::OutputSampleFormat::F32,
+                }
+            }
+            fn poll(&mut self) -> Result<bool, crate::player::output::OutputError> {
+                Ok(false)
+            }
+            fn finish(&mut self) {}
+        }
+        let p = program();
+        let info = short_info(&p);
+        let bytes = adts_frames();
+        let mut service = Service::with_test_sink(
+            move |_, _| {
+                Ok(Box::new(FailAfter {
+                    info: info.clone(),
+                    bytes: Some(bytes.clone()),
+                }))
+            },
+            Arc::new(|_, _, _, _| Ok(Box::new(HoldSink))),
+        );
+        service.select(&p, p.ends_at).unwrap();
+        let start = Instant::now();
+        let mut last_notice = String::new();
+        let update = loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "failed session did not finish; last notice: {last_notice}"
+            );
+            let update = service.poll();
+            if let Some(notice) = update.notice.clone() {
+                last_notice = notice;
+            }
+            if update.ended && update.notice.is_some() {
+                break update;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(update.stopped, "a failed session must set Update.stopped");
+        assert_eq!(
+            update.notice.as_deref(),
+            Some("通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください")
+        );
     }
 }

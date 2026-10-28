@@ -450,7 +450,10 @@ fn main() -> ExitCode {
             ExitCode::from(stdout::BROKEN_PIPE_STATUS)
         }
         Err(error) => {
-            eprintln!("エラー: {error}");
+            eprintln!(
+                "エラー: {}",
+                radiko::player::playback::cli_error_body(error.as_ref())
+            );
             ExitCode::FAILURE
         }
     }

@@ -149,6 +149,8 @@ struct Screen {
     chapter_notice: String,
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
+    /// Set from a failed playback update. Not inferred from the notice text.
+    playback_stopped: bool,
     seen_reauthentications: u64,
     seen_skipped_segments: u64,
     seen_sequence_resets: u64,

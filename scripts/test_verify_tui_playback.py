@@ -14,7 +14,7 @@ import tempfile
 import signal
 from pathlib import Path
 
-from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, device_check, number, select_program, failure_observation, check_timefree_end, UnderrunObservations, output_has_started, require_playback_alive, require_no_alsa_noise
+from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, device_check, number, select_program, failure_observation, check_timefree_end, UnderrunObservations, output_has_started, require_playback_alive, require_no_alsa_noise, playback_failure_visible
 
 
 class TerminalTests(unittest.TestCase):
@@ -466,6 +466,42 @@ else:
         self.assertIsNone(failure_diagnostics('再生停止: unknown-secret-url')['source_stage'])
         self.assertEqual(failure_diagnostics('再生停止: デコード: AACコンテナの時刻またはデータ構造が不正です')['error_kind'],
                          'aac_container')
+
+    def test_confirmed_stop_messages_classify_without_the_old_prefix(self):
+        messages = [
+            ('window_lost', None,
+             '通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください'),
+            ('reconnect_limit', None,
+             '再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください'),
+            ('auth_expired', None,
+             '認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください'),
+        ]
+        stages = [('segment', 'HLS音声取得'), ('playlist', 'HLS一覧更新'),
+                  ('initialization', 'HLS初期化情報取得')]
+        for kind, _stage, message in messages:
+            with self.subTest(kind=kind, prefixed=False):
+                footer = '\n'.join(['body'] * 10 + ['│' + message, '│'])
+                result = failure_diagnostics(footer)
+                self.assertEqual(result['error_kind'], kind)
+                self.assertNotEqual(result['error_kind'], 'other')
+                self.assertTrue(result['notice_visible'])
+                self.assertIsNone(result['source_stage'])
+                self.assertTrue(playback_failure_visible(footer))
+                self.assertNotIn(message, str({k: v for k, v in result.items() if k != 'error_kind'}))
+        for stage, label in stages:
+            prefixed = '再生停止: 配信取得: ' + label + ': 認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください'
+            with self.subTest(stage=stage, prefixed=True):
+                result = failure_diagnostics(prefixed)
+                self.assertEqual(result['error_kind'], 'auth_expired')
+                self.assertEqual(result['source_stage'], stage)
+                self.assertNotEqual(result['error_kind'], 'other')
+        outside = '\n'.join(['通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください']
+                            + ['body'] * 9)
+        self.assertFalse(failure_diagnostics(outside)['notice_visible'])
+        unknown = '\n'.join(['body'] * 10 + ['│再生停止: sensitive-unrecognized-text', '│'])
+        self.assertEqual(failure_diagnostics(unknown)['error_kind'], 'other')
+        self.assertNotIn('sensitive-unrecognized-text', str(failure_diagnostics(unknown)))
+        self.assertNotIn('未分類', str(failure_diagnostics(unknown)))
 
     def test_every_utf8_and_csi_split_preserves_japanese_and_restoration(self):
         content = '\x1b[2J\x1b[2;3H再生位置\x1b[?1049l'.encode()

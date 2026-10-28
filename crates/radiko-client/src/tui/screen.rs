@@ -30,6 +30,7 @@ impl Screen {
             chapter_notice: String::new(),
             playback_action: None,
             playback_notice: String::new(),
+            playback_stopped: false,
             seen_reauthentications: 0,
             seen_skipped_segments: 0,
             seen_sequence_resets: 0,
@@ -134,9 +135,13 @@ impl Screen {
             self.playback_diagnostics.clear();
             self.pipeline_diagnostics.clear();
             self.playback_notice.clear();
+            self.playback_stopped = false;
             self.seen_reauthentications = 0;
             self.seen_skipped_segments = 0;
             self.seen_sequence_resets = 0;
+        }
+        if update.stopped {
+            self.playback_stopped = true;
         }
         if let Some(snapshot) = &update.snapshot {
             self.pipeline_diagnostics = snapshot
@@ -187,16 +192,13 @@ impl Screen {
         }
         if let Some(count) = renewed {
             self.seen_reauthentications = count;
-            if !self.playback_notice.contains("再生停止")
-                && !self.playback_notice.contains("認証期限切れ")
-            {
+            if !self.playback_stopped {
                 self.playback_notice = "配信認証を更新して再生を続けます".into();
             }
         }
         let at_head = http.is_some_and(|http| http.joined_window_head);
         if let Some(elapsed) = reconnecting_for {
-            if !self.playback_notice.contains("再生停止")
-                && !self.playback_notice.contains("認証期限切れ")
+            if !self.playback_stopped
                 && !self.playback_notice.contains("配信認証を更新")
                 && !self.playback_notice.contains("累計")
                 && !self.playback_notice.contains("番組終了")
@@ -209,10 +211,7 @@ impl Screen {
         if let Some((skipped, resets)) = realign {
             self.seen_sequence_resets = resets;
             self.seen_skipped_segments = skipped;
-            if !self.playback_notice.contains("再生停止")
-                && !self.playback_notice.contains("認証期限切れ")
-                && !self.playback_notice.contains("配信認証を更新")
-            {
+            if !self.playback_stopped && !self.playback_notice.contains("配信認証を更新") {
                 self.playback_notice = if at_head {
                     format!("配信窓の先頭から再開しました（累計{skipped}）")
                 } else {
