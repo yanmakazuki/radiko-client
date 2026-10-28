@@ -103,7 +103,7 @@ class TerminalTests(unittest.TestCase):
                     self.assertEqual(result.stdout, b'')
                     self.assertEqual(list(Path(directory).iterdir()), [])
 
-    def test_termination_signals_remove_the_verifier_temporary_directory(self):
+    def _assert_termination_removes_temporary_directory(self, termination, preexec_fn=None):
         # Run main's real signal/TemporaryDirectory boundary with acquisition replaced.
         # This does not start radiko-client or read a session.
         code = """
@@ -117,24 +117,34 @@ verification.verify = fake_verify
 sys.argv = ['verify', '--session-file', 'unused', '--date', '20261021', '--start', '20261021120000']
 raise SystemExit(verification.main())
 """
+        child = subprocess.Popen([sys.executable, '-c', code],
+                                 cwd=Path(__file__).parent,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, preexec_fn=preexec_fn)
+        try:
+            directory = Path(json.loads(child.stdout.readline())['ready'])
+            self.assertTrue(directory.is_dir())
+            child.send_signal(termination)
+            output, errors = child.communicate(timeout=5)
+            self.assertEqual(child.returncode, 130, errors)
+            self.assertEqual(json.loads(output)['phase'], 'interrupted')
+            self.assertFalse(directory.exists())
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
+
+    def test_termination_signals_remove_the_verifier_temporary_directory(self):
         for termination in [signal.SIGTERM, signal.SIGHUP, signal.SIGINT]:
             with self.subTest(signal=termination):
-                child = subprocess.Popen([sys.executable, '-c', code],
-                                         cwd=Path(__file__).parent,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                         text=True)
-                try:
-                    directory = Path(json.loads(child.stdout.readline())['ready'])
-                    self.assertTrue(directory.is_dir())
-                    child.send_signal(termination)
-                    output, errors = child.communicate(timeout=5)
-                    self.assertEqual(child.returncode, 130, errors)
-                    self.assertEqual(json.loads(output)['phase'], 'interrupted')
-                    self.assertFalse(directory.exists())
-                finally:
-                    if child.poll() is None:
-                        child.kill()
-                    child.communicate(timeout=5)
+                self._assert_termination_removes_temporary_directory(termination)
+
+    def test_sigint_removes_the_temporary_directory_when_the_parent_ignored_it(self):
+        # An inherited SIG_IGN suppresses Python's default KeyboardInterrupt handler.
+        def ignore_sigint():
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        self._assert_termination_removes_temporary_directory(signal.SIGINT, ignore_sigint)
 
     def test_failure_observation_reads_the_ninth_footer_row_without_copying_notice_text(self):
         text = '\n'.join([
