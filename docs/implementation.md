@@ -4,6 +4,22 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：ダイアログの q は閉じるだけにする
+
+yanma さんの決定に合わせ、どのダイアログでも `q` は閉じるだけでアプリは終了しない。ログアウト確認の `q` は取消であり、ログアウトは実行しない。名前付き条件の `q` も閉じる。読み込み中と一覧は画面を閉じ、削除確認の `q` はその確認だけを閉じる。操作一覧と取得状況の `q` は閉じるままである。キーワード、条件編集、ログインでは `q` は文字である。秒数入力は数字だけを受け付けるので `q` は入らず、終了もしない。番組一覧とライブ画面の終了は `q`、Esc、Ctrl+C のままである。チャプター表示の `q` と Esc は閉じる。終了しない。#17 の Esc、#22 の `n` と `o`、#23 の `=` は足していない。一覧とライブでは `n`、`o`、`=` は何もしない。
+
+画面内ヘルプと `tui --help` は「通常画面のq / Esc、またはCtrl+Cで終了」と「ログアウトはyで確定、n / Esc / qで取消」を共有する。ダイアログのフッターは「q / Esc 閉じる」である。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 371 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 371 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 56 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。この環境では AppArmor の sysctl は無く、`unshare -rn` はそのまま成功した。radiko への通信と実機の再生はない。
+
+## 2026年10月28日：終了キーの扱いを表で固定する
+
+画面内ヘルプと `tui --help` は、番組一覧の終了を同じ句「通常画面のq / Esc、またはCtrl+Cで終了」で書く。キーワード編集の `q` は文字である。操作一覧と取得状況の `q` と Esc は閉じる。Ctrl+C はどの画面でも終了する。
+
+#17 の通常画面 Esc の変更、#22 の `n` と `o`、#23 の `=` は main にないので、表には入れてない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 371 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 371 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 56 件成功である。radiko への通信と実機の再生はない。
+
 ## 2026年10月28日：origin/main のオフライン TUI スモークを、SIGINT の中断へ合わせる
 
 `origin/main`（#53）を merge commit で取り込んだ。衝突は `docs/implementation.md` と `docs/validation.md` だけである。コードの衝突はなかった。#53 の `tui --offline`、`scripts/smoke_tui.py`、Ubuntu のスモーク手順と、検証スクリプトの SIGINT ハンドラーは両方残した。

@@ -19,7 +19,6 @@ enum Mode {
 pub(super) enum Action {
     None,
     Close,
-    Quit,
     Operation(Operation),
 }
 pub(super) struct Manager {
@@ -66,8 +65,7 @@ impl Manager {
     pub fn handle(&mut self, key: KeyEvent, criteria: &SearchCriteria) -> Action {
         if self.busy {
             return match key.code {
-                KeyCode::Esc => Action::Close,
-                KeyCode::Char('q') => Action::Quit,
+                KeyCode::Esc | KeyCode::Char('q') => Action::Close,
                 _ => Action::None,
             };
         }
@@ -107,15 +105,14 @@ impl Manager {
                     self.busy = true;
                     Action::Operation(Operation::Delete(name.clone()))
                 }
-                KeyCode::Esc | KeyCode::Char('n') => {
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
                     self.mode = Mode::Browse;
                     Action::None
                 }
                 _ => Action::None,
             },
             Mode::Browse => match key.code {
-                KeyCode::Esc => Action::Close,
-                KeyCode::Char('q') => Action::Quit,
+                KeyCode::Esc | KeyCode::Char('q') => Action::Close,
                 KeyCode::Char('n') => {
                     self.mode = Mode::Name(String::new());
                     self.notice = "確定済み条件を保存します。同名の条件は更新します".into();
@@ -163,16 +160,23 @@ impl Manager {
     }
     pub fn controls(&self) -> &'static str {
         if self.busy {
-            return "保存条件の操作中 / Esc 戻る / q・Ctrl+C 終了";
+            return concat!(
+                "保存条件の操作中 / ",
+                dialog_close_hint!(),
+                " / Ctrl+C 終了"
+            );
         }
         match self.mode {
-            Mode::Browse => {
-                "Enter 呼び出し / n 確定済み条件を保存 / d 削除 / r 再読込 / Esc 戻る / q 終了"
-            }
+            Mode::Browse => concat!(
+                "Enter 呼び出し / n 確定済み条件を保存 / d 削除 / r 再読込 / ",
+                dialog_close_hint!()
+            ),
             Mode::Name(_) => {
                 "Enter 保存（同名は更新） / Backspace・Ctrl+U 編集 / Esc 取消 / Ctrl+C 終了"
             }
-            Mode::Delete(_) => "y 削除 / n・Esc 取消 / Ctrl+C 終了",
+            Mode::Delete(_) => {
+                concat!("y 削除 / n 取消 / ", dialog_close_hint!(), " / Ctrl+C 終了")
+            }
         }
     }
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, committed: &SearchCriteria) {
@@ -184,11 +188,10 @@ impl Manager {
             .collect();
         frame.render_stateful_widget(
             List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("名前付き検索条件 / n 保存 / d 削除 / r 再読込 / Esc 戻る"),
-                )
+                .block(Block::default().borders(Borders::ALL).title(concat!(
+                    "名前付き検索条件 / n 保存 / d 削除 / r 再読込 / ",
+                    dialog_close_hint!()
+                )))
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ "),
             panes[0],
@@ -199,7 +202,12 @@ impl Manager {
                 "保存名: {name}▏\nEnter 保存（同名は更新） / Esc 取消 / Ctrl+U 消去\n{}",
                 describe(committed)
             ),
-            Mode::Delete(name) => format!("「{name}」を削除しますか？ y 削除 / n・Esc 取消"),
+            Mode::Delete(name) => {
+                format!(
+                    "「{name}」を削除しますか？ y 削除 / n / {}",
+                    dialog_close_hint!()
+                )
+            }
             Mode::Browse => self
                 .selected()
                 .map(|(_, criteria)| describe(criteria))
@@ -267,6 +275,23 @@ mod tests {
             manager.handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &criteria()),
             Action::None
         ));
+        assert!(matches!(
+            manager.handle(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                &criteria()
+            ),
+            Action::None
+        ));
+        assert!(manager.controls().contains("y 削除"));
+        assert!(matches!(
+            manager.handle(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &criteria()
+            ),
+            Action::None
+        ));
+        assert!(manager.controls().contains("Enter 呼び出し"));
+        assert!(manager.controls().contains("q / Esc 閉じる"));
         assert!(matches!(
             manager.handle(
                 KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),

@@ -118,7 +118,8 @@ pub fn draw(frame: &mut Frame, app: &AppState, list: &mut ListState, height: &mu
         .unwrap_or_else(|| "再生中: なし".into());
     frame.render_widget(
         Paragraph::new(format!(
-            "{playback}\n上下・ページ・Home/End 選択 / e・Esc・q 戻る / Ctrl+C 終了"
+            "{playback}\n上下・ページ・Home/End 選択 / e / {} / Ctrl+C 終了",
+            dialog_close_hint!()
         ))
         .block(Block::default().borders(Borders::ALL)),
         panes[2],
