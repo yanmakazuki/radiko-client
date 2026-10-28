@@ -123,6 +123,8 @@ unshare -rn true || sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=
 unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client
 ```
 
+ローカルスモークで sysctl を 0 にしたあとは、`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1` で AppArmor の制限を戻します。
+
 `--require-isolated-network` は、同じプロセスから `1.1.1.1:443` へ TCP 接続できたときに失敗します。接続できなければ、続けて疑似端末の確認をします。CI の ubuntu-24.04 は、この `unshare -rn` の形です。
 
 ## Linux の実機検証

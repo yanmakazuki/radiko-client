@@ -1,4 +1,14 @@
 //! 検索とライブ／タイムフリー再生のTUI。描画処理は状態を参照するだけで、通信や再生を実行しない。
+macro_rules! quit_key_wording {
+    () => {
+        "通常画面のq / Esc、またはCtrl+Cで終了"
+    };
+}
+macro_rules! logout_key_wording {
+    () => {
+        "ログアウトはyで確定、n / Escで取消、qで終了"
+    };
+}
 mod areas;
 mod failures;
 mod filters;
@@ -52,7 +62,19 @@ use std::{
     },
     time::Duration,
 };
-const USAGE: &str = "tui [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / q・Ctrl+C 終了\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ログアウト（yで確定、n・Escで取消）。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。";
+/// 番組一覧の終了キー。画面内ヘルプと `tui --help` は同じ句を使う。
+#[cfg(test)]
+const QUIT_KEY_WORDING: &str = quit_key_wording!();
+/// ログアウト確認。`q` は取消ではなく終了。入力欄以外の `q` は終了、という設計に合わせる。
+#[cfg(test)]
+const LOGOUT_KEY_WORDING: &str = logout_key_wording!();
+const USAGE: &str = concat!(
+    "tui [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / ",
+    quit_key_wording!(),
+    "\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ",
+    logout_key_wording!(),
+    "。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。"
+);
 fn named_receipt(result: &Result<NamedOutcome, radiko::app::named::Error>) -> String {
     match result {
         Ok(NamedOutcome::Saved(name)) => format!("「{name}」を保存しました"),
@@ -982,7 +1004,7 @@ impl Screen {
                 .into();
         }
         if self.logout_confirm {
-            return "ログアウトしますか？ 再生を停止し保存セッションを削除 / y 確定 / n・Esc 取消"
+            return "ログアウトしますか？ 再生を停止し保存セッションを削除 / y 確定 / n・Esc 取消 / q 終了"
                 .into();
         }
         if let Some(editor) = &self.seek {
@@ -1011,7 +1033,7 @@ impl Screen {
             "Enter TF再生 / v ライブ画面 / l ライブ / f 条件 / b 保存条件 / c チャプター"
         };
         format!(
-            "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q 終了"
+            "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q・Esc・Ctrl+C 終了"
         )
     }
 }
@@ -3374,6 +3396,268 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Surface {
+        MainList,
+        Help,
+        FetchStatus,
+        LogoutConfirm,
+        Editing,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum KeyEffect {
+        Close,
+        Quit,
+        Cancel,
+        /// キーワード入力の `q` は文字であり、閉じる・終了・取消ではない。
+        Insert,
+    }
+    #[derive(Clone, Copy, Debug)]
+    struct KeyCase {
+        surface: Surface,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        effect: KeyEffect,
+    }
+    const KEY_CASES: &[KeyCase] = &[
+        KeyCase {
+            surface: Surface::MainList,
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Quit,
+        },
+        KeyCase {
+            surface: Surface::MainList,
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Quit,
+        },
+        KeyCase {
+            surface: Surface::MainList,
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            effect: KeyEffect::Quit,
+        },
+        KeyCase {
+            surface: Surface::Help,
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Close,
+        },
+        KeyCase {
+            surface: Surface::Help,
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Close,
+        },
+        KeyCase {
+            surface: Surface::Help,
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            effect: KeyEffect::Quit,
+        },
+        KeyCase {
+            surface: Surface::FetchStatus,
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Close,
+        },
+        KeyCase {
+            surface: Surface::FetchStatus,
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Close,
+        },
+        KeyCase {
+            surface: Surface::FetchStatus,
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            effect: KeyEffect::Quit,
+        },
+        KeyCase {
+            surface: Surface::LogoutConfirm,
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Quit,
+        },
+        KeyCase {
+            surface: Surface::LogoutConfirm,
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Cancel,
+        },
+        KeyCase {
+            surface: Surface::LogoutConfirm,
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            effect: KeyEffect::Quit,
+        },
+        KeyCase {
+            surface: Surface::Editing,
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Insert,
+        },
+        KeyCase {
+            surface: Surface::Editing,
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            effect: KeyEffect::Cancel,
+        },
+        KeyCase {
+            surface: Surface::Editing,
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            effect: KeyEffect::Quit,
+        },
+    ];
+    fn prepare(surface: Surface) -> Screen {
+        let mut screen = screen();
+        match surface {
+            Surface::MainList => {}
+            Surface::Help => screen.help_open = true,
+            Surface::FetchStatus => screen.failures_open = true,
+            Surface::LogoutConfirm => screen.logout_confirm = true,
+            Surface::Editing => {
+                screen.app.begin_edit();
+                screen.input = Some(String::new());
+            }
+        }
+        screen
+    }
+    #[test]
+    fn surface_and_quit_keys_follow_one_table() {
+        let mut search =
+            Service::new(|| -> Result<CatalogClient, _> { panic!("key table must not fetch") });
+        for surface in [
+            Surface::MainList,
+            Surface::Help,
+            Surface::FetchStatus,
+            Surface::LogoutConfirm,
+            Surface::Editing,
+        ] {
+            assert_eq!(
+                KEY_CASES
+                    .iter()
+                    .filter(|case| case.surface == surface)
+                    .count(),
+                3,
+                "{surface:?} は q / Esc / Ctrl+C の3行"
+            );
+        }
+        for case in KEY_CASES {
+            let mut screen = prepare(case.surface);
+            let committed = screen.app.committed.clone();
+            let quit = screen
+                .key(KeyEvent::new(case.code, case.modifiers), &mut search)
+                .unwrap();
+            assert!(screen.playback_action.is_none(), "{case:?}");
+            assert!(!screen.logout_requested, "{case:?}");
+            assert!(screen.login_requested.is_none(), "{case:?}");
+            assert_eq!(screen.app.committed, committed, "{case:?}");
+            assert_eq!(screen.app.status, SearchStatus::Idle, "{case:?}");
+            match case.effect {
+                KeyEffect::Quit => {
+                    assert!(quit, "{case:?}");
+                    match case.surface {
+                        Surface::Help => assert!(screen.help_open, "{case:?}"),
+                        Surface::FetchStatus => assert!(screen.failures_open, "{case:?}"),
+                        Surface::LogoutConfirm => assert!(screen.logout_confirm, "{case:?}"),
+                        Surface::Editing => assert!(screen.input.is_some(), "{case:?}"),
+                        Surface::MainList => {
+                            assert!(!screen.help_open && !screen.failures_open, "{case:?}");
+                        }
+                    }
+                }
+                KeyEffect::Close => {
+                    assert!(!quit, "{case:?}");
+                    match case.surface {
+                        Surface::Help => assert!(!screen.help_open, "{case:?}"),
+                        Surface::FetchStatus => assert!(!screen.failures_open, "{case:?}"),
+                        Surface::MainList | Surface::LogoutConfirm | Surface::Editing => {
+                            panic!("閉じるのは操作一覧と取得状況だけです: {case:?}")
+                        }
+                    }
+                }
+                KeyEffect::Cancel => {
+                    assert!(!quit, "{case:?}");
+                    match case.surface {
+                        Surface::LogoutConfirm => {
+                            assert!(!screen.logout_confirm, "{case:?}");
+                        }
+                        Surface::Editing => {
+                            assert!(screen.input.is_none(), "{case:?}");
+                            assert!(screen.app.draft.is_none(), "{case:?}");
+                        }
+                        Surface::MainList | Surface::Help | Surface::FetchStatus => {
+                            panic!("取消はログアウト確認と編集中だけです: {case:?}")
+                        }
+                    }
+                }
+                KeyEffect::Insert => {
+                    assert!(!quit, "{case:?}");
+                    assert_eq!(case.surface, Surface::Editing, "{case:?}");
+                    assert_eq!(screen.input.as_deref(), Some("q"), "{case:?}");
+                    assert!(screen.app.draft.is_some(), "{case:?}");
+                    assert!(!screen.help_open && !screen.failures_open, "{case:?}");
+                }
+            }
+        }
+        assert!(help::KEYS.contains(QUIT_KEY_WORDING));
+        assert!(USAGE.contains(QUIT_KEY_WORDING));
+        assert!(help::KEYS.contains(LOGOUT_KEY_WORDING));
+        assert!(USAGE.contains(LOGOUT_KEY_WORDING));
+        let main_quit_keys: Vec<_> = KEY_CASES
+            .iter()
+            .filter(|case| case.surface == Surface::MainList)
+            .map(|case| {
+                assert_eq!(case.effect, KeyEffect::Quit, "{case:?}");
+                match (case.code, case.modifiers) {
+                    (KeyCode::Char('q'), KeyModifiers::NONE) => "q",
+                    (KeyCode::Esc, KeyModifiers::NONE) => "Esc",
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => "Ctrl+C",
+                    _ => panic!("番組一覧の終了キーが表にありません: {case:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(main_quit_keys, ["q", "Esc", "Ctrl+C"].as_slice());
+        for token in main_quit_keys {
+            assert!(
+                QUIT_KEY_WORDING.contains(token),
+                "終了の文言に {token} がありません"
+            );
+        }
+        let logout_q = KEY_CASES
+            .iter()
+            .find(|case| {
+                case.surface == Surface::LogoutConfirm
+                    && case.code == KeyCode::Char('q')
+                    && case.modifiers == KeyModifiers::NONE
+            })
+            .expect("ログアウト確認の q");
+        match logout_q.effect {
+            KeyEffect::Quit => assert!(LOGOUT_KEY_WORDING.contains("qで終了")),
+            KeyEffect::Cancel | KeyEffect::Close => {
+                assert!(LOGOUT_KEY_WORDING.contains("qで取消"))
+            }
+            KeyEffect::Insert => panic!("ログアウト確認の q は文字ではありません"),
+        }
+        let logout_esc = KEY_CASES
+            .iter()
+            .find(|case| {
+                case.surface == Surface::LogoutConfirm
+                    && case.code == KeyCode::Esc
+                    && case.modifiers == KeyModifiers::NONE
+            })
+            .expect("ログアウト確認の Esc");
+        match logout_esc.effect {
+            KeyEffect::Cancel | KeyEffect::Close => {
+                assert!(LOGOUT_KEY_WORDING.contains("Escで取消"))
+            }
+            KeyEffect::Quit => assert!(LOGOUT_KEY_WORDING.contains("Escで終了")),
+            KeyEffect::Insert => panic!("ログアウト確認の Esc は文字ではありません"),
+        }
     }
     #[test]
     fn question_mark_in_keyword_draft_does_not_open_help_or_fetch() {
