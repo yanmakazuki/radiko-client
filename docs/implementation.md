@@ -8,11 +8,11 @@
 
 再生状態の空の更新で「受信待ち…」と「再接続中…」を消していた。画面は50ミリ秒ごとに再生を見るが、スナップショットが無い回の方が多い。スナップショットがある更新だけで出し消しを決める。空の更新は今の文を残す。
 
-追いつきと配信認証の更新は、出してから5秒（`NOTICE_HOLD`）だけ受信待ちと再接続中を抑える。5秒は、その一文を読む長さである。5秒のあいだに音が戻っても、その文は残す。5秒を過ぎて無音なら「受信待ち…」に替え、通信断から30秒で「再接続中…（N秒）」にする。確認済みの停止文は、これまでどおり置き換えない。
+追いつき、配信認証の更新、操作の結果は、出してから5秒（`NOTICE_HOLD`）だけ受信待ちと再接続中を抑える。操作の結果は「再生準備失敗（現在の状態を維持）」「再生準備に失敗しました（現在の状態を維持）」「再生準備中」「シーク不可」「切替不可」「位置指定を取消」「再生切替失敗（現在の状態を維持）」「再生切替完了」「一時停止」と、画面側の放送前・放送終了などの同じ種類である。5秒は、その一文を読む長さである。5秒のあいだに音が戻っても、その文は残す。5秒を過ぎて無音なら「受信待ち…」に替え、通信断から30秒を過ぎていれば「再接続中…（N秒）」にする。確認済みの停止文は、これまでどおり置き換えない。
 
 22秒と60秒の途絶は、注入した時計と偽のプレイリストを再生ループそのものに渡して確認する。手元のバッファは `#EXTINF:5` の5秒で、「受信待ち…」は再生開始から7秒、再接続の表示は30秒である。数値は定数から計算せず、7秒・2秒・30秒・5秒とその直前直後を直接見ている。バッファが空いた時刻を戻さない改変と、スナップショットへ `receiving_for` を入れない改変は、このテストが失敗する。`RECEPTION_AFTER` を3秒にすると最初の表示は8秒になり、`NOTICE_AFTER` を25秒にすると22秒の途絶でも再接続中が出て、どちらも失敗する。
 
-確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 381 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 381 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。`--help` とオフライン画面は、この変更の前のバイナリとバイト単位で同じである。radiko への通信と実機の再生はない。
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 382 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 382 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。`--help` とオフライン画面は、この変更の前のバイナリとバイト単位で同じである。radiko への通信と実機の再生はない。
 
 ## 2026年10月28日：バッファが空いた無音には「受信待ち…」を出す
 

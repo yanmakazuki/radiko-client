@@ -222,7 +222,9 @@ impl Screen {
         let held = self.notice_hold_until.is_some_and(|until| now < until)
             && matches!(
                 self.notice_hold,
-                super::NoticeHold::AuthRenewal | super::NoticeHold::CatchUp
+                super::NoticeHold::AuthRenewal
+                    | super::NoticeHold::CatchUp
+                    | super::NoticeHold::Action
             );
         // An empty poll has no snapshot. Leaving the notice alone stops the
         // once-a-second blink: most 50ms ticks carry no playback snapshot.
@@ -260,8 +262,12 @@ impl Screen {
         if let Some((skipped, resets)) = realign {
             self.seen_sequence_resets = resets;
             self.seen_skipped_segments = skipped;
-            let auth_held = held && self.notice_hold == super::NoticeHold::AuthRenewal;
-            if !self.playback_stopped && !self.playback_ended && !auth_held {
+            let protected = held
+                && matches!(
+                    self.notice_hold,
+                    super::NoticeHold::AuthRenewal | super::NoticeHold::Action
+                );
+            if !self.playback_stopped && !self.playback_ended && !protected {
                 self.playback_notice = if at_head {
                     format!("配信窓の先頭から再開しました（累計{skipped}）")
                 } else {
@@ -273,12 +279,21 @@ impl Screen {
         }
         if let Some(notice) = update.notice {
             self.playback_notice = notice;
-            self.notice_hold = super::NoticeHold::Other;
+            if self.playback_stopped || self.playback_ended {
+                self.notice_hold = super::NoticeHold::Other;
+                self.notice_hold_until = None;
+            } else {
+                self.hold_action(now);
+            }
         }
+    }
+    fn hold_action(&mut self, now: std::time::Instant) {
+        self.notice_hold = super::NoticeHold::Action;
+        self.notice_hold_until = Some(now + super::NOTICE_HOLD);
     }
     fn show_notice(&mut self, notice: impl Into<String>) {
         self.playback_notice = notice.into();
-        self.notice_hold = super::NoticeHold::Other;
+        self.hold_action(std::time::Instant::now());
     }
     pub(super) fn rows(&self) -> &[usize] {
         if self.live_mode {
