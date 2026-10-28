@@ -76,9 +76,7 @@ impl fmt::Display for ProbeError {
             Self::Authentication => {
                 f.write_str("配信認証が拒否されました。sessionで会員認証を確認してください")
             }
-            Self::AuthExpired => f.write_str(
-                "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください",
-            ),
+            Self::AuthExpired => f.write_str(Self::AUTH_EXPIRED),
             Self::Denied => f.write_str(
                 "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）",
             ),
@@ -113,6 +111,8 @@ impl std::error::Error for ProbeError {}
 impl ProbeError {
     pub(crate) const WINDOW_LOST: &'static str =
         "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
+    pub(crate) const AUTH_EXPIRED: &'static str =
+        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください";
     fn at(self, stage: &'static str) -> Self {
         Self::At(stage, Box::new(self))
     }
@@ -965,12 +965,10 @@ mod tests {
             ProbeError::Authentication => {
                 "配信認証が拒否されました。sessionで会員認証を確認してください".into()
             }
-            ProbeError::AuthExpired => {
-                "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
-                    .into()
-            }
+            ProbeError::AuthExpired => ProbeError::AUTH_EXPIRED.into(),
             ProbeError::Denied => {
-                "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）".into()
+                "配信サーバーがアクセスを拒否しました（契約・地域・配信条件の確認が必要です）"
+                    .into()
             }
             ProbeError::NotFound => "対象の番組または配信が見つかりません".into(),
             ProbeError::RateLimited => "アクセス制限中です。時間をおいて再実行してください".into(),
@@ -986,7 +984,9 @@ mod tests {
             ProbeError::ContractRequired => {
                 "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）".into()
             }
-            ProbeError::AvailabilityUnknown => "番組の配信条件が未確認のため取得を中止しました".into(),
+            ProbeError::AvailabilityUnknown => {
+                "番組の配信条件が未確認のため取得を中止しました".into()
+            }
             ProbeError::Unavailable => "番組情報でタイムフリー配信対象外とされています".into(),
             ProbeError::InvalidPlaylist => {
                 "HLSプレイリストまたはサンプルの構造が不正・未対応です".into()

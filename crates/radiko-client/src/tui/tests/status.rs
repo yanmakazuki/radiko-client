@@ -63,14 +63,19 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
             area_free: Some(true),
             time_free_30: Some(false),
         });
-    let expired = format!(
-        "再生停止: {}",
-        radiko::player::playback::PlaybackError::Source(radiko::api::stream::ProbeError::At(
+    let expired = radiko::player::playback::failure_notice(
+        &radiko::player::playback::PlaybackError::Source(radiko::api::stream::ProbeError::At(
             "HLS一覧更新",
             Box::new(radiko::api::stream::ProbeError::AuthExpired),
-        ))
+        )),
     );
-    assert!(expired.contains("認証期限切れ"));
+    assert_eq!(
+        expired,
+        radiko::api::stream::ProbeError::AuthExpired.to_string()
+    );
+    assert!(!expired.contains("再生停止:"));
+    assert!(!expired.contains("配信取得:"));
+    assert!(!expired.contains("HLS一覧更新:"));
     assert!(!expired.contains("synthetic"));
     screen.playback_notice = expired;
     let now = Utc::now().fixed_offset();
@@ -154,13 +159,19 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     let shown = text(&terminal).replace(' ', "");
     assert!(shown.contains("配信認証を更新して継続"), "{shown}");
     assert!(shown.contains("再認証1"), "{shown}");
+    let expired = radiko::player::playback::failure_notice(
+        &radiko::player::playback::PlaybackError::Source(radiko::api::stream::ProbeError::At(
+            "HLS音声取得",
+            Box::new(radiko::api::stream::ProbeError::AuthExpired),
+        )),
+    );
+    assert!(!expired.contains("再生停止:"));
+    assert!(!expired.contains("HLS音声取得:"));
     screen.apply_playback(radiko::app::playback::Update {
-            notice: Some(
-                "再生停止: HLS音声取得: 認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
-                    .into(),
-            ),
-            ..radiko::app::playback::Update::default()
-        });
+        stopped: true,
+        notice: Some(expired),
+        ..radiko::app::playback::Update::default()
+    });
     terminal
         .draw(|frame| draw(frame, &mut screen, now))
         .unwrap();
@@ -369,17 +380,134 @@ fn reconnecting_notice_is_shown_and_yields_to_catch_up_and_stop() {
         "ライブ端に追いつきました（飛ばしたセグメントは累計5）"
     );
     screen.playback_notice = "再生停止: 音声コールバックが進まないため出力を停止しました".into();
+    screen.playback_stopped = true;
     screen.apply_playback(radiko::app::playback::Update {
         snapshot: Some(snapshot(Some(Duration::from_secs(9)), 5, false)),
         ..radiko::app::playback::Update::default()
     });
     assert!(screen.playback_notice.contains("再生停止"));
+    screen.playback_stopped = false;
     screen.playback_notice = "配信認証を更新して再生を続けます".into();
     screen.apply_playback(radiko::app::playback::Update {
         snapshot: Some(snapshot(Some(Duration::from_secs(9)), 5, false)),
         ..radiko::app::playback::Update::default()
     });
     assert_eq!(screen.playback_notice, "配信認証を更新して再生を続けます");
+}
+#[test]
+fn confirmed_stop_notices_survive_reconnect_catch_up_and_auth_renewal() {
+    use radiko::api::stream::ProbeError;
+    use radiko::player::diagnostics::{Snapshot, Stage};
+    use radiko::player::playback::{PlaybackError, failure_notice};
+    let now = Utc::now().fixed_offset();
+    let stages = ["HLS一覧更新", "HLS初期化情報取得", "HLS音声取得", "別段階"];
+    let mut errors = vec![
+        PlaybackError::Source(ProbeError::WindowLost),
+        PlaybackError::Source(ProbeError::ReconnectGaveUp),
+        PlaybackError::Source(ProbeError::AuthExpired),
+        PlaybackError::ReconnectGaveUp,
+        PlaybackError::Output(radiko::player::output::OutputError::ReconnectGaveUp),
+    ];
+    for stage in stages {
+        errors.push(PlaybackError::Source(ProbeError::At(
+            stage,
+            Box::new(ProbeError::AuthExpired),
+        )));
+        errors.push(PlaybackError::Source(ProbeError::At(
+            stage,
+            Box::new(ProbeError::WindowLost),
+        )));
+        errors.push(PlaybackError::Source(ProbeError::At(
+            stage,
+            Box::new(ProbeError::ReconnectGaveUp),
+        )));
+    }
+    errors.push(PlaybackError::Source(ProbeError::At(
+        "外側",
+        Box::new(ProbeError::At(
+            "HLS音声取得",
+            Box::new(ProbeError::AuthExpired),
+        )),
+    )));
+    let http = |skipped, reauth| radiko::api::stream::playback::RequestSnapshot {
+        stage: radiko::api::stream::playback::RequestStage::Idle,
+        response_status: Some(200),
+        elapsed: Duration::ZERO,
+        headers_max: Duration::ZERO,
+        body_max: Duration::ZERO,
+        attempts: 1,
+        retry_waits: 0,
+        network_failures: 0,
+        timeouts: 0,
+        connect_failures: 0,
+        reauthentications: reauth,
+        skipped_segments: skipped,
+        sequence_resets: 0,
+        joined_window_head: true,
+    };
+    let snapshot = |reconnecting_for, skipped, reauth| radiko::player::state::PlaybackSnapshot {
+        info: radiko::api::stream::playback::StreamInfo {
+            title: Some("枠".into()),
+            station: "TBS".into(),
+            mode: radiko::api::stream::ProbeMode::Live,
+            starts_at: now,
+            ends_at: now + chrono::Duration::hours(1),
+            position: Duration::ZERO,
+        },
+        state: PlaybackState::Playing,
+        pending: None,
+        volume: 25,
+        position: None,
+        output: None,
+        segments: 1,
+        reconnecting_for,
+        pipeline: Some(Snapshot {
+            stage: Stage::Waiting,
+            elapsed: Duration::from_secs(1),
+            acquisition_max: Duration::ZERO,
+            acquisition_max_pcm_start: Duration::ZERO,
+            acquisition_max_pcm_min: Duration::ZERO,
+            decode_max: Duration::ZERO,
+            decode_last: Duration::ZERO,
+            media_last: Duration::ZERO,
+            decoded_segments: 1,
+            waiting_pcm_segments: 0,
+            waiting_pcm_media: Duration::ZERO,
+            http: Some(http(skipped, reauth)),
+        }),
+    };
+    for error in errors {
+        let notice = failure_notice(&error);
+        assert!(!notice.contains("再生停止:"), "{notice}");
+        assert!(!notice.contains("配信取得:"), "{notice}");
+        for stage in stages {
+            assert!(!notice.contains(&format!("{stage}: ")), "{notice}");
+        }
+        let mut screen = screen();
+        screen.apply_playback(radiko::app::playback::Update {
+            stopped: true,
+            ended: true,
+            notice: Some(notice.clone()),
+            snapshot: Some(snapshot(Some(Duration::from_secs(42)), 0, 0)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(screen.playback_notice, notice);
+        assert!(screen.playback_stopped);
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(snapshot(Some(Duration::from_secs(9)), 0, 1)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(
+            screen.playback_notice, notice,
+            "reconnect or renewal replaced the stop"
+        );
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(snapshot(None, 4, 1)),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(screen.playback_notice, notice, "catch-up replaced the stop");
+        assert!(!screen.playback_notice.starts_with("再接続中"));
+    }
 }
 #[test]
 fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {

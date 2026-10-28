@@ -70,6 +70,8 @@ pub struct Update {
     pub new_session: bool,
     pub snapshot: Option<PlaybackSnapshot>,
     pub notice: Option<String>,
+    /// `notice` is a playback failure. Reconnect and catch-up must not replace it.
+    pub stopped: bool,
     pub ended: bool,
     pub final_diagnostics: Option<String>,
 }
@@ -345,12 +347,13 @@ impl Service {
                         ));
                     }
                     // Preserve an undelivered snapshot so the UI can retain diagnostics on failure.
-                    update.notice = Some(match result {
+                    update.stopped = result.is_err();
+                    update.notice = Some(match &result {
                         Ok(report) => match report.reason {
                             playback::EndReason::ProgramEnd => "番組終了".into(),
                             _ => "停止しました".into(),
                         },
-                        Err(error) => format!("再生停止: {error}"),
+                        Err(error) => playback::failure_notice(error),
                     });
                 }
                 // Output is already dropped. Join only so a later session does not accumulate

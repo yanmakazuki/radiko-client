@@ -49,6 +49,91 @@ impl fmt::Display for PlaybackError {
     }
 }
 impl std::error::Error for PlaybackError {}
+
+/// TUI notice for a playback failure.
+/// Window loss, the reconnect limit, and auth expiry are the confirmed sentence alone.
+/// Every other failure keeps the `再生停止:` prefix and the Display chain.
+pub fn failure_notice(error: &PlaybackError) -> String {
+    match confirmed_message(error) {
+        Some(message) => message.to_owned(),
+        None => format!("再生停止: {error}"),
+    }
+}
+
+/// Text after CLI's `エラー:` label.
+/// Confirmed sentences are shown alone. When Display still has a stage or `配信取得:`,
+/// that chain is the following line so the kind is not dropped.
+pub fn cli_playback_body(error: &PlaybackError) -> String {
+    retain_chain(confirmed_message(error), error.to_string())
+}
+
+/// Same rules for a playback `PlaybackError` or a bare `ProbeError`. Other errors are unchanged.
+pub fn cli_error_body(error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(error) = error.downcast_ref::<PlaybackError>() {
+        return cli_playback_body(error);
+    }
+    if let Some(error) = error.downcast_ref::<ProbeError>() {
+        return retain_chain(confirmed_probe(error), error.to_string());
+    }
+    error.to_string()
+}
+
+fn retain_chain(message: Option<&str>, chain: String) -> String {
+    match message {
+        Some(message) if chain != message => format!("{message}\n{chain}"),
+        Some(message) => message.to_owned(),
+        None => chain,
+    }
+}
+
+fn confirmed_message(error: &PlaybackError) -> Option<&'static str> {
+    match error {
+        PlaybackError::ReconnectGaveUp => Some(crate::reconnect::GAVE_UP),
+        PlaybackError::Output(OutputError::ReconnectGaveUp) => Some(crate::reconnect::GAVE_UP),
+        PlaybackError::Source(error) => confirmed_probe(error),
+        PlaybackError::Storage(_)
+        | PlaybackError::LoginRequired
+        | PlaybackError::Auth(_)
+        | PlaybackError::Decode(_)
+        | PlaybackError::Output(_)
+        | PlaybackError::EarlyEnd
+        | PlaybackError::SourceStalled
+        | PlaybackError::Worker => None,
+    }
+}
+
+fn confirmed_probe(error: &ProbeError) -> Option<&'static str> {
+    match error {
+        ProbeError::At(_, inner) => confirmed_probe(inner),
+        ProbeError::WindowLost => Some(ProbeError::WINDOW_LOST),
+        ProbeError::AuthExpired => Some(ProbeError::AUTH_EXPIRED),
+        ProbeError::ReconnectGaveUp => Some(crate::reconnect::GAVE_UP),
+        ProbeError::InvalidInput
+        | ProbeError::InvalidPosition
+        | ProbeError::Network
+        | ProbeError::Cancelled
+        | ProbeError::Http(_)
+        | ProbeError::Authentication
+        | ProbeError::Denied
+        | ProbeError::NotFound
+        | ProbeError::RateLimited
+        | ProbeError::TooLarge
+        | ProbeError::UnsafeUrl
+        | ProbeError::InvalidAuth
+        | ProbeError::OutsideJapan
+        | ProbeError::InvalidXml
+        | ProbeError::InvalidProgram
+        | ProbeError::Upcoming
+        | ProbeError::StillOnAir
+        | ProbeError::Expired
+        | ProbeError::ContractRequired
+        | ProbeError::AvailabilityUnknown
+        | ProbeError::Unavailable
+        | ProbeError::InvalidPlaylist
+        | ProbeError::NoEndpoint => None,
+    }
+}
+
 impl From<OutputError> for PlaybackError {
     fn from(e: OutputError) -> Self {
         Self::Output(e)
@@ -2751,5 +2836,231 @@ mod tests {
             seen.iter().any(|(paused, volume)| *paused && *volume == 10),
             "pause and volume must be applied while waiting, saw {seen:?}"
         );
+    }
+
+    fn probe_code(error: &ProbeError) -> &'static str {
+        match error {
+            ProbeError::At(_, _) => "At",
+            ProbeError::InvalidInput => "InvalidInput",
+            ProbeError::InvalidPosition => "InvalidPosition",
+            ProbeError::Network => "Network",
+            ProbeError::Cancelled => "Cancelled",
+            ProbeError::Http(_) => "Http",
+            ProbeError::Authentication => "Authentication",
+            ProbeError::AuthExpired => "AuthExpired",
+            ProbeError::Denied => "Denied",
+            ProbeError::NotFound => "NotFound",
+            ProbeError::RateLimited => "RateLimited",
+            ProbeError::TooLarge => "TooLarge",
+            ProbeError::UnsafeUrl => "UnsafeUrl",
+            ProbeError::InvalidAuth => "InvalidAuth",
+            ProbeError::OutsideJapan => "OutsideJapan",
+            ProbeError::InvalidXml => "InvalidXml",
+            ProbeError::InvalidProgram => "InvalidProgram",
+            ProbeError::Upcoming => "Upcoming",
+            ProbeError::StillOnAir => "StillOnAir",
+            ProbeError::Expired => "Expired",
+            ProbeError::ContractRequired => "ContractRequired",
+            ProbeError::AvailabilityUnknown => "AvailabilityUnknown",
+            ProbeError::Unavailable => "Unavailable",
+            ProbeError::InvalidPlaylist => "InvalidPlaylist",
+            ProbeError::WindowLost => "WindowLost",
+            ProbeError::NoEndpoint => "NoEndpoint",
+            ProbeError::ReconnectGaveUp => "ReconnectGaveUp",
+        }
+    }
+
+    fn assert_surfaces(error: PlaybackError) {
+        let historical_tui = format!("再生停止: {error}");
+        let historical_cli = format!("エラー: {error}");
+        let tui = failure_notice(&error);
+        let cli = format!("エラー: {}", cli_playback_body(&error));
+        let chain = error.to_string();
+        if let Some(message) = confirmed_message(&error) {
+            assert_eq!(tui, message);
+            assert!(!tui.contains("再生停止:"), "{tui}");
+            assert!(!tui.contains("配信取得:"), "{tui}");
+            for stage in [
+                "HLS一覧更新",
+                "HLS初期化情報取得",
+                "HLS音声取得",
+                "別段階",
+                "外側",
+            ] {
+                assert!(
+                    !tui.contains(&format!("{stage}: ")),
+                    "stage prefix in {tui}"
+                );
+            }
+            assert!(cli.starts_with(&format!("エラー: {message}")), "{cli}");
+            assert!(cli.contains(&chain), "chain missing from stderr: {cli}");
+            assert_ne!(tui, historical_tui);
+            if chain == message {
+                assert_eq!(cli, historical_cli);
+            } else {
+                assert_ne!(cli, historical_cli);
+                let expected = format!("エラー: {message}");
+                let mut lines = cli.lines();
+                assert_eq!(lines.next(), Some(expected.as_str()));
+                assert_eq!(lines.next(), Some(chain.as_str()));
+                assert_eq!(lines.next(), None);
+            }
+        } else {
+            assert_eq!(tui, historical_tui);
+            assert_eq!(cli, historical_cli);
+        }
+    }
+
+    #[test]
+    fn failure_text_changes_only_for_the_three_confirmed_messages() {
+        use crate::api::auth::AuthError;
+        use crate::player::output::OfferedOutputFormat;
+        use crate::storage::StorageError;
+        use std::collections::BTreeSet;
+        let leaves = [
+            ProbeError::InvalidInput,
+            ProbeError::InvalidPosition,
+            ProbeError::Network,
+            ProbeError::Cancelled,
+            ProbeError::Http(503),
+            ProbeError::Authentication,
+            ProbeError::AuthExpired,
+            ProbeError::Denied,
+            ProbeError::NotFound,
+            ProbeError::RateLimited,
+            ProbeError::TooLarge,
+            ProbeError::UnsafeUrl,
+            ProbeError::InvalidAuth,
+            ProbeError::OutsideJapan,
+            ProbeError::InvalidXml,
+            ProbeError::InvalidProgram,
+            ProbeError::Upcoming,
+            ProbeError::StillOnAir,
+            ProbeError::Expired,
+            ProbeError::ContractRequired,
+            ProbeError::AvailabilityUnknown,
+            ProbeError::Unavailable,
+            ProbeError::InvalidPlaylist,
+            ProbeError::WindowLost,
+            ProbeError::NoEndpoint,
+            ProbeError::ReconnectGaveUp,
+        ];
+        let mut seen = BTreeSet::new();
+        for error in leaves {
+            let code = probe_code(&error);
+            assert!(seen.insert(code), "duplicate {code}");
+            let probe_body = cli_error_body(&error);
+            let probe_chain = error.to_string();
+            if let Some(message) = confirmed_probe(&error) {
+                if probe_chain == message {
+                    assert_eq!(probe_body, message);
+                } else {
+                    assert_eq!(probe_body, format!("{message}\n{probe_chain}"));
+                }
+            } else {
+                assert_eq!(probe_body, probe_chain);
+            }
+            assert_surfaces(PlaybackError::Source(error));
+        }
+        assert_eq!(seen.len(), 26, "one row per ProbeError leaf, saw {seen:?}");
+        assert!(!seen.contains("At"));
+        let stages = ["HLS一覧更新", "HLS初期化情報取得", "HLS音声取得", "別段階"];
+        for stage in stages {
+            for inner in [
+                ProbeError::NotFound,
+                ProbeError::Network,
+                ProbeError::Http(503),
+                ProbeError::InvalidPlaylist,
+                ProbeError::WindowLost,
+                ProbeError::AuthExpired,
+                ProbeError::ReconnectGaveUp,
+            ] {
+                assert_surfaces(PlaybackError::Source(ProbeError::At(
+                    stage,
+                    Box::new(inner),
+                )));
+            }
+        }
+        assert_surfaces(PlaybackError::Source(ProbeError::At(
+            "外側",
+            Box::new(ProbeError::At(
+                "HLS音声取得",
+                Box::new(ProbeError::AuthExpired),
+            )),
+        )));
+        assert_surfaces(PlaybackError::LoginRequired);
+        assert_surfaces(PlaybackError::EarlyEnd);
+        assert_surfaces(PlaybackError::SourceStalled);
+        assert_surfaces(PlaybackError::ReconnectGaveUp);
+        assert_surfaces(PlaybackError::Worker);
+        for error in [
+            AuthError::InvalidCredentials,
+            AuthError::SessionExpired,
+            AuthError::Network,
+            AuthError::Cancelled,
+            AuthError::Http(401),
+            AuthError::RateLimited,
+            AuthError::InvalidResponse,
+            AuthError::ResponseTooLarge,
+            AuthError::InvalidInput,
+        ] {
+            assert_surfaces(PlaybackError::Auth(error));
+        }
+        for error in [
+            StorageError::Io(std::io::ErrorKind::PermissionDenied),
+            StorageError::Invalid,
+            StorageError::UnsupportedVersion,
+            StorageError::UnsafePermissions,
+            StorageError::UnsafePath,
+            StorageError::NoDataDirectory,
+        ] {
+            assert_surfaces(PlaybackError::Storage(error));
+        }
+        for error in [
+            AacError::Cancelled,
+            AacError::TooLarge,
+            AacError::InvalidMetadata,
+            AacError::InvalidContainer,
+            AacError::UnsupportedContainer,
+            AacError::InvalidConfig,
+            AacError::InvalidPacket,
+            AacError::InvalidHeader,
+            AacError::TruncatedFrame,
+            AacError::Empty,
+            AacError::TooManyPackets,
+            AacError::UnsupportedTransport,
+            AacError::UnsupportedCodec,
+            AacError::DecodeFailed,
+            AacError::FormatChanged,
+            AacError::InvalidPcm,
+            AacError::DeclaredSbrMissing,
+            AacError::SbrNotReconstructed,
+        ] {
+            assert_surfaces(PlaybackError::Decode(error));
+        }
+        for error in [
+            OutputError::InvalidPcm,
+            OutputError::NoDevice,
+            OutputError::DeviceInfo,
+            OutputError::UnsupportedFormat,
+            OutputError::IncompatibleOutput {
+                requested_rate: 48_000,
+                offered: vec![OfferedOutputFormat {
+                    channels: 2,
+                    min_sample_rate: 44_100,
+                    max_sample_rate: 44_100,
+                    sample_format: "f32",
+                }],
+            },
+            OutputError::Device,
+            OutputError::Stalled,
+            OutputError::ReconnectGaveUp,
+            OutputError::ProbeTimeout,
+            OutputError::Deadline,
+        ] {
+            assert_surfaces(PlaybackError::Output(error));
+        }
+        let unrelated = std::io::Error::other("unchanged");
+        assert_eq!(cli_error_body(&unrelated), unrelated.to_string());
     }
 }

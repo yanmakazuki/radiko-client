@@ -182,13 +182,30 @@ def output_has_started(text, station, start, end, mode):
     return output is not None and output > 0 and target_matches(text, station, start, end, mode)
 
 
+# Confirmed stop sentences are shown without the 再生停止 / 配信取得 / stage prefix.
+# Match them before the generic 配信取得 fallback so they are not left unclassified.
+CONFIRMED_STOPS = (
+    ('window_lost', '通信が長く途切れたため、続きを再生できなくなりました'),
+    ('reconnect_limit', '再接続の上限を超えたため再生を停止しました'),
+    ('auth_expired', '認証期限切れのため再生を停止しました'),
+)
+
+
+def playback_failure_visible(text):
+    if '再生停止:' in text:
+        return True
+    return any(phrase in text for _, phrase in CONFIRMED_STOPS)
+
+
 def failure_diagnostics(text):
     """Only classify a footer notice into fixed labels; never return notice/program text."""
     notice = next((line.strip(' │') for line in text.splitlines()[-8:]
-                   if line.strip(' │').startswith('再生停止:')), None)
+                   if line.strip(' │').startswith('再生停止:')
+                   or any(phrase in line for _, phrase in CONFIRMED_STOPS)), None)
     if notice is None:
         return dict(notice_visible=False, error_kind=None, http_status=None, source_stage=None)
     categories = [
+        *CONFIRMED_STOPS,
         ('source_stalled', '30秒間新しいセグメント'),
         ('worker', '再生ワーカーが予期せず終了'),
         ('early_end', '放送枠末尾より前に配信が終了'),
@@ -304,7 +321,7 @@ def device_check(terminal, proc, master, station, selected, ends_at, wait):
             text = terminal.screen()
             require(proc.poll() is None, 'TUI exited during device verification')
             require_no_alsa_noise(text)
-            saw_error |= '再生停止:' in text
+            saw_error |= playback_failure_visible(text)
             saw_inactive |= '再生中: なし' in text
             if time.monotonic() - last_report >= 10:
                 report(phase='device_observation', awaiting=expected,
@@ -577,7 +594,7 @@ def verify(args, directory):
                    inactive_visible='再生中: なし' in text,
                    stop_notice_visible='停止しました' in text,
                    stopped_diagnostics_visible='停止時:' in text,
-                   playback_error_visible='再生停止:' in text,
+                   playback_error_visible=playback_failure_visible(text),
                    help_visible='┌操作一覧' in text,
                    editor_visible='条件編集中' in text,
                    chapter_visible='公式AIチャプター・閲覧中' in text,
@@ -629,7 +646,7 @@ def verify(args, directory):
                                paused_visible='Paused' in text, playing_visible='Playing' in text,
                                active_target_matches=target_matches(text, args.station, selected, ends_at, expected_mode),
                                inactive_visible='再生中: なし' in text,
-                               playback_error_visible='再生停止:' in text,
+                               playback_error_visible=playback_failure_visible(text),
                                device_error_visible='音声出力機器の開始・実行に失敗' in text,
                                callback_stalled_visible='音声コールバックが進まない' in text,
                                help_visible='┌操作一覧' in text,
