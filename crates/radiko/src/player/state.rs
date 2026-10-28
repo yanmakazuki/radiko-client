@@ -20,6 +20,9 @@ pub struct PlaybackSnapshot {
     pub output: Option<OutputSummary>,
     pub segments: u64,
     pub pipeline: Option<super::diagnostics::Snapshot>,
+    /// Local audio has already played, and the buffer has been empty for at least
+    /// [`crate::reconnect::RECEPTION_AFTER`]. Cleared once [`Self::reconnecting_for`] is set.
+    pub receiving_for: Option<Duration>,
     /// Set while playback is waiting through a suspension or a long input gap.
     pub reconnecting_for: Option<Duration>,
 }
@@ -69,6 +72,7 @@ impl PlaybackSnapshot {
             output,
             segments,
             pipeline: None,
+            receiving_for: None,
             reconnecting_for: None,
         }
     }

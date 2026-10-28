@@ -416,6 +416,7 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
             .unwrap_or("処理診断 未取得")
             .to_owned()
     };
+    // 受信待ち… と再接続中… は、このフッターと同じ通常の状態色で出す。エラー色は付けない。
     let footer = format!(
         "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}\n{}\n{} {}",
         state,

@@ -120,6 +120,15 @@ enum PlaybackAction {
     Command(Command),
     Stop,
 }
+/// Why `playback_notice` is set. Gap text is cleared from this, not from the wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeHold {
+    Other,
+    Receiving,
+    Reconnecting,
+    CatchUp,
+    AuthRenewal,
+}
 struct Screen {
     help_open: bool,
     help_scroll: scroll::Scroll,
@@ -149,8 +158,11 @@ struct Screen {
     chapter_notice: String,
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
+    notice_hold: NoticeHold,
     /// Set from a failed playback update. Not inferred from the notice text.
     playback_stopped: bool,
+    /// The control session ended (program end, stop, or failure). Gap notices stay off.
+    playback_ended: bool,
     seen_reauthentications: u64,
     seen_skipped_segments: u64,
     seen_sequence_resets: u64,

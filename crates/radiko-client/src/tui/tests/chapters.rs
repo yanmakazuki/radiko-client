@@ -98,6 +98,7 @@ fn aligned_chapter_enter_seeks_only_same_timefree_slot_and_switches_other_target
                 sample_format: radiko::player::output::OutputSampleFormat::F32,
             }),
             segments: 1,
+            receiving_for: None,
             reconnecting_for: None,
         });
         screen
@@ -183,6 +184,7 @@ fn chapter_navigation_refresh_and_refused_enter_never_generate_playback_or_searc
         position: Some(Duration::from_secs(8)),
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for: None,
     });
     screen
@@ -451,6 +453,7 @@ fn playback_keys_are_separate_from_search_editing_and_future_slots() {
         volume: 25,
         output: None,
         segments: 1,
+        receiving_for: None,
         reconnecting_for: None,
     });
     for code in [KeyCode::Char('g'), KeyCode::Char('1'), KeyCode::Char('5')] {

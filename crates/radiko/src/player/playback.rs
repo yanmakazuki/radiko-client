@@ -634,6 +634,10 @@ pub(crate) trait AudioSink {
     fn reconnecting_for(&self) -> Option<Duration> {
         None
     }
+    /// Frames still queued for the device. Zero means the local buffer is empty.
+    fn queued_frames(&self) -> u64 {
+        0
+    }
 }
 // Explicit parent shutdown wins over errors observed during the same loop iteration.
 // Check before CancelOnExit runs; otherwise its teardown cancellation would hide real errors.
@@ -675,6 +679,9 @@ impl AudioSink for ContinuousOutput {
     }
     fn reconnecting_for(&self) -> Option<Duration> {
         ContinuousOutput::reconnecting_for(self)
+    }
+    fn queued_frames(&self) -> u64 {
+        ContinuousOutput::queued_frames(self)
     }
 }
 
@@ -746,6 +753,9 @@ impl AudioSink for BoxedSink {
     fn reconnecting_for(&self) -> Option<Duration> {
         self.0.reconnecting_for()
     }
+    fn queued_frames(&self) -> u64 {
+        self.0.queued_frames()
+    }
 }
 #[cfg(test)]
 pub(crate) fn play_idle_with<S: AudioSink>(
@@ -784,21 +794,78 @@ enum Initial<T> {
     Source(T),
     Idle(StreamInfo),
 }
-enum Silence {
-    Continue,
-    Reconnect(Duration),
+/// 「受信待ち…」。再接続の秒数表示に切り替える前の、バッファが空いたあとの状態。
+pub const RECEPTION_NOTICE: &str = "受信待ち…";
+
+pub use crate::reconnect::{NOTICE_AFTER, RECEPTION_AFTER};
+
+/// 「再接続中…（N秒）」。N は新しい PCM が来ない時間で、`NOTICE_AFTER` 以降だけである。
+pub fn reconnect_notice(elapsed: Duration) -> String {
+    format!("再接続中…（{}秒）", elapsed.as_secs())
+}
+
+/// Inputs to [`audible_wait`]. Durations are measured by the caller; this function does not sleep.
+#[derive(Clone, Copy, Debug)]
+pub struct AudibleGap {
+    /// At least one output frame has been played.
+    pub heard: bool,
+    pub paused: bool,
+    /// Program end, including the time-free tail drain.
+    pub ended: bool,
+    /// The worker is still running and no PCM chunk is waiting to be enqueued.
+    pub waiting: bool,
+    /// How long the device queue has been empty while `waiting` and `heard`.
+    pub empty_for: Duration,
+    /// How long since the play loop last received a PCM chunk. Pause does not count.
+    pub since_pcm: Duration,
+    /// Output-device rebuild. Independent of `NOTICE_AFTER`.
+    pub output_reconnecting: Option<Duration>,
+}
+
+/// What the status line should say about a quiet buffer. `GaveUp` stops playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudiblePhase {
+    Quiet,
+    Receiving,
+    Reconnecting(Duration),
     GaveUp,
 }
-fn silence_reconnect(waiting: bool, silent: Duration, output: Option<Duration>) -> Silence {
-    if waiting && silent > crate::reconnect::LIMIT {
-        return Silence::GaveUp;
+
+impl AudiblePhase {
+    /// TUI text for this phase. `None` leaves the current notice to other state.
+    pub fn notice(self) -> Option<String> {
+        match self {
+            Self::Receiving => Some(RECEPTION_NOTICE.to_owned()),
+            Self::Reconnecting(elapsed) => Some(reconnect_notice(elapsed)),
+            Self::Quiet | Self::GaveUp => None,
+        }
     }
-    let input = (waiting && silent >= crate::reconnect::NOTICE_AFTER).then_some(silent);
-    match (input, output) {
-        (Some(left), Some(right)) => Silence::Reconnect(left.max(right)),
-        (Some(elapsed), None) | (None, Some(elapsed)) => Silence::Reconnect(elapsed),
-        (None, None) => Silence::Continue,
+}
+
+/// Buffer-empty 「受信待ち…」, then 「再接続中…（N秒）」 at [`NOTICE_AFTER`].
+///
+/// `NOTICE_AFTER`, playlist backoff, and [`crate::reconnect::LIMIT`] are unchanged.
+/// The reception notice is withheld while paused, before the first played frame,
+/// and at program end. Output-device rebuild still reports reconnecting immediately.
+pub fn audible_wait(gap: AudibleGap) -> AudiblePhase {
+    if gap.waiting && gap.since_pcm > crate::reconnect::LIMIT {
+        return AudiblePhase::GaveUp;
     }
+    if gap.paused || gap.ended || !gap.heard {
+        return AudiblePhase::Quiet;
+    }
+    let input = (gap.waiting && gap.since_pcm >= NOTICE_AFTER).then_some(gap.since_pcm);
+    match (input, gap.output_reconnecting) {
+        (Some(left), Some(right)) => return AudiblePhase::Reconnecting(left.max(right)),
+        (Some(elapsed), None) | (None, Some(elapsed)) => {
+            return AudiblePhase::Reconnecting(elapsed);
+        }
+        (None, None) => {}
+    }
+    if gap.waiting && gap.empty_for >= RECEPTION_AFTER {
+        return AudiblePhase::Receiving;
+    }
+    AudiblePhase::Quiet
 }
 fn reconnect_gave_up(error: &ProbeError) -> bool {
     match error {
@@ -840,6 +907,7 @@ fn play_loop<S: AudioSink>(
     let mut eof = false;
     let mut report_at = Instant::now();
     let mut last_pcm_at = Instant::now();
+    let mut empty_since: Option<Instant> = None;
     let result = 'playback: loop {
         if stop.is_cancelled() {
             break 'playback Ok(PlaybackReport {
@@ -895,6 +963,7 @@ fn play_loop<S: AudioSink>(
                         segments = ready.segments;
                         eof = false;
                         last_pcm_at = Instant::now();
+                        empty_since = None;
                         report_at = Instant::now();
                         control.report(format!("再生切替完了: {} / {:?}", info.station, info.mode));
                     }
@@ -1013,12 +1082,29 @@ fn play_loop<S: AudioSink>(
             && !paused
             && output.as_ref().is_none_or(|o| o.accepted() < maximum);
         let silent_for = last_pcm_at.elapsed();
-        let reconnecting_for = silence_reconnect(
-            waiting_for_audio,
-            silent_for,
-            output.as_ref().and_then(AudioSink::reconnecting_for),
-        );
-        if let Silence::GaveUp = reconnecting_for {
+        let heard = output
+            .as_ref()
+            .is_some_and(|sink| sink.summary().frames > 0);
+        let queued = output.as_ref().map(AudioSink::queued_frames).unwrap_or(0);
+        let buffer_empty = waiting_for_audio && heard && queued == 0;
+        if buffer_empty {
+            if empty_since.is_none() {
+                empty_since = Some(Instant::now());
+            }
+        } else {
+            empty_since = None;
+        }
+        let empty_for = empty_since.map(|start| start.elapsed()).unwrap_or_default();
+        let phase = audible_wait(AudibleGap {
+            heard,
+            paused,
+            ended: eof,
+            waiting: waiting_for_audio,
+            empty_for,
+            since_pcm: silent_for,
+            output_reconnecting: output.as_ref().and_then(AudioSink::reconnecting_for),
+        });
+        if let AudiblePhase::GaveUp = phase {
             break 'playback failure_or_cancelled(
                 &stop,
                 output.as_ref(),
@@ -1074,9 +1160,11 @@ fn play_loop<S: AudioSink>(
                 }
             }
         }
-        if matches!(reconnecting_for, Silence::Reconnect(_))
-            && report_at > Instant::now() + Duration::from_secs(1)
-        {
+        let refresh = matches!(
+            phase,
+            AudiblePhase::Receiving | AudiblePhase::Reconnecting(_)
+        );
+        if refresh && report_at > Instant::now() + Duration::from_secs(1) {
             report_at = Instant::now();
         }
         if running_worker.is_some() && Instant::now() >= report_at {
@@ -1091,15 +1179,18 @@ fn play_loop<S: AudioSink>(
                     .and_then(|control| control.pending_target.clone()),
             );
             snapshot.pipeline = running_worker.as_ref().and_then(Worker::diagnostics);
-            snapshot.reconnecting_for = match reconnecting_for {
-                Silence::Reconnect(elapsed) => Some(elapsed),
-                Silence::Continue | Silence::GaveUp => None,
-            };
+            match phase {
+                AudiblePhase::Reconnecting(elapsed) => {
+                    snapshot.reconnecting_for = Some(elapsed);
+                }
+                AudiblePhase::Receiving => snapshot.receiving_for = Some(empty_for),
+                AudiblePhase::Quiet | AudiblePhase::GaveUp => {}
+            }
             progress(snapshot);
             let interval = controls.as_ref().map_or(Duration::from_secs(5), |control| {
                 control.notification_interval
             });
-            let interval = if matches!(reconnecting_for, Silence::Reconnect(_)) {
+            let interval = if refresh {
                 interval.min(Duration::from_secs(1))
             } else {
                 interval
@@ -2694,40 +2785,89 @@ mod tests {
         assert!(began.elapsed() < Duration::from_secs(1));
         handle.join().unwrap();
     }
+    fn gap(empty_for: Duration, since_pcm: Duration) -> AudibleGap {
+        AudibleGap {
+            heard: true,
+            paused: false,
+            ended: false,
+            waiting: true,
+            empty_for,
+            since_pcm,
+            output_reconnecting: None,
+        }
+    }
     #[test]
     fn silence_shorter_than_thirty_seconds_continues_and_the_limit_gives_up() {
+        let below = RECEPTION_AFTER - Duration::from_nanos(1);
+        assert_eq!(audible_wait(gap(below, below)).notice(), None);
+        assert_eq!(
+            audible_wait(gap(RECEPTION_AFTER, RECEPTION_AFTER)).notice(),
+            Some(RECEPTION_NOTICE.into())
+        );
+        assert_eq!(
+            audible_wait(gap(Duration::from_secs(20), Duration::from_secs(20))),
+            AudiblePhase::Receiving
+        );
         assert!(matches!(
-            silence_reconnect(true, Duration::from_secs(20), None),
-            Silence::Continue
+            audible_wait(gap(NOTICE_AFTER, NOTICE_AFTER)),
+            AudiblePhase::Reconnecting(elapsed) if elapsed == NOTICE_AFTER
         ));
         assert!(matches!(
-            silence_reconnect(true, crate::reconnect::NOTICE_AFTER, None),
-            Silence::Reconnect(elapsed) if elapsed == crate::reconnect::NOTICE_AFTER
+            audible_wait(gap(Duration::from_secs(90), Duration::from_secs(90))),
+            AudiblePhase::Reconnecting(elapsed) if elapsed == Duration::from_secs(90)
         ));
         assert!(matches!(
-            silence_reconnect(true, Duration::from_secs(90), None),
-            Silence::Reconnect(elapsed) if elapsed == Duration::from_secs(90)
+            audible_wait(gap(crate::reconnect::LIMIT, crate::reconnect::LIMIT)),
+            AudiblePhase::Reconnecting(_)
         ));
-        assert!(matches!(
-            silence_reconnect(true, crate::reconnect::LIMIT, None),
-            Silence::Reconnect(_)
-        ));
-        assert!(matches!(
-            silence_reconnect(true, crate::reconnect::LIMIT + Duration::from_secs(1), None),
-            Silence::GaveUp
-        ));
-        assert!(matches!(
-            silence_reconnect(
-                false,
+        assert_eq!(
+            audible_wait(gap(
                 crate::reconnect::LIMIT + Duration::from_secs(1),
-                None
-            ),
-            Silence::Continue
-        ));
+                crate::reconnect::LIMIT + Duration::from_secs(1)
+            )),
+            AudiblePhase::GaveUp
+        );
+        let mut idle = gap(
+            crate::reconnect::LIMIT + Duration::from_secs(1),
+            crate::reconnect::LIMIT + Duration::from_secs(1),
+        );
+        idle.waiting = false;
+        assert_eq!(audible_wait(idle), AudiblePhase::Quiet);
+        let mut device = gap(Duration::ZERO, Duration::ZERO);
+        device.waiting = false;
+        device.output_reconnecting = Some(Duration::from_secs(2));
         assert!(matches!(
-            silence_reconnect(false, Duration::ZERO, Some(Duration::from_secs(2))),
-            Silence::Reconnect(elapsed) if elapsed == Duration::from_secs(2)
+            audible_wait(device),
+            AudiblePhase::Reconnecting(elapsed) if elapsed == Duration::from_secs(2)
         ));
+        for (label, mut suppressed) in [
+            ("paused", {
+                let mut gap = gap(Duration::from_secs(20), Duration::from_secs(20));
+                gap.paused = true;
+                gap
+            }),
+            ("before audio", {
+                let mut gap = gap(Duration::from_secs(40), Duration::from_secs(40));
+                gap.heard = false;
+                gap
+            }),
+            ("program end", {
+                let mut gap = gap(Duration::from_secs(20), Duration::from_secs(40));
+                gap.ended = true;
+                gap
+            }),
+        ] {
+            assert_eq!(audible_wait(suppressed).notice(), None, "{label}");
+            suppressed.output_reconnecting = Some(Duration::from_secs(3));
+            assert_eq!(
+                audible_wait(suppressed).notice(),
+                None,
+                "{label} must hide reconnect text"
+            );
+        }
+        let mut still_buffered = gap(Duration::ZERO, Duration::from_secs(20));
+        still_buffered.empty_for = Duration::ZERO;
+        assert_eq!(audible_wait(still_buffered), AudiblePhase::Quiet);
     }
     #[test]
     fn pause_volume_and_stop_apply_while_the_source_stays_quiet() {

@@ -2447,6 +2447,86 @@ mod tests {
         assert_eq!(lost.next, 11);
         assert_eq!(lost.http.skipped.get(), 0);
     }
+    /// One `#EXTINF:5` segment is already in hand when the stall starts.
+    /// Silence begins when that buffer runs out. Notices use the injected stall clock.
+    fn assert_stall_notices(until: Wait, reconnects: bool) {
+        use crate::player::playback::{
+            AudibleGap, AudiblePhase, NOTICE_AFTER, RECEPTION_AFTER, RECEPTION_NOTICE, audible_wait,
+        };
+        let buffered = Wait::from_secs(5);
+        assert!(String::from_utf8_lossy(&media(10, 1, false, "a", false)).contains("#EXTINF:5,"));
+        let mut first_receiving = None;
+        let mut first_reconnect = None;
+        let mut t = Wait::ZERO;
+        while t < until {
+            let phase = audible_wait(AudibleGap {
+                heard: true,
+                paused: false,
+                ended: false,
+                waiting: true,
+                empty_for: t.saturating_sub(buffered),
+                since_pcm: t,
+                output_reconnecting: None,
+            });
+            match phase.notice() {
+                Some(text) if text == RECEPTION_NOTICE => {
+                    first_receiving.get_or_insert(t);
+                    assert!(t < NOTICE_AFTER, "reception ran into the reconnect window");
+                }
+                Some(text) => {
+                    assert!(text.starts_with("再接続中…（"));
+                    assert!(text.ends_with("秒）"));
+                    assert_eq!(
+                        text,
+                        crate::player::playback::reconnect_notice(t),
+                        "reconnect seconds follow since_pcm"
+                    );
+                    first_reconnect.get_or_insert(t);
+                }
+                None => {
+                    assert!(t < buffered + RECEPTION_AFTER);
+                }
+            }
+            t += Wait::from_secs(1);
+        }
+        assert_eq!(first_receiving, Some(buffered + RECEPTION_AFTER));
+        if reconnects {
+            assert_eq!(first_reconnect, Some(NOTICE_AFTER));
+            assert!(NOTICE_AFTER < until);
+        } else {
+            assert_eq!(first_reconnect, None);
+            assert!(until < NOTICE_AFTER);
+        }
+        let recovered = audible_wait(AudibleGap {
+            heard: true,
+            paused: false,
+            ended: false,
+            waiting: false,
+            empty_for: Wait::ZERO,
+            since_pcm: Wait::ZERO,
+            output_reconnecting: None,
+        });
+        assert_eq!(recovered, AudiblePhase::Quiet);
+        assert_eq!(recovered.notice(), None);
+    }
+    #[test]
+    fn injected_clock_playlist_outage_shows_reception_before_reconnect_for_live_and_timefree() {
+        let cases = [
+            (true, 22, media(13, 3, false, "b", false), false),
+            (false, 22, media(11, 1, false, "b", false), false),
+            (true, 60, media(13, 6, false, "b", false), true),
+            (false, 60, media(11, 1, false, "b", false), true),
+        ];
+        for (live, seconds, playlist, reconnects) in cases {
+            let until = Wait::from_secs(seconds);
+            let mut source = outage(live, until, playlist, false, false);
+            let segment = next_segment(&mut source);
+            assert_eq!(segment.bytes, vec![1], "live={live} outage={seconds}");
+            assert!(waited(&source) >= until);
+            assert!(waited(&source) < crate::reconnect::LIMIT);
+            assert_stall_notices(until, reconnects);
+        }
+    }
     #[test]
     fn timefree_lost_window_is_window_lost_and_does_not_skip_ahead() {
         let mut source = reader(

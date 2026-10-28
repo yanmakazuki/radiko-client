@@ -552,6 +552,7 @@ mod tests {
             volume: 0,
             position: Some(Duration::from_secs(1)),
             segments: 1,
+            receiving_for: None,
             reconnecting_for: None,
             output: Some(OutputSummary {
                 frames: 48000,
