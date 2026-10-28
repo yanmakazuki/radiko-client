@@ -4,6 +4,14 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：検証スクリプトは、親が SIGINT を無視していても中断する
+
+`scripts/verify_tui_playback.py` は SIGTERM と SIGHUP だけを KeyboardInterrupt にしていた。SIGINT は Python の既定ハンドラー任せである。親が SIGINT を無視していると、その無視が子へ引き継がれ、Python は既定ハンドラーを入れない。Ctrl+C が届かず、一時ディレクトリは消えず、終了コード 130 にもならない。通常の端末と CI では親が無視しないので、この失敗は出ない。
+
+直しは、SIGINT にも同じ中断ハンドラーを入れることである。通常のシェルでは、これまでどおり KeyboardInterrupt で一時ディレクトリを消し、終了コード 130 で戻る。子の radiko-client の起動方法は変えていない。
+
+確認は、取得処理を偽物に置き換えた隔離プロセスである。radiko への接続、アカウント、音声は使っていない。通常のシェルと、`trap '' INT` で SIGINT を無視したシェルの両方で `python3 -m unittest discover -s scripts -p 'test_*.py'` が 51 件成功した。親が SIGINT を無視したまま子を起動するテストも足した。Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）で `cargo +stable test --workspace --all-targets --all-features` は 365 件成功、失敗 0、ignored 2 件である。この変更で Rust のテストは足していない。実機の再生は確認していない。
+
 ## 2026年10月28日：origin/main の配信窓と再接続を、ProbeError の表示とローカル HTTP テストへ合わせる
 
 `origin/main`（#39）を merge commit で取り込んだ。衝突は `crates/radiko/src/api/stream.rs`、`docs/implementation.md`、`docs/validation.md` である。`http.rs` と `playback.rs` は自動で合わさった。`ProbeError` は `NotFound`、`WindowLost`、`ReconnectGaveUp` を残し、表示は一段の網羅的な `match` のままにした。`unreachable!` は戻していない。`WindowLost` の文言と、再接続の上限文言は main のままである。再生の再接続、ライブの追いつきと巻き戻り、失効した chunklist を最初の配信 URL から取り直す処理も残した。ローカル HTTP の 4 件は通常の `cargo test` のままである。文書は両方の記録を残し、新しい日付を前にした。
