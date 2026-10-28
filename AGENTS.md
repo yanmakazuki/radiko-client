@@ -8,7 +8,7 @@ This macOS and Linux Rust client provides filtered station and regional/nationwi
 
 The workspace has two crates. `crates/radiko` (`radiko`) is the screen-free library: domain, catalog selection, `api` HTTP/parsing, player, storage, session, and app services. `crates/radiko-client` is the CLI and Ratatui TUI and depends on `radiko`. Shared synthetic assets stay in `tests/fixtures/`.
 
-- `crates/radiko/src/app.rs` and `crates/radiko/src/app/search.rs`: main-loop-owned search state, editing, request generations, and bounded cancellable acquisition; `crates/radiko-client/src/tui.rs`: Ratatui search/playback frontend and terminal restoration.
+- `crates/radiko/src/app.rs` and `crates/radiko/src/app/search.rs`: main-loop-owned search state, editing, request generations, and bounded cancellable acquisition; `crates/radiko-client/src/tui.rs` (event loop and terminal restoration), `crates/radiko-client/src/tui/screen.rs` (state and keys), and `crates/radiko-client/src/tui/draw.rs` (rendering): Ratatui search/playback frontend. Test bodies included by `tui.rs` live in `crates/radiko-client/src/tui_tests_*.rs`.
 - `crates/radiko/src/app/playback.rs`: bounded TUI playback commands, session resolution, snapshots, and output shutdown.
 - `crates/radiko/src/app/chapters.rs`: chapter request generations, bounded acquisition, and origin/slot-bound jump validation; listening permission is rechecked by playback.
 - `crates/radiko/src/app/auth.rs`: asynchronous session checks, explicit login/logout jobs, and contract-only snapshots; credential drafts are zeroized and never logged.
@@ -94,7 +94,7 @@ macOSとLinux向けのRust製radiko TUIクライアントを開発する。全�
 
 ## 構成と実装ルール
 
-- ワークスペースはライブラリクレート `radiko`（`crates/radiko`）と、CLI・TUI のバイナリ `radiko-client`（`crates/radiko-client`）に分ける。ライブラリは `api`、`catalog`、`player`、`app`、`domain`、`storage` の責務を分離し、画面の依存を持たない。画面のコードは `crates/radiko-client/src/tui.rs` と `crates/radiko-client/src/tui/` にある。アプリ状態は単一イベントループで更新し、処理領域ごとの要求ID・世代で古い結果を破棄する。
+- ワークスペースはライブラリクレート `radiko`（`crates/radiko`）と、CLI・TUI のバイナリ `radiko-client`（`crates/radiko-client`）に分ける。ライブラリは `api`、`catalog`、`player`、`app`、`domain`、`storage` の責務を分離し、画面の依存を持たない。画面のコードは `crates/radiko-client/src/tui.rs`、`crates/radiko-client/src/tui/`（`screen.rs` が状態とキー、`draw.rs` が描画）、および `tui.rs` が取り込む `tui_tests_*.rs` にある。アプリ状態は単一イベントループで更新し、処理領域ごとの要求ID・世代で古い結果を破棄する。
 - 採用技術は設計書に従う。依存ライブラリの対応形式・API・featureは公式資料と実際の採用バージョンで確認する。
 - アプリケーション用の`Cargo.lock`を管理する。
 - 画面から通信・デコード処理を直接実行せず、コマンドと状態通知を介して連携する。

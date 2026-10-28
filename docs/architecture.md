@@ -42,7 +42,7 @@ flowchart LR
 | 場所 | 役割 |
 | --- | --- |
 | `radiko-client` の `main.rs` | 引数、終了コード、プローブ系 CLI |
-| `radiko-client` の `tui.rs` と `tui/` | キーを操作へ変え、状態を描く。端末の復元。通信とデコードは呼ばない |
+| `radiko-client` の `tui.rs`、`tui/screen.rs`、`tui/draw.rs` と `tui/` | キーを操作へ変え、状態を描く。端末の復元。通信とデコードは呼ばない。テスト本体は `tui.rs` と同じ階層の `tui_tests_*.rs` |
 | `app.rs` と `app/` | メインループが所有する状態。検索、再生、チャプター、認証、名前付き条件のサービス |
 | `domain.rs` と `domain/search.rs` | 放送枠、放送日、状態、検索条件、チャプター、聴取可否の表示 |
 | `catalog.rs` と `catalog/search.rs` | 地域から局を選び、最大4並列で取得し、条件を適用する |
