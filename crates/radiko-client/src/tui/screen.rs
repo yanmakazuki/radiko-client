@@ -1,5 +1,6 @@
+use super::*;
 impl Screen {
-    fn new(criteria: SearchCriteria, preferences_notice: String) -> Self {
+    pub(super) fn new(criteria: SearchCriteria, preferences_notice: String) -> Self {
         Self {
             help_open: false,
             help_scroll: scroll::Scroll::default(),
@@ -43,7 +44,7 @@ impl Screen {
             offline: false,
         }
     }
-    fn dispatch_requested(
+    pub(super) fn dispatch_requested(
         &mut self,
         player: &mut PlaybackService,
         authentication: &mut AuthService,
@@ -87,7 +88,11 @@ impl Screen {
         self.dispatch_playback(player, Utc::now().fixed_offset());
         Ok(())
     }
-    fn dispatch_playback(&mut self, player: &mut PlaybackService, now: DateTime<FixedOffset>) {
+    pub(super) fn dispatch_playback(
+        &mut self,
+        player: &mut PlaybackService,
+        now: DateTime<FixedOffset>,
+    ) {
         let Some(action) = self.playback_action.take() else {
             return;
         };
@@ -123,7 +128,7 @@ impl Screen {
             Err(reason) => self.playback_notice = reason.into(),
         }
     }
-    fn apply_playback(&mut self, update: playback::Update) {
+    pub(super) fn apply_playback(&mut self, update: playback::Update) {
         if update.new_session {
             self.app.playback = None;
             self.playback_diagnostics.clear();
@@ -219,14 +224,14 @@ impl Screen {
             self.playback_notice = notice;
         }
     }
-    fn rows(&self) -> &[usize] {
+    pub(super) fn rows(&self) -> &[usize] {
         if self.live_mode {
             &self.live_rows
         } else {
             &self.app.visible
         }
     }
-    fn rebuild_live(&mut self, now: DateTime<FixedOffset>) {
+    pub(super) fn rebuild_live(&mut self, now: DateTime<FixedOffset>) {
         self.last_live_time = Some(now);
         self.live_rows = self
             .app
@@ -249,7 +254,7 @@ impl Screen {
             .filter(|time| *time > now)
             .min();
     }
-    fn restore_selection(&mut self, key: Option<radiko::domain::ProgramKey>) {
+    pub(super) fn restore_selection(&mut self, key: Option<radiko::domain::ProgramKey>) {
         let position = key.and_then(|key| {
             self.rows()
                 .iter()
@@ -267,7 +272,7 @@ impl Screen {
         };
         self.list.select(selected);
     }
-    fn refresh_live(&mut self, now: DateTime<FixedOffset>) {
+    pub(super) fn refresh_live(&mut self, now: DateTime<FixedOffset>) {
         if !self.live_mode {
             return;
         }
@@ -280,7 +285,7 @@ impl Screen {
         }
         self.last_live_time = Some(now);
     }
-    fn toggle_live(&mut self, service: &mut Service) -> Result<(), &'static str> {
+    pub(super) fn toggle_live(&mut self, service: &mut Service) -> Result<(), &'static str> {
         let criteria = if self.live_mode {
             self.timefree_criteria
                 .take()
@@ -298,13 +303,13 @@ impl Screen {
         self.app.edit_criteria(criteria)?;
         self.submit(service)
     }
-    fn selected(&self) -> Option<&Program> {
+    pub(super) fn selected(&self) -> Option<&Program> {
         self.list
             .selected()
             .and_then(|i| self.rows().get(i))
             .and_then(|i| self.app.programs.get(*i))
     }
-    fn submit(&mut self, service: &mut Service) -> Result<(), &'static str> {
+    pub(super) fn submit(&mut self, service: &mut Service) -> Result<(), &'static str> {
         if self.app.chapters.target.is_some() {
             self.close_chapters();
         }
@@ -337,13 +342,13 @@ impl Screen {
         service.submit(id, self.app.committed.clone());
         Ok(())
     }
-    fn apply(&mut self, event: radiko::app::search::Event) {
+    pub(super) fn apply(&mut self, event: radiko::app::search::Event) {
         let key = self.selected().map(|p| p.key.clone());
         self.app.apply(event);
         self.rebuild_live(Utc::now().fixed_offset());
         self.restore_selection(key);
     }
-    fn open_chapters(&mut self, target: Program) -> Result<(), &'static str> {
+    pub(super) fn open_chapters(&mut self, target: Program) -> Result<(), &'static str> {
         let id = self.app.chapters.open(target.clone())?;
         self.chapter_list.select(None);
         self.chapter_summary_focused = false;
@@ -360,7 +365,7 @@ impl Screen {
         self.chapter_notice.clear();
         self.chapter_action = Some(ChapterAction::Cancel);
     }
-    fn named_event(&mut self, event: NamedEvent) -> Result<(), &'static str> {
+    pub(super) fn named_event(&mut self, event: NamedEvent) -> Result<(), &'static str> {
         if event.mutating {
             self.preferences_notice = named_receipt(&event.result);
         }
@@ -390,7 +395,7 @@ impl Screen {
         }
         Ok(())
     }
-    fn dispatch_named(&mut self, service: &mut NamedService) {
+    pub(super) fn dispatch_named(&mut self, service: &mut NamedService) {
         if let Some(operation) = self.named_action.take() {
             if let Some(manager) = &mut self.named {
                 if let Err(error) = service.submit(manager.view, operation) {
@@ -399,7 +404,11 @@ impl Screen {
             }
         }
     }
-    fn key(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
+    pub(super) fn key(
+        &mut self,
+        key: KeyEvent,
+        service: &mut Service,
+    ) -> Result<bool, &'static str> {
         if key.kind == KeyEventKind::Release
             || (key.kind == KeyEventKind::Repeat && key.code == KeyCode::Enter)
         {
@@ -844,7 +853,7 @@ impl Screen {
         }
         Ok(false)
     }
-    fn control_hint(&self) -> String {
+    pub(super) fn control_hint(&self) -> String {
         if self.login.is_some() {
             return "Tab 入力欄 / Enter 次の欄・ログイン確定 / Ctrl+U 消去 / Esc 取消 / Ctrl+C 終了"
                 .into();

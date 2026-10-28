@@ -1,4 +1,5 @@
-fn local(time: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+use super::*;
+pub(super) fn local(time: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
     FixedOffset::east_opt(9 * 3600)
         .map(|zone| time.with_timezone(&zone))
         .unwrap_or(time)
@@ -23,7 +24,7 @@ fn classes(ids: &[String], empty: bool) -> String {
     }
 }
 // Display a bounded preview of common schedule HTML; this is not a browser renderer.
-fn preview(text: &str) -> String {
+pub(super) fn preview(text: &str) -> String {
     let mut chars = text.chars().take(12_000).peekable();
     let mut output = String::new();
     while let Some(c) = chars.next() {
@@ -437,7 +438,7 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
         area,
     );
 }
-fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
+pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     if screen.failures_open {
         failures::draw(
             frame,

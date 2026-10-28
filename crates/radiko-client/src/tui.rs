@@ -15,6 +15,7 @@ macro_rules! dialog_close_hint {
     };
 }
 mod areas;
+mod draw;
 mod failures;
 mod filters;
 mod help;
@@ -22,12 +23,16 @@ mod login;
 mod named;
 mod offline;
 mod picker;
+mod screen;
 mod scroll;
 mod seek;
 mod viewport;
 use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+#[cfg(test)]
+use draw::preview;
+use draw::{draw, local};
 use radiko::{
     api::catalog::CatalogClient,
     app::{
@@ -471,4 +476,8 @@ mod tests {
         let criteria = crate::programs::criteria(&["TBS".into(), "20261015".into()], now).unwrap();
         Screen::new(criteria, String::new())
     }
+    include!("tui_tests_editing.rs");
+    include!("tui_tests_status.rs");
+    include!("tui_tests_keys.rs");
+    include!("tui_tests_chapters.rs");
 }
