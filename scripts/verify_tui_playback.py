@@ -888,6 +888,11 @@ def main():
         parser.error('timefree-end cannot be combined with device, sleep, pause or restart checks')
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
+    # Python installs its KeyboardInterrupt handler only when SIGINT is still
+    # the default at startup. A parent that ignores SIGINT (nohup, trap '' INT)
+    # leaves this process ignoring it, so Ctrl+C never reaches the cleanup below.
+    # The handler raises the same KeyboardInterrupt a normal shell already gets.
+    signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGHUP, interrupt)
     try:

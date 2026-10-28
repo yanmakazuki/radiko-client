@@ -4,6 +4,12 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：origin/main のオフライン TUI スモークを、SIGINT の中断へ合わせる
+
+`origin/main`（#53）を merge commit で取り込んだ。衝突は `docs/implementation.md` と `docs/validation.md` だけである。コードの衝突はなかった。#53 の `tui --offline`、`scripts/smoke_tui.py`、Ubuntu のスモーク手順と、検証スクリプトの SIGINT ハンドラーは両方残した。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 370 件成功、失敗 0、ignored 2 件（`native_muted`）である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は、通常のシェルと `trap '' INT` の両方で 56 件成功である。Rust 1.85.0 はこの環境では再ビルドしていない。radiko への通信と実機の再生はない。
+
 ## 2026年10月28日：オフライン確認はファイルを触らず、CIではネットワークのない名前空間で起動する
 
 clap は外した。`Cargo.toml` と `Cargo.lock` は main と同じである。`--offline` は手書きの引数分解のままで、`USAGE` とトップの `--help` には書かない。`tui --offline --help` は使い方を出して終了 0 になる。
@@ -27,6 +33,14 @@ macOS の `openpty` はウィンドウサイズを `*mut` で受け取る。Linu
 Checks の ubuntu-24.04（Format, lint, and tests）が、Rust と Python のテストのあと `scripts/smoke_tui.py` を実行する。疑似端末は 40 行 160 列。`tui --offline TBS` を一時の `--data-dir` で起動し、操作一覧、検索条件、取得状況、ライブ画面を切り替えて `q` で終了する。終了コード 0、端末属性と代替画面の復元、出力に `ALSA lib` と `panicked` がないこと、TCP と UDP のソケットを開かないことを見る。macOS のジョブと Rust 1.85.0 のジョブにはこの手順はない。`scripts/verify_tui_playback.py` のシグナル処理は変えていない。
 
 確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 369 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 clippy` と同じオプションのテストも 369 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 53 件成功である。同じデバッグビルドで `scripts/smoke_tui.py` を 10 回連続で実行し、10 回とも終了 0、端末復元、禁止文字列なしだった。音声デバイスは使っていない。radiko への通信はない。実機の再生確認ではない。
+
+## 2026年10月28日：検証スクリプトは、親が SIGINT を無視していても中断する
+
+`scripts/verify_tui_playback.py` は SIGTERM と SIGHUP だけを KeyboardInterrupt にしていた。SIGINT は Python の既定ハンドラー任せである。親が SIGINT を無視していると、その無視が子へ引き継がれ、Python は既定ハンドラーを入れない。Ctrl+C が届かず、一時ディレクトリは消えず、終了コード 130 にもならない。通常の端末と CI では親が無視しないので、この失敗は出ない。
+
+直しは、SIGINT にも同じ中断ハンドラーを入れることである。通常のシェルでは、これまでどおり KeyboardInterrupt で一時ディレクトリを消し、終了コード 130 で戻る。子の radiko-client の起動方法は変えていない。
+
+確認は、取得処理を偽物に置き換えた隔離プロセスである。radiko への接続、アカウント、音声は使っていない。通常のシェルと、`trap '' INT` で SIGINT を無視したシェルの両方で `python3 -m unittest discover -s scripts -p 'test_*.py'` が 51 件成功した。親が SIGINT を無視したまま子を起動するテストも足した。Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）で `cargo +stable test --workspace --all-targets --all-features` は 365 件成功、失敗 0、ignored 2 件である。この変更で Rust のテストは足していない。実機の再生は確認していない。
 
 ## 2026年10月28日：origin/main の配信窓と再接続を、ProbeError の表示とローカル HTTP テストへ合わせる
 
