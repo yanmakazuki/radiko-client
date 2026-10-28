@@ -4,6 +4,14 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：終了キーの扱いを表で固定する
+
+画面内ヘルプと `tui --help` は、番組一覧の終了を同じ句「通常画面のq / Esc、またはCtrl+Cで終了」で書く。ログアウト確認は「ログアウトはyで確定、n / Escで取消、qで終了」で、`q` は終了のままである。取消は `n` と Esc である。キーワード編集の `q` は文字である。操作一覧と取得状況の `q` と Esc は閉じる。Ctrl+C はどの画面でも終了する。
+
+#17 の通常画面 Esc の変更、#22 の `n` と `o`、#23 の `=` は main にないので、表には入れてない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 371 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 371 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 56 件成功である。radiko への通信と実機の再生はない。
+
 ## 2026年10月28日：origin/main のオフライン TUI スモークを、SIGINT の中断へ合わせる
 
 `origin/main`（#53）を merge commit で取り込んだ。衝突は `docs/implementation.md` と `docs/validation.md` だけである。コードの衝突はなかった。#53 の `tui --offline`、`scripts/smoke_tui.py`、Ubuntu のスモーク手順と、検証スクリプトの SIGINT ハンドラーは両方残した。
