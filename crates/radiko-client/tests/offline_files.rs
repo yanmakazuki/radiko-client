@@ -26,6 +26,38 @@ fn place(dir: &Path) {
     }
 }
 
+/// macOS `openpty` takes `*mut winsize`. Linux takes `*const`.
+fn open_pty(
+    master: *mut libc::c_int,
+    slave: *mut libc::c_int,
+    winsize: libc::winsize,
+) -> libc::c_int {
+    #[cfg(target_os = "macos")]
+    let mut winsize = winsize;
+    unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            libc::openpty(
+                master,
+                slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut winsize,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            libc::openpty(
+                master,
+                slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &winsize,
+            )
+        }
+    }
+}
+
 fn unchanged(dir: &Path) {
     assert_eq!(fs::read(dir.join("session.json")).unwrap(), SESSION);
     assert_eq!(fs::read(dir.join("searches.json")).unwrap(), SEARCHES);
@@ -102,21 +134,16 @@ fn offline_tui_leaves_session_and_search_files_untouched() {
 
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let winsize = libc::winsize {
-        ws_row: 40,
-        ws_col: 160,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let opened = unsafe {
-        libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &winsize,
-        )
-    };
+    let opened = open_pty(
+        &mut master_fd,
+        &mut slave_fd,
+        libc::winsize {
+            ws_row: 40,
+            ws_col: 160,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    );
     assert_eq!(opened, 0, "openpty failed");
     let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
     let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
