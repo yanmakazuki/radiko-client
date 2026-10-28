@@ -32,6 +32,7 @@ impl Screen {
             playback_notice: String::new(),
             notice_hold: super::NoticeHold::Other,
             notice_hold_until: None,
+            notice_clock: None,
             playback_stopped: false,
             playback_ended: false,
             seen_reauthentications: 0,
@@ -132,8 +133,15 @@ impl Screen {
             Err(reason) => self.show_notice(reason),
         }
     }
+    fn playback_now(&self) -> std::time::Instant {
+        self.notice_clock.unwrap_or_else(std::time::Instant::now)
+    }
     pub(super) fn apply_playback(&mut self, update: playback::Update) {
-        self.apply_playback_at(update, std::time::Instant::now());
+        self.apply_playback_at(update, self.playback_now());
+    }
+    #[cfg(test)]
+    pub(super) fn set_notice_clock(&mut self, now: std::time::Instant) {
+        self.notice_clock = Some(now);
     }
     pub(super) fn apply_playback_at(&mut self, update: playback::Update, now: std::time::Instant) {
         if update.new_session {
@@ -291,9 +299,10 @@ impl Screen {
         self.notice_hold = super::NoticeHold::Action;
         self.notice_hold_until = Some(now + super::NOTICE_HOLD);
     }
-    fn show_notice(&mut self, notice: impl Into<String>) {
+    pub(super) fn show_notice(&mut self, notice: impl Into<String>) {
+        let now = self.playback_now();
         self.playback_notice = notice.into();
-        self.hold_action(std::time::Instant::now());
+        self.hold_action(now);
     }
     pub(super) fn rows(&self) -> &[usize] {
         if self.live_mode {

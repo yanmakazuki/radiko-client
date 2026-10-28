@@ -174,8 +174,10 @@ struct Screen {
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
     notice_hold: NoticeHold,
-    /// Catch-up and auth text stay until this instant. Gap notices wait.
+    /// Catch-up, auth, and action text stay until this instant. Gap notices wait.
     notice_hold_until: Option<std::time::Instant>,
+    /// Test clock. Empty in production, so notices use the wall clock.
+    notice_clock: Option<std::time::Instant>,
     /// Set from a failed playback update. Not inferred from the notice text.
     playback_stopped: bool,
     /// The control session ended (program end, stop, or failure). Gap notices stay off.
