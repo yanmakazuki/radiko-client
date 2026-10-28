@@ -27,6 +27,7 @@ pub enum PlaybackError {
     Output(OutputError),
     EarlyEnd,
     SourceStalled,
+    ReconnectGaveUp,
     Worker,
 }
 impl fmt::Display for PlaybackError {
@@ -42,6 +43,7 @@ impl fmt::Display for PlaybackError {
             Self::SourceStalled => {
                 f.write_str("30秒間新しいセグメントを確認できないため停止しました")
             }
+            Self::ReconnectGaveUp => f.write_str(crate::reconnect::GAVE_UP),
             Self::Worker => f.write_str("再生ワーカーが予期せず終了しました"),
         }
     }
@@ -334,15 +336,20 @@ pub(super) fn worker(mut source: impl SegmentSource, stop: StopToken) -> (Worker
                 Ok(next) => next,
                 Err(error) => {
                     enter(Stage::Finished);
-                    send(&tx, Event::Failed(PlaybackError::Source(error)), &control);
+                    let failed = if reconnect_gave_up(&error) {
+                        PlaybackError::ReconnectGaveUp
+                    } else {
+                        PlaybackError::Source(error)
+                    };
+                    send(&tx, Event::Failed(failed), &control);
                     break;
                 }
             };
             match next {
                 Next::Pending(delay) => {
                     enter(Stage::Waiting);
-                    if last_segment.elapsed() > Duration::from_secs(30) {
-                        send(&tx, Event::Failed(PlaybackError::SourceStalled), &control);
+                    if last_segment.elapsed() > crate::reconnect::LIMIT {
+                        send(&tx, Event::Failed(PlaybackError::ReconnectGaveUp), &control);
                         break;
                     }
                     let until = Instant::now() + delay.min(Duration::from_secs(1));
@@ -539,6 +546,9 @@ pub(crate) trait AudioSink {
     fn summary(&self) -> OutputSummary;
     fn poll(&mut self) -> Result<bool, OutputError>;
     fn finish(&mut self);
+    fn reconnecting_for(&self) -> Option<Duration> {
+        None
+    }
 }
 // Explicit parent shutdown wins over errors observed during the same loop iteration.
 // Check before CancelOnExit runs; otherwise its teardown cancellation would hide real errors.
@@ -577,6 +587,9 @@ impl AudioSink for ContinuousOutput {
     }
     fn finish(&mut self) {
         self.finish();
+    }
+    fn reconnecting_for(&self) -> Option<Duration> {
+        ContinuousOutput::reconnecting_for(self)
     }
 }
 
@@ -645,6 +658,9 @@ impl AudioSink for BoxedSink {
     fn finish(&mut self) {
         self.0.finish();
     }
+    fn reconnecting_for(&self) -> Option<Duration> {
+        self.0.reconnecting_for()
+    }
 }
 #[cfg(test)]
 pub(crate) fn play_idle_with<S: AudioSink>(
@@ -682,6 +698,29 @@ fn play_with<S: AudioSink>(
 enum Initial<T> {
     Source(T),
     Idle(StreamInfo),
+}
+enum Silence {
+    Continue,
+    Reconnect(Duration),
+    GaveUp,
+}
+fn silence_reconnect(waiting: bool, silent: Duration, output: Option<Duration>) -> Silence {
+    if waiting && silent > crate::reconnect::LIMIT {
+        return Silence::GaveUp;
+    }
+    let input = (waiting && silent >= crate::reconnect::NOTICE_AFTER).then_some(silent);
+    match (input, output) {
+        (Some(left), Some(right)) => Silence::Reconnect(left.max(right)),
+        (Some(elapsed), None) | (None, Some(elapsed)) => Silence::Reconnect(elapsed),
+        (None, None) => Silence::Continue,
+    }
+}
+fn reconnect_gave_up(error: &ProbeError) -> bool {
+    match error {
+        ProbeError::ReconnectGaveUp => true,
+        ProbeError::At(_, inner) => reconnect_gave_up(inner),
+        _ => false,
+    }
 }
 fn play_loop<S: AudioSink>(
     initial: Initial<impl SegmentSource>,
@@ -883,17 +922,23 @@ fn play_loop<S: AudioSink>(
                 }
             }
         }
-        if running_worker.is_some()
+        let waiting_for_audio = running_worker.is_some()
             && current.is_none()
             && !eof
-            && !output.as_ref().is_some_and(|o| o.accepted() >= maximum)
-            && last_pcm_at.elapsed() > Duration::from_secs(30)
-        {
+            && !paused
+            && !output.as_ref().is_some_and(|o| o.accepted() >= maximum);
+        let silent_for = last_pcm_at.elapsed();
+        let reconnecting_for = silence_reconnect(
+            waiting_for_audio,
+            silent_for,
+            output.as_ref().and_then(AudioSink::reconnecting_for),
+        );
+        if let Silence::GaveUp = reconnecting_for {
             break 'playback failure_or_cancelled(
                 &stop,
                 output.as_ref(),
                 segments,
-                PlaybackError::SourceStalled,
+                PlaybackError::ReconnectGaveUp,
             );
         }
         if let Some(out) = output.as_mut() {
@@ -944,6 +989,11 @@ fn play_loop<S: AudioSink>(
                 }
             }
         }
+        if matches!(reconnecting_for, Silence::Reconnect(_))
+            && report_at > Instant::now() + Duration::from_secs(1)
+        {
+            report_at = Instant::now();
+        }
         if running_worker.is_some() && Instant::now() >= report_at {
             let mut snapshot = Progress::active(
                 &info,
@@ -956,11 +1006,20 @@ fn play_loop<S: AudioSink>(
                     .and_then(|control| control.pending_target.clone()),
             );
             snapshot.pipeline = running_worker.as_ref().and_then(Worker::diagnostics);
+            snapshot.reconnecting_for = match reconnecting_for {
+                Silence::Reconnect(elapsed) => Some(elapsed),
+                Silence::Continue | Silence::GaveUp => None,
+            };
             progress(snapshot);
-            report_at = Instant::now()
-                + controls.as_ref().map_or(Duration::from_secs(5), |control| {
-                    control.notification_interval
-                });
+            let interval = controls.as_ref().map_or(Duration::from_secs(5), |control| {
+                control.notification_interval
+            });
+            let interval = if matches!(reconnecting_for, Silence::Reconnect(_)) {
+                interval.min(Duration::from_secs(1))
+            } else {
+                interval
+            };
+            report_at = Instant::now() + interval;
         }
         thread::sleep(Duration::from_millis(5));
     };
@@ -2549,5 +2608,148 @@ mod tests {
         assert!(report.output.is_none());
         assert!(began.elapsed() < Duration::from_secs(1));
         handle.join().unwrap();
+    }
+    #[test]
+    fn silence_shorter_than_thirty_seconds_continues_and_the_limit_gives_up() {
+        assert!(matches!(
+            silence_reconnect(true, Duration::from_secs(20), None),
+            Silence::Continue
+        ));
+        assert!(matches!(
+            silence_reconnect(true, crate::reconnect::NOTICE_AFTER, None),
+            Silence::Reconnect(elapsed) if elapsed == crate::reconnect::NOTICE_AFTER
+        ));
+        assert!(matches!(
+            silence_reconnect(true, Duration::from_secs(90), None),
+            Silence::Reconnect(elapsed) if elapsed == Duration::from_secs(90)
+        ));
+        assert!(matches!(
+            silence_reconnect(true, crate::reconnect::LIMIT, None),
+            Silence::Reconnect(_)
+        ));
+        assert!(matches!(
+            silence_reconnect(true, crate::reconnect::LIMIT + Duration::from_secs(1), None),
+            Silence::GaveUp
+        ));
+        assert!(matches!(
+            silence_reconnect(
+                false,
+                crate::reconnect::LIMIT + Duration::from_secs(1),
+                None
+            ),
+            Silence::Continue
+        ));
+        assert!(matches!(
+            silence_reconnect(false, Duration::ZERO, Some(Duration::from_secs(2))),
+            Silence::Reconnect(elapsed) if elapsed == Duration::from_secs(2)
+        ));
+    }
+    #[test]
+    fn pause_volume_and_stop_apply_while_the_source_stays_quiet() {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        struct Watching {
+            frames: u64,
+            maximum: u64,
+            rate: u32,
+            channels: u16,
+            seen: Arc<Mutex<Vec<(bool, u32)>>>,
+        }
+        impl AudioSink for Watching {
+            fn configure(&self, paused: bool, volume: u32) {
+                self.seen.lock().unwrap().push((paused, volume));
+            }
+            fn enqueue(
+                &mut self,
+                pcm: &DecodedPcm,
+                cursor: &mut usize,
+            ) -> Result<bool, OutputError> {
+                if pcm.summary.sample_rate != self.rate || pcm.summary.channels != self.channels {
+                    return Err(OutputError::UnsupportedFormat);
+                }
+                self.frames += (pcm.summary.frames as u64).min(self.maximum - self.frames);
+                *cursor = pcm.samples.len();
+                Ok(true)
+            }
+            fn accepted(&self) -> u64 {
+                self.frames
+            }
+            fn summary(&self) -> OutputSummary {
+                OutputSummary {
+                    frames: self.frames,
+                    underrun_frames: 0,
+                    sample_rate: self.rate,
+                    channels: self.channels,
+                    sample_format: crate::player::output::OutputSampleFormat::F32,
+                }
+            }
+            fn poll(&mut self) -> Result<bool, OutputError> {
+                Ok(self.frames == self.maximum)
+            }
+            fn finish(&mut self) {}
+        }
+        let stop = StopToken::default();
+        let (tx, rx) = mpsc::channel();
+        let mut control = super::super::seek::Controller::with_reporter(
+            rx,
+            stop.clone(),
+            |_| panic!("no prepare"),
+            |_| {},
+        );
+        let signal = stop.clone();
+        let commands = tx.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            commands
+                .send(super::super::seek::Command::Volume(10))
+                .unwrap();
+            commands.send(super::super::seek::Command::Pause).unwrap();
+            thread::sleep(Duration::from_millis(80));
+            signal.cancel();
+        });
+        let bytes = packet(48_000);
+        struct Quiet {
+            info: StreamInfo,
+            once: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Quiet {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                if let Some(bytes) = self.once.take() {
+                    return event(bytes, false);
+                }
+                Ok(Next::Pending(Duration::from_millis(20)))
+            }
+        }
+        let report = play_loop(
+            Initial::Source(Quiet {
+                info: info(60_000),
+                once: Some(bytes),
+            }),
+            Some(30),
+            stop,
+            |_| {},
+            move |pcm, maximum, _, _| {
+                Ok(Watching {
+                    frames: 0,
+                    maximum,
+                    rate: pcm.summary.sample_rate,
+                    channels: pcm.summary.channels,
+                    seen: record.clone(),
+                })
+            },
+            Some(&mut control),
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|(paused, volume)| *paused && *volume == 10),
+            "pause and volume must be applied while waiting, saw {seen:?}"
+        );
     }
 }

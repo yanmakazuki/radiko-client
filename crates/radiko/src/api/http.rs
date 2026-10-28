@@ -33,6 +33,16 @@ pub(crate) trait Fetch {
     ) -> Result<Reply, ProbeError>;
     /// Counts a completed stream-token renewal. The default keeps non-playback clients unchanged.
     fn note_reauthentication(&self) {}
+    /// Counts segments a live playlist skipped while catching up. Other clients ignore it.
+    fn note_skipped_segments(&self, _count: u64) {}
+    /// Counts a live timeline restart. Other clients ignore it.
+    fn note_sequence_reset(&self) {}
+    /// Records whether the latest live restart joined the first playlist segment.
+    fn note_joined_window_head(&self, _at_head: bool) {}
+    /// Playback cancellation. The default is for clients that never sleep between attempts.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 pub(crate) struct Reply {
     pub headers: HeaderMap,
@@ -346,6 +356,24 @@ impl Fetch for Http {
         if let Some(measurements) = &self.diagnostics {
             measurements.note_reauthentication();
         }
+    }
+    fn note_skipped_segments(&self, count: u64) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_skipped_segments(count);
+        }
+    }
+    fn note_sequence_reset(&self) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_sequence_reset();
+        }
+    }
+    fn note_joined_window_head(&self, at_head: bool) {
+        if let Some(measurements) = &self.diagnostics {
+            measurements.note_joined_window_head(at_head);
+        }
+    }
+    fn cancelled(&self) -> bool {
+        self.cancelled.as_ref().is_some_and(|check| check())
     }
     fn get(
         &self,

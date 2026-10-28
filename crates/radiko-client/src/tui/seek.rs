@@ -110,6 +110,7 @@ mod tests {
             position: Some(Duration::from_secs(25)),
             output: None,
             segments: 1,
+            reconnecting_for: None,
         }
     }
     #[test]

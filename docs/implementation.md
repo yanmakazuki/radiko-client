@@ -4,6 +4,74 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：ライブの失効した chunklist は、最初の配信 URL から取り直す
+
+YFM のライブを Linux aarch64、PipeWire で再生し、`kill -STOP` の 60 秒と 90 秒のあと `kill -CONT` すると、出力は戻りバッファ分は鳴る。追いつきの通知は出ず、「再生停止: 配信取得: HLS一覧更新: 対象の番組または配信が見つかりません」で止まる。
+
+原因は、更新先がリダイレクト後のメディアプレイリスト（chunklist）のままなことである。`Http::get` は 301〜308 を追い、最終応答の URL を `Reply.url` にする（`crates/radiko/src/api/http.rs` の 407 行付近）。`install_playlist` が `self.url = reply.url`（`crates/radiko/src/api/stream/playback.rs` の 823 行）で、その chunklist を次の更新先にする。ステータス 404 は `ProbeError::NotFound` になる（`http.rs` の 287 行）。表示は「対象の番組または配信が見つかりません」（`stream.rs` の 84 行）で、段階名「HLS一覧更新」が付く（`playback.rs` の 755 行）。`retryable_transport`（939 行）は通信失敗と HTTP 408、500番台だけなので、404 は再接続に入らずその場で止まる。マスタープレイリストの URL でも、playlist 作成 URL でもない。
+
+直しは、再生が始まったあとのライブに限る。プレイリスト更新の 404 と、認証切れの 401/403 では、保存してある最初の配信 URL（リダイレクト前の playlist 作成 URL）からマスターも含めて引き直す。必要なら認証も更新する。新しいメディアプレイリストは、これまでと同じ追いつきと巻き戻り判定に渡す。通し番号の系列が変わったときはリセットで、飛んだ差は飛ばした数に足さない。404 が続くときも再接続の 5 分まで試し、超えたら「再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください」で止める。終了リスト、認証そのものの拒否、開始前の 404 はその場で止める。タイムフリーの先へ飛ばさない挙動と、`WindowLost` の文言は変えていない。タイムフリーの 404 も、これまでどおり `NotFound` のままである。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 360 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 360 件成功、失敗 0、ignored 4 件はそのままである。実配信での STOP/CONT のやり直しは、この環境では確認していない。
+
+同日の macOS 15、Rust 1.85.0 の CI では、`closed_stdout_exits_141_without_a_panic_for_every_stdout_command` の `--help` だけが終了 0 になり、他の 4 件は成功した。閉じたパイプの読み口が `FD_CLOEXEC` を付ける前に、同じテストプロセスの別スレッドの `spawn` へ引き継がれていた。パイプ作成から `FD_CLOEXEC` までと、このファイルの `spawn` を同じロックで直列にした。Linux では同じテストを再実行して成功した。macOS の再実行は CI で見る。
+
+## 2026年10月27日：タイムフリーの続きが取れないときの文言を確定する
+
+タイムフリーで続きが取れなくなったときの `ProbeError::WindowLost` は、yanma さん確認済みの「通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください」である。分類、先へ飛ばさないこと、再接続の対象にしないことは変えていない。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 356 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 356 件成功、失敗 0、ignored 4 件はそのままである。実配信の再生は確認していない。
+
+## 2026年10月27日：タイムフリーの窓落ちは、プレイリスト不正と分けて止める
+
+タイムフリーで、未取得の通し番号が配信窓から外れたときは `ProbeError::WindowLost` で止める。表示は「通信が途切れている間に、この部分が配信窓から外れました。番組を選び直すと再生できます」である。プレイリストの形式エラー「HLSプレイリストまたはサンプルの構造が不正・未対応です」にはしない。番号が巻き戻ったときの失敗は、これまでどおりプレイリスト不正のままである。先のセグメントへは飛ばさない。再接続の対象にも加えない。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 356 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 356 件成功、失敗 0、ignored 4 件はそのままである。実配信で窓が外れる再生は確認していない。
+
+## 2026年10月27日：スリープ復帰と長い通信断は、5分まで再接続する
+
+再生中の出力停止と、30秒を超える通信断は、再生を終えずに「再接続中…（N秒）」へ入れる。上限は `reconnect::LIMIT` の5分である。過ぎたときと、出力の作り直しに失敗したときは「再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください」で止める。
+
+5分にしたのは、60〜90秒の通信断に、HTTP の接続10秒・要求20秒・最大3回の再試行が重なっても収まる長さだからである。戻らない機器や配信を、番組の終わりまで無音のままにはしない。プロセスが止まっていた時間は、この5分に数えない。長いスリープだけでは上限に達しない。
+
+出力は `ContinuousOutput::poll` の間隔が1秒より長いとき、プロセスが止まっていたとみなす。`Stalled` にはせず、基準を戻してもう一度待つ。コールバックが動けば続ける。動かなければ出力を作り直す。作り直しのあとも進まなければ、5分で止める。間隔が1秒以内のままコールバックが3秒進まないときは、これまでどおり `Stalled` である。
+
+入力は、セグメントを一度返したあとの通信失敗と HTTP 408、500番台を、ライブもタイムフリーもその場では止めない。待ちは1秒、2秒、4秒、8秒、以降10秒である。成功したプレイリストは、これまでと同じ `install_playlist` に渡す。ライブの追いつきと、少し古い窓を無視する判定はそのままである。注入した時計で、20秒の途絶のあとは配信窓の先頭から再開し、飛ばしたセグメントは累計2である。90秒のあとはライブ端から再開し、累計5である。タイムフリーは同じ通し番号から続き、窓から消えていれば「未取得セグメントが配信窓から消失」で止める。認証失敗は1回で止め、取り消しは待たない。開始前に最初の音声が30秒来ないときは、これまでどおり止める。
+
+再接続中も、停止、一時停止、音量は効く。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 355 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 355 件成功、失敗 0、ignored 4 件はそのままである。実機のスリープ復帰と、実配信の通信断は確認していない。
+
+## 2026年10月27日：少し古いライブ窓は、セグメント数までしか無視しない
+
+ライブで、同じ長さの窓が1つ古いだけで届いたときにリセットしない。1セグメントで 12 の次に 11 が届いても 11 は再生せず、デコーダーも作り直さない。その後のプレイリストは 13 から続ける。6セグメントで 12〜17 を再生したあとに 11〜16 が届いても、14〜16 は流さず、デコーダーも作り直さない。その後は 18 から続ける。
+
+無視する上限は、新しい窓の末尾が最後に再生した番号からそのプレイリストのセグメント数以内だけ前にあることである。6セグメントでは末尾 11（17 からちょうど 6 つ前）までを無視し、末尾 10 はリセットにする。0 から始まるような、それより小さい番号への切り替わりもリセットのままである。前へ進む追いつきと、セグメント数より大きい飛び、タイムフリーの失敗は変えていない。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 343 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 343 件成功、失敗 0、ignored 4 件はそのままである。実配信で窓が1つ古い再生は確認していない。
+
+## 2026年10月27日：窓の先頭からの再開通知の文言を直す
+
+TUI で、配信窓の先頭から再開したときの通知を「配信窓の先頭から再開しました（累計N）」にした。「ライブ端に追いつきました（飛ばしたセグメントは累計N）」は変えていない。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 340 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 340 件成功、失敗 0、ignored 4 件はそのままである。実配信の再生は確認していない。
+
+## 2026年10月27日：小さな巻き戻りは待ち、窓を超える飛びはリセットにする
+
+ライブの `MEDIA-SEQUENCE` が小さくても、新しい範囲が次の番号を含むか、その直前で終わっているときはリセットにしない。次の番号は動かさず、同じセグメントを取り直さず、デコーダーと巻き戻り回数も変えない。次に欲しいのが 13 で、通し番号が 12 から 11 に戻ったプレイリストでは、11 を二度取らず、その後の取得は 13 から続く。範囲が次の番号と重ならず、直前でもない巻き戻りだけをリセットにする。
+
+先へ飛ぶ差が、そのプレイリストのセグメント数より大きいときもリセットにする。差そのものは飛ばした数に足さない。差がその個数以下の取りこぼしだけを足す。しきい値をセグメント数にしたのは、今の応答が示す窓の長さだけが、同じ配信の直近として数にできる範囲だからである。10 から 13 の3セグメントでは差が2なので、これまでどおり 13 を不連続で返す。10 から 1,000,000 の3セグメントでは差が窓より大きいので、リセットとし、飛ばした数は 0 のままである。
+
+再開位置が窓の先頭なら TUI は「配信窓の先頭から再開しました（累計N）」、ライブ端の近くなら「ライブ端に追いつきました（飛ばしたセグメントは累計N）」と出す。タイムフリーの欠落と巻き戻りは、これまでと同じ失敗のままである。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 340 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 340 件成功、失敗 0、ignored 4 件はそのままである。実配信で窓が先に進む再生は確認していない。
+
+## 2026年10月27日：配信窓の追いつきを main の標準出力変更へ合わせる
+
+`origin/main`（#42、標準出力の `BrokenPipe`）を merge commit で取り込んだ。衝突は `docs/implementation.md` と `docs/validation.md` だけで、同日の二つの節と自動テストの文は両方残した。コードのコンフリクトはなかった。追いつきで足した CLI の表示は、新しい `println!` ではない。再生中の状態は stderr の通信診断のままで、標準出力の行は `stdout_ln!` のままである。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 338 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 338 件成功、失敗 0、ignored 4 件はそのままである。実配信で窓が先に進む再生は確認していない。
+
 ## 2026年10月27日：標準出力の BrokenPipe を終了コード 141 で戻す
 
 対象は `radiko-client` の CLI である。Rust は SIGPIPE を無視するため、`println!` が閉じたパイプへ書くと `failed printing to stdout: Broken pipe (os error 32)` でパニックし、終了コード 101 になる。`programs --areas JP13 | head -1` で再現する。
@@ -13,6 +81,12 @@
 確認環境は Linux x86_64、Rust 1.99.1、音声デバイスなしである。`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features` は 332 件成功、失敗 0、ignored 4 件のままである。統合テスト `sigpipe` は、読み口を閉じたパイプと bash の `| head -1` を、ヘルプと `login`、`session`、`logout`、`probe-live`、`probe-timefree`、`play-live`、`play-timefree`、`output-info`、`probe-output`、`play-sample`、`programs`、`tui --help`、`searches`、`chapters`、`inspect-chapters` に対して実行する。標準出力へ書くコマンドは、閉じたパイプで終了 141、panic なし、stderr に新たなエラーなしである。書く前に失敗するコマンドは終了 1 のままである。読み切ったときの `--help`、`searches show` / `restore` の JSON、`inspect-chapters` の全文は終了 0 で欠けるところはない。`output-info` と `probe-output` は機器がないため終了 1、stderr は「エラー: 既定の音声出力機器がありません」だけである。
 
 同じデバッグビルドで `programs --areas JP13 | head -1` を実行した。終了コードは 141、panic はなく、stdout の1行目は `BAYFM78 (BAYFM78) / 放送日 2026-10-27 / 日本時間（実行時点の状態）` だった。stderr は進捗2行（局一覧 1/1、番組表 1/15）だけで、「エラー:」は出ていない。取得はそこで止めた。アカウントは使っていない。音声の保存もない。macOS はこの環境では実行していない。同じテストは `#![cfg(unix)]` なので、GitHub Actions の macos-15 でも走る。Rust 1.85.0（4d91de4e4、2025-02-17）の `cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 332 件成功、失敗 0、ignored 4 件のままである。fmt と clippy は 1.85.0 では実行していない。
+
+## 2026年10月27日：ライブの配信窓から遅れても再生を続ける
+
+ライブで、次の通し番号が新しいプレイリストに無いときは止めない。再開位置は、終端から target duration の3倍以内に始まるセグメントのうち最も古いものである。窓全体がその範囲なら先頭の `MEDIA-SEQUENCE` になる。飛ばした通し番号の個数は通信診断の「飛ばしたセグメント」と、TUI の再生通知に出す。CLI の状態表示は同じ通信診断の行である。再開したセグメントは不連続としてデコーダーを作り直す。`MEDIA-SEQUENCE` が小さくなったライブは、配信のリセットとして同じ位置から再開し、回数を「通し番号の巻き戻り」に足す。リセットで捨てた古い番号は飛ばした個数に入れない。タイムフリーの欠落と巻き戻りは失敗のままである。再認証、終了時に出力を先に閉じること、サンプル形式の選択は変えていない。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 333 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 333 件成功、失敗 0、ignored 4 件はそのままである。偽のプレイリストで、通常の進み方、窓から遅れた短い窓と 6 セグメントの窓、通し番号の巻き戻りを確認した。タイムフリーの同じ欠落と巻き戻りは、セグメントを取らずに失敗する。アカウント、radiko への通信、実配信で窓が先に進む再生は確認していない。
 
 ## 2026年10月27日：PulseAudio の null sink で native_muted を20回繰り返す
 

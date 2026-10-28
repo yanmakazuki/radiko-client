@@ -27,6 +27,7 @@ pub enum OutputError {
     },
     Device,
     Stalled,
+    ReconnectGaveUp,
     ProbeTimeout,
     Deadline,
 }
@@ -47,6 +48,7 @@ impl fmt::Display for OutputError {
             Self::Stalled => f.write_str(
                 "音声コールバックが進まないため出力を停止しました。スリープ復帰・機器変更後は出力先を確認し、番組を選び直して再生してください",
             ),
+            Self::ReconnectGaveUp => f.write_str(crate::reconnect::GAVE_UP),
             Self::ProbeTimeout => {
                 f.write_str("無音出力診断の実時間上限を超えたため停止しました")
             }
@@ -705,9 +707,102 @@ pub struct ContinuousOutput {
     accepted: u64,
     maximum: u64,
     started: bool,
-    last_callback: u64,
-    last_progress: Instant,
+    stop: StopToken,
+    deadline: Option<Instant>,
+    watch: OutputStallWatch,
     drained_at: Option<Instant>,
+}
+/// Decides whether a quiet callback is a stopped process, a device to rebuild, or a real stall.
+/// Tests pass `now` directly so a sleep or a five-minute wait does not block.
+struct OutputStallWatch {
+    last_poll: Option<Instant>,
+    last_progress: Option<Instant>,
+    last_callback: u64,
+    started: bool,
+    reconnecting: bool,
+    rebuilt: bool,
+    elapsed: Duration,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputWatch {
+    Continue,
+    /// `poll` itself was late. The baseline was reset. This is not `Stalled`.
+    Suspended,
+    Rebuild,
+    Stalled,
+    Expired,
+}
+impl OutputStallWatch {
+    fn new() -> Self {
+        Self {
+            last_poll: None,
+            last_progress: None,
+            last_callback: 0,
+            started: false,
+            reconnecting: false,
+            rebuilt: false,
+            elapsed: Duration::ZERO,
+        }
+    }
+    fn start(&mut self, now: Instant) {
+        self.started = true;
+        self.last_progress = Some(now);
+    }
+    fn reconnecting_for(&self) -> Option<Duration> {
+        self.reconnecting.then_some(self.elapsed)
+    }
+    /// After a new device is opened, its callback counter starts again.
+    fn rebase(&mut self, now: Instant, callbacks: u64) {
+        self.last_poll = Some(now);
+        self.last_progress = Some(now);
+        self.last_callback = callbacks;
+    }
+    fn poll(&mut self, now: Instant, callbacks: u64) -> OutputWatch {
+        let gap = self
+            .last_poll
+            .map(|then| now.saturating_duration_since(then));
+        self.last_poll = Some(now);
+        if gap.is_some_and(|gap| gap > crate::reconnect::OUTPUT_POLL_GAP) {
+            self.last_callback = callbacks;
+            self.last_progress = Some(now);
+            if self.started {
+                self.reconnecting = true;
+                self.rebuilt = false;
+                self.elapsed = Duration::ZERO;
+                return OutputWatch::Suspended;
+            }
+            return OutputWatch::Continue;
+        }
+        if self.reconnecting {
+            if let Some(gap) = gap {
+                self.elapsed = self.elapsed.saturating_add(gap);
+            }
+        }
+        if callbacks != self.last_callback {
+            self.last_callback = callbacks;
+            self.last_progress = Some(now);
+            self.reconnecting = false;
+            self.rebuilt = false;
+            self.elapsed = Duration::ZERO;
+            return OutputWatch::Continue;
+        }
+        if self.reconnecting && self.elapsed > crate::reconnect::LIMIT {
+            return OutputWatch::Expired;
+        }
+        let frozen = self.started
+            && self.last_progress.is_some_and(|at| {
+                now.saturating_duration_since(at) > crate::reconnect::OUTPUT_CALLBACK_WAIT
+            });
+        if frozen && self.reconnecting && !self.rebuilt {
+            self.rebuilt = true;
+            self.last_progress = Some(now);
+            return OutputWatch::Rebuild;
+        }
+        if frozen && !self.reconnecting {
+            return OutputWatch::Stalled;
+        }
+        OutputWatch::Continue
+    }
 }
 impl ContinuousOutput {
     pub fn new(
@@ -724,7 +819,7 @@ impl ContinuousOutput {
             .map(|d| Instant::now().checked_add(d).ok_or(OutputError::InvalidPcm))
             .transpose()?;
         let rate = pcm.summary.sample_rate;
-        let output = Output::open_with_stop(rate, maximum, deadline, stop)?;
+        let output = Output::open_with_stop(rate, maximum, deadline, stop.clone())?;
         output.state.volume.store(25, Ordering::Release);
         Ok(Self {
             output,
@@ -733,8 +828,9 @@ impl ContinuousOutput {
             accepted: 0,
             maximum,
             started: false,
-            last_callback: 0,
-            last_progress: Instant::now(),
+            stop,
+            deadline,
+            watch: OutputStallWatch::new(),
             drained_at: None,
         })
     }
@@ -769,7 +865,7 @@ impl ContinuousOutput {
             self.output.stream.play().map_err(|_| OutputError::Device)?;
             self.output.state.enabled.store(true, Ordering::Release);
             self.started = true;
-            self.last_progress = Instant::now();
+            self.watch.start(Instant::now());
         }
         Ok(*cursor == pcm.samples.len() || self.accepted == self.maximum)
     }
@@ -779,7 +875,7 @@ impl ContinuousOutput {
                 Ok(()) => {
                     self.output.state.enabled.store(true, Ordering::Release);
                     self.started = true;
-                    self.last_progress = Instant::now();
+                    self.watch.start(Instant::now());
                 }
                 Err(_) => self.output.state.failed.store(true, Ordering::Release),
             }
@@ -808,21 +904,46 @@ impl ContinuousOutput {
             .volume
             .store(volume.min(100), Ordering::Release);
     }
+    pub fn reconnecting_for(&self) -> Option<Duration> {
+        self.watch.reconnecting_for()
+    }
     pub fn poll(&mut self) -> Result<bool, OutputError> {
         self.output.check()?;
         let callbacks = self.output.state.callbacks.load(Ordering::Acquire);
-        if callbacks != self.last_callback {
-            self.last_callback = callbacks;
-            self.last_progress = Instant::now();
-        }
         if self.output.state.ended.load(Ordering::Acquire) {
             let start = self.drained_at.get_or_insert_with(Instant::now);
             return Ok(start.elapsed() >= Duration::from_millis(250));
         }
-        if self.started && self.last_progress.elapsed() > Duration::from_secs(3) {
-            return Err(OutputError::Stalled);
+        let now = Instant::now();
+        match self.watch.poll(now, callbacks) {
+            OutputWatch::Continue | OutputWatch::Suspended => Ok(false),
+            OutputWatch::Rebuild => {
+                self.rebuild()?;
+                Ok(false)
+            }
+            OutputWatch::Stalled => Err(OutputError::Stalled),
+            OutputWatch::Expired => Err(OutputError::ReconnectGaveUp),
         }
-        Ok(false)
+    }
+    fn rebuild(&mut self) -> Result<(), OutputError> {
+        let paused = self.output.state.paused.load(Ordering::Acquire);
+        let volume = self.output.state.volume.load(Ordering::Acquire);
+        let output =
+            Output::open_with_stop(self.rate, self.maximum, self.deadline, self.stop.clone())
+                .map_err(|_| OutputError::ReconnectGaveUp)?;
+        output.state.paused.store(paused, Ordering::Release);
+        output.state.volume.store(volume, Ordering::Release);
+        if self.started {
+            output
+                .stream
+                .play()
+                .map_err(|_| OutputError::ReconnectGaveUp)?;
+            output.state.enabled.store(true, Ordering::Release);
+        }
+        self.output = output;
+        let callbacks = self.output.state.callbacks.load(Ordering::Acquire);
+        self.watch.rebase(Instant::now(), callbacks);
+        Ok(())
     }
 }
 fn validate_pcm(pcm: &DecodedPcm) -> Result<(), OutputError> {
@@ -1345,5 +1466,75 @@ mod tests {
         );
         assert_eq!(probe_tone(0).unwrap_err(), OutputError::InvalidPcm);
         assert_eq!(probe_tone(11).unwrap_err(), OutputError::InvalidPcm);
+    }
+    fn started(at: Instant) -> OutputStallWatch {
+        let mut watch = OutputStallWatch::new();
+        watch.start(at);
+        watch.poll(at, 1);
+        watch
+    }
+    #[test]
+    fn a_long_poll_gap_is_not_a_stall_and_resumes_when_callbacks_move() {
+        let start = Instant::now();
+        let mut watch = started(start);
+        assert_eq!(
+            watch.poll(start + Duration::from_secs(70), 1),
+            OutputWatch::Suspended
+        );
+        assert_eq!(watch.reconnecting_for(), Some(Duration::ZERO));
+        assert_eq!(
+            watch.poll(
+                start + Duration::from_secs(70) + Duration::from_millis(100),
+                2
+            ),
+            OutputWatch::Continue
+        );
+        assert_eq!(watch.reconnecting_for(), None);
+        assert_ne!(
+            watch.poll(start + Duration::from_secs(74), 2),
+            OutputWatch::Stalled
+        );
+    }
+    #[test]
+    fn a_poll_gap_then_a_frozen_callback_rebuilds_and_stops_at_the_limit() {
+        let start = Instant::now();
+        let mut watch = started(start);
+        let mut now = start + Duration::from_secs(10);
+        assert_eq!(watch.poll(now, 4), OutputWatch::Suspended);
+        let mut rebuilt = false;
+        loop {
+            now += Duration::from_millis(500);
+            match watch.poll(now, 4) {
+                OutputWatch::Rebuild => rebuilt = true,
+                OutputWatch::Expired => break,
+                OutputWatch::Continue | OutputWatch::Suspended => {}
+                OutputWatch::Stalled => panic!("a suspension must not become a callback stall"),
+            }
+            assert!(
+                now.saturating_duration_since(start) < Duration::from_secs(400),
+                "reconnect must end at the limit"
+            );
+        }
+        assert!(rebuilt);
+        assert!(watch.elapsed > crate::reconnect::LIMIT);
+        assert!(watch.elapsed < crate::reconnect::LIMIT + Duration::from_secs(2));
+    }
+    #[test]
+    fn frozen_callbacks_with_regular_polls_are_still_stalled() {
+        let start = Instant::now();
+        let mut watch = started(start);
+        let mut now = start;
+        let mut stalled = false;
+        for _ in 0..40 {
+            now += Duration::from_millis(100);
+            if watch.poll(now, 4) == OutputWatch::Stalled {
+                stalled = true;
+                break;
+            }
+        }
+        assert!(stalled);
+        assert!(now.saturating_duration_since(start) <= Duration::from_secs(4));
+        assert!(!watch.rebuilt);
+        assert_eq!(watch.reconnecting_for(), None);
     }
 }

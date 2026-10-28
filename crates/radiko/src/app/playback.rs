@@ -549,6 +549,7 @@ mod tests {
             volume: 0,
             position: Some(Duration::from_secs(1)),
             segments: 1,
+            reconnecting_for: None,
             output: Some(OutputSummary {
                 frames: 48000,
                 underrun_frames: 0,
