@@ -769,7 +769,7 @@ impl Screen {
                 self.chapter_summary_focused = !self.chapter_summary_focused;
                 Ok(Some(false))
             }
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 self.close_chapters();
                 Ok(Some(false))
             }
@@ -3514,25 +3514,8 @@ mod tests {
         }
         cases.extend(close_keys(Surface::Help));
         cases.extend(close_keys(Surface::FetchStatus));
-        // チャプター表示の q は一覧へ抜けて終了する。Esc だけ閉じる。
-        cases.push(case(
-            Surface::Chapters,
-            KeyCode::Char('q'),
-            KeyModifiers::NONE,
-            KeyEffect::Quit,
-        ));
-        cases.push(case(
-            Surface::Chapters,
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-            KeyEffect::Close,
-        ));
-        cases.push(case(
-            Surface::Chapters,
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-            KeyEffect::Quit,
-        ));
+        // チャプター表示の q と Esc は閉じる。終了しない。
+        cases.extend(close_keys(Surface::Chapters));
         cases.push(case(
             Surface::LogoutConfirm,
             KeyCode::Char('q'),
