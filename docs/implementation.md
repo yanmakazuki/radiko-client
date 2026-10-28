@@ -14,7 +14,7 @@ TUIの再生通知とCLIの `エラー:` 行では、次の3つだけをその�
 
 それ以外の失敗は、これまでどおり「再生停止:」に続けて `PlaybackError` の表示連鎖である。3つの確認済みの文でも、種類と段階名は `Display` のままCLIの標準エラーの次の行に残す。停止したあとの「再接続中…」、追いつき、配信認証の更新は、通知の文字列ではなく停止フラグを見て、その文を置き換えない。
 
-`scripts/verify_tui_playback.py` は、接頭辞のないこの3文を `window_lost`、`reconnect_limit`、`auth_expired` に分ける。段階名が残っているときは、これまでどおり `source_stage` を読む。
+`scripts/verify_tui_playback.py` は、接頭辞のないこの3文を `window_lost`、`reconnect_limit`、`auth_expired` に分ける。段階名が残っているときは、これまでどおり `source_stage` を読む。表示の期待値はテスト内の文そのもので、確認済みの3文を書き換えると失敗する。失敗した再生セッションは `Update.stopped` を立て、そのフラグを外すとテストが失敗する。そのあとの「ライブ端に追いつきました」では停止の文を置き換えない。
 
 確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 375 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 clippy` と同じオプションのテストも 375 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。この環境では AppArmor の sysctl は無く、`unshare -rn` はそのまま成功した。`--help` と `tui --help` の文言は main と同じである。radiko への通信と実機の再生はない。
 
