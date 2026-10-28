@@ -4,6 +4,16 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月28日：ライブの失効した chunklist は、最初の配信 URL から取り直す
+
+YFM のライブを Linux aarch64、PipeWire で再生し、`kill -STOP` の 60 秒と 90 秒のあと `kill -CONT` すると、出力は戻りバッファ分は鳴る。追いつきの通知は出ず、「再生停止: 配信取得: HLS一覧更新: 対象の番組または配信が見つかりません」で止まる。
+
+原因は、更新先がリダイレクト後のメディアプレイリスト（chunklist）のままなことである。`Http::get` は 301〜308 を追い、最終応答の URL を `Reply.url` にする（`crates/radiko/src/api/http.rs` の 407 行付近）。`install_playlist` が `self.url = reply.url`（`crates/radiko/src/api/stream/playback.rs` の 823 行）で、その chunklist を次の更新先にする。ステータス 404 は `ProbeError::NotFound` になる（`http.rs` の 287 行）。表示は「対象の番組または配信が見つかりません」（`stream.rs` の 84 行）で、段階名「HLS一覧更新」が付く（`playback.rs` の 755 行）。`retryable_transport`（939 行）は通信失敗と HTTP 408、500番台だけなので、404 は再接続に入らずその場で止まる。マスタープレイリストの URL でも、playlist 作成 URL でもない。
+
+直しは、再生が始まったあとのライブに限る。プレイリスト更新の 404 と、認証切れの 401/403 では、保存してある最初の配信 URL（リダイレクト前の playlist 作成 URL）からマスターも含めて引き直す。必要なら認証も更新する。新しいメディアプレイリストは、これまでと同じ追いつきと巻き戻り判定に渡す。通し番号の系列が変わったときはリセットで、飛んだ差は飛ばした数に足さない。404 が続くときも再接続の 5 分まで試し、超えたら「再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください」で止める。終了リスト、認証そのものの拒否、開始前の 404 はその場で止める。タイムフリーの先へ飛ばさない挙動と、`WindowLost` の文言は変えていない。タイムフリーの 404 も、これまでどおり `NotFound` のままである。
+
+確認は Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 360 件成功、失敗 0、ignored 4 件はそのままである。`cargo +1.85.0 test --workspace --locked --all-targets --all-features` も 360 件成功、失敗 0、ignored 4 件はそのままである。実配信での STOP/CONT のやり直しは、この環境では確認していない。
+
 ## 2026年10月27日：タイムフリーの続きが取れないときの文言を確定する
 
 タイムフリーで続きが取れなくなったときの `ProbeError::WindowLost` は、yanma さん確認済みの「通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください」である。分類、先へ飛ばさないこと、再接続の対象にしないことは変えていない。
