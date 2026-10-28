@@ -97,7 +97,10 @@ pub fn draw(
     frame.render_widget(Paragraph::new(active), rows[0]);
     frame.render_widget(diagnostic, rows[1]);
     frame.render_widget(
-        Paragraph::new("Esc / ? / q 操作一覧を閉じる\n↑↓ PgUp/Dn Home/End / Ctrl+C 終了"),
+        Paragraph::new(concat!(
+            dialog_close_hint!(),
+            "\n↑↓ PgUp/Dn Home/End / Ctrl+C 終了"
+        )),
         rows[2],
     );
 }
