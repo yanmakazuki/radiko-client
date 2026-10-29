@@ -1210,6 +1210,7 @@ mod tests {
         assert_ne!(opened.0.sample_rate.0, 96_000);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn alsa_library_diagnostics_stay_quiet_unless_the_debug_variable_is_one() {
         assert!(crate::stderr::native_logs_suppressed(None));

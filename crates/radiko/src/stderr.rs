@@ -19,6 +19,7 @@ fn discard(result: io::Result<()>) {
 }
 
 /// `RADIKO_ALSA_LOG=1` 以外では、ALSA と JACK などのプラグインログを出さない。
+#[cfg(target_os = "linux")]
 pub(crate) fn native_logs_suppressed(value: Option<&str>) -> bool {
     value != Some("1")
 }

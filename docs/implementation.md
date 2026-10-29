@@ -16,7 +16,7 @@ CPAL 0.16.0 の ALSA ホストは、`default_host` 自体では機器を開か�
 
 `cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 402 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 fmt`、同じオプションの clippy とテストも 402 件成功、失敗 0、ignored 2 件である。PulseAudio の null sink ジョブはこの環境では実行していない。実機の Q2-N（#26）も未確認である。radiko への通信と実機の再生はない。
 
-macOS の stable clippy は、Linux 以外では `prepare_alsa_errors` の `return` が関数の最後になるため `needless_return` になった。Linux とそれ以外で関数を分け、早期 return は置いていない。Linux 以外はハンドラを入れず、標準エラーの書き先も変えない。この環境から `x86_64-apple-darwin` の clippy は、macOS SDK が無く `ring` の C が Linux のヘッダを読んで失敗した。
+macOS の stable clippy は、Linux 以外では `prepare_alsa_errors` の `return` が関数の最後になるため `needless_return` になった。Linux とそれ以外で関数を分け、早期 return は置いていない。Linux 以外はハンドラを入れず、標準エラーの書き先も変えない。続けて `native_logs_suppressed` は Linux 以外のライブラリ本体から呼ばれないため `dead_code` になった。関数とそのテストを `target_os = "linux"` に限った。この環境から `x86_64-apple-darwin` の clippy は、macOS SDK が無く `ring` の C が Linux のヘッダを読んで失敗した。代わりに、触ったファイルの `target_os = "linux"` を一時的に成り立たない cfg へ替えてホストの clippy を実行し、終わったら戻した。その実行は警告なしだった。
 
 ## 2026年10月29日：試験用の番組表オリジンはデバッグビルドだけ
 
