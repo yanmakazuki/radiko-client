@@ -44,6 +44,7 @@ fn ensure_preserved(state: &mut State) {
 }
 
 pub(super) fn begin_redirect() -> bool {
+    install_panic_hook();
     let mut state = lock();
     ensure_preserved(&mut state);
     if state.preserved.is_none() {
@@ -112,6 +113,67 @@ pub(super) fn write_fmt(args: Arguments<'_>, newline: bool) {
         text.push('\n');
     }
     write_bytes(text.as_bytes());
+}
+
+/// パニックはガードのドロップより先に標準のフックへ書かれる。
+/// fd 2 が `/dev/null` のままだとそのメッセージは消える。
+/// フックは一度だけ、それまで入っていたフックを呼ぶ形で足す。
+/// 窓の外ではそのフックをそのまま呼ぶ。窓の中では、呼ぶ直前だけ fd 2 を
+/// 保存してある標準エラーへ戻し、戻ったら深さが残っていれば再び `/dev/null` にする。
+/// メッセージの文面は前のフック（既定または libtest）に任せる。
+/// ロックを持ったまま前のフックは呼ばない。同じスレッドが既にロックを持って
+/// パニックしたときは取り直さず、デッドロックもしない。
+fn install_panic_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let conceal = ConcealAfterPanic(reveal_stderr_for_panic());
+            previous(info);
+            drop(conceal);
+        }));
+    });
+}
+
+struct ConcealAfterPanic(bool);
+
+impl Drop for ConcealAfterPanic {
+    fn drop(&mut self) {
+        if self.0 {
+            conceal_stderr_after_panic();
+        }
+    }
+}
+
+fn reveal_stderr_for_panic() -> bool {
+    let state = match STATE.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    if state.depth == 0 {
+        return false;
+    }
+    let Some(saved) = state.saved.as_ref() else {
+        return false;
+    };
+    rustix::stdio::dup2_stderr(saved).is_ok()
+}
+
+fn conceal_stderr_after_panic() {
+    let state = match STATE.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if state.depth == 0 {
+        return;
+    }
+    let Ok(null) = fs::open("/dev/null", OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty()) else {
+        return;
+    };
+    let _ = rustix::stdio::dup2_stderr(&null);
 }
 
 fn write_bytes(bytes: &[u8]) {
@@ -215,6 +277,88 @@ AFTER
         if let Err(message) = failed {
             crate::stderr::write_line(format_args!("エラー: {message}"));
         }
+    }
+
+    #[test]
+    fn panic_inside_the_silence_window_is_printed_and_exits_101() {
+        if let Some(kind) = std::env::var_os("RADIKO_PANIC_CHILD") {
+            match kind.to_string_lossy().as_ref() {
+                "main" => {
+                    let _guard = crate::stderr::silence_native_stderr();
+                    panic!("silence-window-main-thread");
+                }
+                "other" => {
+                    let _guard = crate::stderr::silence_native_stderr();
+                    let error = thread::spawn(|| panic!("silence-window-other-thread"))
+                        .join()
+                        .expect_err("other thread should panic");
+                    std::panic::resume_unwind(error);
+                }
+                "closed" => {
+                    let _guard = crate::stderr::silence_native_stderr();
+                    panic!("silence-window-closed-stderr");
+                }
+                other => panic!("unknown panic child {other}"),
+            }
+        }
+        let name = std::thread::current()
+            .name()
+            .expect("libtest names the test thread")
+            .to_owned();
+        for (kind, marker) in [
+            ("main", "silence-window-main-thread"),
+            ("other", "silence-window-other-thread"),
+        ] {
+            let output = run_panic_child(&name, kind);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(101),
+                "{kind} status {:?} stderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stderr.contains(marker) && stderr.contains("panicked at"),
+                "{kind} panic message was swallowed:\n{stderr}"
+            );
+        }
+        let closed = Command::new("bash")
+            .arg("-c")
+            .arg(r#"exec "$@" 2>&-"#)
+            .arg("closed-stderr")
+            .arg(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(&name)
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env("RADIKO_PANIC_CHILD", "closed")
+            .env_remove("RADIKO_ALSA_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&closed.stdout);
+        assert_eq!(
+            closed.status.code(),
+            Some(101),
+            "closed stderr must exit 101 without aborting: {:?} stdout:\n{stdout}",
+            closed.status
+        );
+        assert!(
+            !stdout.contains("fatal runtime error"),
+            "double panic:\n{stdout}"
+        );
+    }
+
+    fn run_panic_child(name: &str, kind: &str) -> std::process::Output {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env("RADIKO_PANIC_CHILD", kind)
+            .env_remove("RADIKO_ALSA_LOG")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
     }
 
     fn failing_open(start: Arc<Barrier>, done: mpsc::Receiver<()>) -> Result<(), &'static str> {

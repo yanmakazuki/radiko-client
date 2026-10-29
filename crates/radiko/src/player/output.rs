@@ -337,6 +337,28 @@ fn start_output(stream: &cpal::Stream) -> Result<(), OutputError> {
     stream.play().map_err(|_| OutputError::Device)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod enumeration_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn enable() {
+        ENABLED.with(|cell| cell.set(true));
+    }
+
+    /// 列挙の直前に呼ばれる。ガードが生きていれば fd 2 への書き込みは捨てられる。
+    pub(super) fn note() {
+        if !ENABLED.with(Cell::get) {
+            return;
+        }
+        let _ = rustix::io::write(rustix::stdio::stderr(), b"ENUM-FD2\n");
+        crate::stderr::write_line(format_args!("SEAM-RAN"));
+    }
+}
+
 /// The enumerated output whose name matches CPAL's current default.
 /// On macOS, CPAL 0.16 names that device after the CoreAudio default and registers
 /// `DeviceIsAlive` only for enumerated devices. The default wrapper follows later OS
@@ -352,6 +374,8 @@ fn selected_output_device() -> Result<cpal::Device, OutputError> {
     let host = cpal::default_host();
     let fallback = host.default_output_device().ok_or(OutputError::NoDevice)?;
     let name = fallback.name().map_err(|_| OutputError::DeviceInfo)?;
+    #[cfg(all(test, target_os = "linux"))]
+    enumeration_probe::note();
     if let Ok(devices) = host.output_devices() {
         for device in devices {
             if device.name().ok().as_deref() == Some(name.as_str()) {
@@ -1208,6 +1232,40 @@ mod tests {
         assert_eq!(opened.0.sample_rate.0, 48_000);
         assert_ne!(opened.0.sample_rate.0, 44_100);
         assert_ne!(opened.0.sample_rate.0, 96_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_enumeration_writes_fd2_only_while_silence_is_active() {
+        if std::env::var_os("RADIKO_ENUM_CHILD").is_some() {
+            super::enumeration_probe::enable();
+            let _ = super::selected_output_device();
+            return;
+        }
+        let name = std::thread::current()
+            .name()
+            .expect("libtest names the test thread")
+            .to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1"])
+            .env("RADIKO_ENUM_CHILD", "1")
+            .env_remove("RADIKO_ALSA_LOG")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "status {:?} stderr:\n{stderr}",
+            output.status.code()
+        );
+        assert!(
+            stderr.contains("SEAM-RAN"),
+            "enumeration seam did not run:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("ENUM-FD2"),
+            "fd 2 was not silenced during enumeration:\n{stderr}"
+        );
     }
 
     #[cfg(target_os = "linux")]
