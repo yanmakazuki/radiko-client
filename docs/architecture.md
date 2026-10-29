@@ -55,7 +55,7 @@ flowchart LR
 | `crates/radiko/tests/` と `crates/radiko-client/tests/` | ライブラリと CLI の統合テスト |
 | `tests/fixtures/` | 資格情報を含まない合成データ |
 
-CLI が標準出力へ書く行は `stdout.rs` に集約する。読み手がパイプを閉じたときの `BrokenPipe` は、エラー行を足さず終了コード 141（128+SIGPIPE）で戻す。標準エラーの進捗と失敗は `radiko::stderr` の一つの書き込みに集め、書けないときは捨てて終了コードは変えない。SIGPIPE を `unsafe` で既定に戻すことはしない。
+CLI が標準出力へ書く行は `stdout.rs` に集約する。読み手がパイプを閉じたときの `BrokenPipe` は、エラー行を足さず終了コード 141（128+SIGPIPE）で戻す。それ以外の書き込み失敗、たとえば空き容量不足は、番組表の残りを取るのをやめ、終了コード 1 と標準エラーの「エラー: 書き込みに失敗しました（空き容量不足）」一行で戻す。標準エラーの進捗と失敗は `radiko::stderr` の一つの書き込みに集め、書けないときは捨てて、取得も終了コードも変えない。SIGPIPE を `unsafe` で既定に戻すことはしない。`eprintln!` と `eprint!` は clippy が拒否する。
 
 採用バージョンは各クレートの `Cargo.toml` と、ワークスペースの `Cargo.lock` が正です。画面は Ratatui 0.29.0 と Crossterm 0.28.1 で、バイナリだけが依存します。出力は CPAL 0.16.0 と rtrb 0.3.2、AAC は `rusty_aac` 1.1.0、コンテナの解析に Symphonia 0.5、HTTP は reqwest 0.12（`rustls-tls`、blocking feature は使わない）、非同期ランタイムは Tokio です。CPAL の既定ホストは、macOS では CoreAudio、Linux では ALSA です。Linux のビルドは libasound にリンクします。JACK 機能は有効にしていません。
 

@@ -324,17 +324,25 @@ fn parallel_cancelled<J: Sync, T: Send>(
                     let Some(job) = jobs.get(index) else {
                         break;
                     };
-                    if tx.send((index, work(job))).is_err() {
+                    if cancelled.load(Ordering::Acquire) {
                         break;
                     }
+                    // 結果を表示し終えるまで次の取得へ進まない。書き込み失敗の取り消しが
+                    // 次の局・日より先に立つ。
+                    let (ack_tx, ack_rx) = mpsc::channel();
+                    if tx.send((index, work(job), ack_tx)).is_err() {
+                        break;
+                    }
+                    let _ = ack_rx.recv();
                 }
             });
         }
         drop(tx);
-        for (done, (index, value)) in rx.into_iter().enumerate() {
+        for (done, (index, value, ack_tx)) in rx.into_iter().enumerate() {
             if !cancelled.load(Ordering::Acquire) {
                 consume(&jobs[index], value, done + 1);
             }
+            let _ = ack_tx.send(());
         }
     });
 }
@@ -372,5 +380,32 @@ mod tests {
         let mut expected = jobs;
         expected.sort();
         assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn cancellation_during_progress_does_not_start_another_wave() {
+        let ran = std::sync::Mutex::new(Vec::new());
+        let jobs: Vec<_> = (0..5).map(|n| n.to_string()).collect();
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        parallel_cancelled(
+            &jobs,
+            &cancel,
+            |job| {
+                ran.lock().expect("ran").push(job.clone());
+                job.clone()
+            },
+            |job, result, completed| {
+                assert_eq!(job, &result);
+                seen.push(result);
+                if completed == 1 {
+                    cancel.store(true, Ordering::Release);
+                }
+            },
+        );
+        let ran = ran.lock().expect("ran");
+        assert!(!ran.is_empty() && ran.len() <= 4, "{ran:?}");
+        assert!(ran.iter().all(|job| job != "4"), "{ran:?}");
+        assert_eq!(seen.len(), 1);
     }
 }

@@ -4,6 +4,20 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月29日：空き容量不足では番組表の取得を止める
+
+標準出力への書き込みが `BrokenPipe` 以外で失敗したときは、残りの局・日を取らない。終了コードは 1 で、標準エラーには `エラー:` で始まる行を一つだけ出す。空き容量不足（`ENOSPC`、`/dev/full`）は「エラー: 書き込みに失敗しました（空き容量不足）」である。書き込みが拒否されたときは「書き込みが拒否されました」、それ以外の種類はその種類名を、同じ括弧の中に書く。`BrokenPipe` は終了コード 141 のままで、その行は出さない。
+
+標準エラーが書けないだけでは取得を止めない。`/dev/full` へ捨てても、終了コードは標準エラーが開いているときと同じである。
+
+表示し終えるまで次の取得へ進まない。先に走っている最大4件は終わるが、その次の局・日は始めない。`RADIKO_CATALOG_ORIGIN` が `http://127.0.0.1:ポート` だけのときは、番組表の取得先をそこへ替える。それ以外の値は拒否する。利用者向けの設定ではなく、ヘルプには出さない。配信の URL は替わらない。
+
+`clippy.toml` は `eprintln!` と `eprint!` を拒否する。テストの計測表示だけ許可している。進捗表示を `eprintln!` に戻すと、stable と Rust 1.85.0 の clippy `-D warnings` がどちらもそのマクロだけで失敗する。
+
+確認は Linux x86_64、`/dev/full` がある環境である。標準出力を `/dev/full` にした5日分は終了 1、`エラー:` の行は空き容量不足の一つだけで、5日目の番組表はリクエストされない。標準エラーを `/dev/full` にしたときは5日とも取り、終了コードは標準エラーを読んだときと同じ 0 である。閉じた標準出力は終了 141 で、`エラー:` の行は無い。macOS には `/dev/full` が無いので、このテストは Linux だけでコンパイルする。標準エラーを開いた CLI 29 例は `568e130` とバイト列が一致した。
+
+Linux、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 395 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 fmt`、同じオプションの clippy とテストも 395 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn` のオフライン TUI スモークは終了 0、端末復元だった。radiko への通信と実機の再生はない。
+
 ## 2026年10月29日：閉じた標準エラーでは表示だけ捨て、終了コードは変えない
 
 Rust は SIGPIPE を無視する。標準エラーが閉じたパイプだと、進捗の書き込みが `failed printing to stderr` でパニックし、終了コード 101 になる。対象は CLI と、再生準備が状態を出す箇所である。
@@ -16,7 +30,7 @@ Rust は SIGPIPE を無視する。標準エラーが閉じたパイプだと、
 
 エラー行、番組表の進捗、検索条件の復元失敗を、それぞれ元の書き込みに戻すと、対応するテストが終了 101 で失敗した。戻したあとは元のヘルパーに戻している。ログインのプロンプトは、標準エラーが端末でないと到達しない。再生の状態表示と準備の報告は、会員セッションと配信が要る。無音出力の途中表示は、音声機器が要る。保存先を解決できない表示は、ホームディレクトリが無いときにだけ出る。これらは今回の自動テストでは到達していない。
 
-標準出力がパイプ以外で書けないとき、たとえば容量不足のとき、残りの番組表取得を止める処理は足していない。止めるのは、これまでどおり標準出力の `BrokenPipe` だけである。
+この節の時点では、標準出力がパイプ以外で書けないときに残りの番組表取得を止めていない。同じ日の前の節で、空き容量不足は取得を止めて終了コード 1 にしている。
 
 確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 389 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 fmt`、同じオプションの clippy とテストも 389 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。この環境では AppArmor の sysctl は無く、`unshare -rn` はそのまま成功した。macOS はこの環境では実行していない。同じテストは `#![cfg(unix)]` なので、GitHub Actions の macos-15 でも走る。radiko への通信と実機の再生はない。音声デバイスは使っていない。
 
