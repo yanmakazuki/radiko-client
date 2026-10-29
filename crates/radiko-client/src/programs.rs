@@ -1,5 +1,6 @@
 //! 番組一覧CLIの条件解析と表示。取得件数と絞り込み後の件数、取得失敗を区別する。
-use crate::stdout::{self, stdout_ln};
+use crate::stderr::stderr_ln;
+use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
 use radiko::catalog::search::{Filter, ObservedClassifications};
 use radiko::{
@@ -206,7 +207,7 @@ fn restored_request(
                 None => SearchCriteria::initial(now)?,
             },
             Err(error) => {
-                eprintln!("検索条件を復元できません: {error}（当日・全国・指定なしで検索）");
+                stderr_ln!("検索条件を復元できません: {error}（当日・全国・指定なしで検索）");
                 return Ok((
                     from_criteria(&SearchCriteria::initial(now)?, json, classifications),
                     false,
@@ -239,7 +240,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         None => match SearchStore::default_location() {
             Ok(store) => Some(store),
             Err(error) => {
-                eprintln!("検索条件を保存できません: {error}");
+                stderr_ln!("検索条件を保存できません: {error}");
                 None
             }
         },
@@ -251,7 +252,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
     if allow_save {
         if let Some(store) = &store {
             if let Err(error) = store.save_last(criteria_from_request(&request)?) {
-                eprintln!("検索条件を保存できません: {error}（現在の条件で検索を継続）");
+                stderr_ln!("検索条件を保存できません: {error}（現在の条件で検索を継続）");
             }
         }
     }
@@ -296,7 +297,7 @@ fn acquire_range(
     let cancel = AtomicBool::new(false);
     let mut display_error = None;
     let mut on_progress = |progress: radiko::catalog::Progress<'_>| {
-        eprintln!(
+        stderr_ln!(
             "{} {}/{} / 失敗: {} / {} {}",
             progress.phase,
             progress.completed,
@@ -308,9 +309,8 @@ fn acquire_range(
         if !request.json && display_error.is_none() {
             if let Some(list) = progress.list {
                 if let Err(error) = print_list(list, now, &request.filter) {
-                    if stdout::is_closed(error.as_ref()) {
-                        cancel.store(true, Ordering::Release);
-                    }
+                    // BrokenPipe も空き容量不足も、残りの局・日は取らない。
+                    cancel.store(true, Ordering::Release);
                     display_error = Some(error);
                 }
             }
@@ -333,10 +333,10 @@ fn acquire_range(
             &mut on_progress,
         )
     };
-    match display_error {
-        Some(error) if stdout::is_closed(error.as_ref()) => return Err(error),
-        Some(error) if fetched.is_ok() => return Err(error),
-        _ => {}
+    // 表示できなくなったら、取り消しや一部失敗よりその書き込みエラーを先に返す。
+    // BrokenPipe は終了コード 141 のまま、メッセージは main が足さない。
+    if let Some(error) = display_error {
+        return Err(error);
     }
     let report = fetched?;
     if request.json {
@@ -365,13 +365,14 @@ fn acquire_range(
             report.stations.len() * request.range.days().len()
         );
         for failure in &report.area_failures {
-            eprintln!(
+            stderr_ln!(
                 "未取得地域 {}（対象局も未確定）: {}",
-                failure.target, failure.error
+                failure.target,
+                failure.error
             );
         }
         for failure in &report.schedule_failures {
-            eprintln!(
+            stderr_ln!(
                 "未取得番組表 {} {}: {}",
                 failure.target,
                 failure.day.map(|day| day.to_string()).unwrap_or_default(),

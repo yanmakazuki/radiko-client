@@ -45,6 +45,7 @@ pub mod domain;
 pub mod player;
 mod reconnect;
 pub mod session;
+pub mod stderr;
 pub mod storage;
 
 /// 番組表、検索条件、セッション、再生要求で共通する型。

@@ -86,9 +86,56 @@ pub fn parse_day(text: &str) -> Result<NaiveDate, CatalogError> {
     NaiveDate::parse_from_str(text, "%Y%m%d").map_err(|_| CatalogError::InvalidDate)
 }
 
+/// デバッグビルドの自動テストだけが読む。リリースビルドはこの名前を含まない。
+#[cfg(debug_assertions)]
+const CATALOG_ORIGIN_ENV: &str = "RADIKO_CATALOG_ORIGIN";
+
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn loopback_catalog_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    if super::http::loopback_catalog_url(&url)
+        && (url.path().is_empty() || url.path() == "/")
+        && url.query().is_none()
+        && url.fragment().is_none()
+    {
+        Some(format!("http://127.0.0.1:{}", url.port()?))
+    } else {
+        None
+    }
+}
+
+#[cfg(debug_assertions)]
+fn prepare_catalog_http() -> Result<Http, CatalogError> {
+    let mut http = Http::new()?;
+    if std::env::var_os(CATALOG_ORIGIN_ENV).is_some() {
+        catalog_base()?;
+        http.permit_loopback_catalog()?;
+    }
+    Ok(http)
+}
+
+#[cfg(not(debug_assertions))]
+fn prepare_catalog_http() -> Result<Http, CatalogError> {
+    Ok(Http::new()?)
+}
+
+fn catalog_base() -> Result<String, CatalogError> {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(value) = std::env::var(CATALOG_ORIGIN_ENV) {
+            return loopback_catalog_origin(&value).ok_or(CatalogError::Network);
+        }
+    }
+    Ok("https://radiko.jp".to_string())
+}
+
+fn catalog_url(path: &str) -> Result<Url, CatalogError> {
+    Url::parse(&format!("{}{path}", catalog_base()?)).map_err(|_| CatalogError::Network)
+}
+
 pub fn list_programs(station: &str, day: NaiveDate) -> Result<ProgramList, CatalogError> {
     validate_station(station).map_err(|_| CatalogError::InvalidStation)?;
-    let http = Http::new().map_err(CatalogError::from)?;
+    let http = prepare_catalog_http()?;
     fetch_programs(&http, station, day)
 }
 
@@ -97,9 +144,18 @@ fn fetch_programs(
     station: &str,
     day: NaiveDate,
 ) -> Result<ProgramList, CatalogError> {
+    fetch_programs_from(http, station, day, &catalog_base()?)
+}
+
+fn fetch_programs_from(
+    http: &impl Fetch,
+    station: &str,
+    day: NaiveDate,
+    base: &str,
+) -> Result<ProgramList, CatalogError> {
     validate_station(station).map_err(|_| CatalogError::InvalidStation)?;
     let url = Url::parse(&format!(
-        "https://radiko.jp/v3/program/station/date/{}/{station}.xml",
+        "{base}/v3/program/station/date/{}/{station}.xml",
         day.format("%Y%m%d")
     ))
     .map_err(|_| CatalogError::InvalidDate)?;
@@ -377,6 +433,35 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_catalog_url_stays_on_https_radiko() {
+        let url = catalog_url("/v3/program/station/date/20261015/TBS.xml").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://radiko.jp/v3/program/station/date/20261015/TBS.xml"
+        );
+    }
+
+    #[test]
+    fn loopback_catalog_origin_accepts_only_a_bare_local_port() {
+        assert_eq!(
+            loopback_catalog_origin("http://127.0.0.1:9").as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        for value in [
+            "https://127.0.0.1:9",
+            "http://127.0.0.1",
+            "http://127.0.0.1:9/v3",
+            "http://localhost:9",
+            "http://127.0.0.1:9?x=1",
+            "http://user@127.0.0.1:9",
+            "https://radiko.jp",
+        ] {
+            assert_eq!(loopback_catalog_origin(value), None, "{value}");
+        }
+    }
+
+    #[test]
     fn cancelled_catalog_client_rejects_construction_before_network_and_preserves_error_kind() {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         assert!(matches!(
@@ -444,11 +529,19 @@ mod tests {
     fn every_request_refetches_without_credentials_or_stale_fallback() {
         let mock = Mock(Cell::new(0));
         let day = parse_day("20261015").unwrap();
-        assert!(fetch_programs(&mock, "../TBS", day).is_err());
+        // 本番の URL を直接渡す。環境変数の試験用オリジンには依存しない。
+        let base = "https://radiko.jp";
+        assert!(fetch_programs_from(&mock, "../TBS", day, base).is_err());
         assert_eq!(mock.0.get(), 0);
-        assert_eq!(fetch_programs(&mock, "TBS", day).unwrap().programs.len(), 3);
+        assert_eq!(
+            fetch_programs_from(&mock, "TBS", day, base)
+                .unwrap()
+                .programs
+                .len(),
+            3
+        );
         assert!(matches!(
-            fetch_programs(&mock, "TBS", day),
+            fetch_programs_from(&mock, "TBS", day, base),
             Err(CatalogError::Network)
         ));
         assert_eq!(mock.0.get(), 2);
@@ -461,7 +554,9 @@ pub struct CatalogClient {
 }
 impl CatalogClient {
     pub fn new() -> Result<Self, CatalogError> {
-        Ok(Self { http: Http::new()? })
+        Ok(Self {
+            http: prepare_catalog_http()?,
+        })
     }
     pub fn new_cancellable(
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -470,7 +565,7 @@ impl CatalogClient {
         if cancel.load(Ordering::Acquire) {
             return Err(CatalogError::Cancelled);
         }
-        let mut http = Http::new()?;
+        let mut http = prepare_catalog_http()?;
         http.set_cancellation(std::sync::Arc::new(move || cancel.load(Ordering::Acquire)));
         Ok(Self { http })
     }
@@ -495,8 +590,7 @@ fn fetch_stations(
     area: &str,
 ) -> Result<Vec<crate::domain::Station>, CatalogError> {
     validate_area(area)?;
-    let url = Url::parse(&format!("https://radiko.jp/v3/station/list/{area}.xml"))
-        .map_err(|_| CatalogError::InvalidArea)?;
+    let url = catalog_url(&format!("/v3/station/list/{area}.xml"))?;
     parse_stations(&fetch_xml(http, url)?, area)
 }
 

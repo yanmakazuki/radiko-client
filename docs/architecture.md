@@ -1,6 +1,6 @@
 # アーキテクチャ
 
-2026年10月28日時点の構成です。仕様の意味は [機能設計](design.md)、確認の範囲は [検証範囲](validation.md)、日付ごとの手順と数値は [実装状況](implementation.md) にあります。
+2026年10月29日時点の構成です。仕様の意味は [機能設計](design.md)、確認の範囲は [検証範囲](validation.md)、日付ごとの手順と数値は [実装状況](implementation.md) にあります。
 
 画面は状態を直接変えません。通信とデコードの結果は、領域ごとの要求 ID を付けてメインループへ返し、ID が一致するものだけを反映します。キャンセルしたあとに届いた結果も捨てます。
 
@@ -51,10 +51,11 @@ flowchart LR
 | `storage.rs` と `storage/searches.rs` | `session.json` と `searches.json` の原子的な読み書き。`DataDir` が同じディレクトリを返す |
 | `programs.rs` `play.rs` `chapters.rs` `searches.rs` | 各 CLI。バイナリ側 |
 | `stdout.rs` | CLI の標準出力。閉じたパイプは終了コード 141 で戻し、stderr には出さない |
+| `stderr.rs`（バイナリ）と `radiko` の `stderr` | CLI と再生準備の標準エラー。書けないときは捨てて、終了コードは変えない |
 | `crates/radiko/tests/` と `crates/radiko-client/tests/` | ライブラリと CLI の統合テスト |
 | `tests/fixtures/` | 資格情報を含まない合成データ |
 
-CLI が標準出力へ書く行は `stdout.rs` に集約する。読み手がパイプを閉じたときの `BrokenPipe` は、エラー行を足さず終了コード 141（128+SIGPIPE）で戻す。stderr の進捗と失敗表示は変えない。SIGPIPE を `unsafe` で既定に戻すことはしない。
+CLI が標準出力へ書く行は `stdout.rs` に集約する。読み手がパイプを閉じたときの `BrokenPipe` は、エラー行を足さず終了コード 141（128+SIGPIPE）で戻す。それ以外の書き込み失敗、たとえば空き容量不足は、番組表の残りを取るのをやめ、終了コード 1 と標準エラーの「エラー: 書き込みに失敗しました（空き容量不足）」一行で戻す。標準エラーの進捗と失敗は `radiko::stderr` の一つの書き込みに集め、書けないときは捨てて、取得も終了コードも変えない。SIGPIPE を `unsafe` で既定に戻すことはしない。`eprintln!` と `eprint!` は clippy が拒否する。
 
 採用バージョンは各クレートの `Cargo.toml` と、ワークスペースの `Cargo.lock` が正です。画面は Ratatui 0.29.0 と Crossterm 0.28.1 で、バイナリだけが依存します。出力は CPAL 0.16.0 と rtrb 0.3.2、AAC は `rusty_aac` 1.1.0、コンテナの解析に Symphonia 0.5、HTTP は reqwest 0.12（`rustls-tls`、blocking feature は使わない）、非同期ランタイムは Tokio です。CPAL の既定ホストは、macOS では CoreAudio、Linux では ALSA です。Linux のビルドは libasound にリンクします。JACK 機能は有効にしていません。
 

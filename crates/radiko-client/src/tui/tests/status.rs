@@ -909,6 +909,7 @@ fn catalog_page_keys_only_change_selection_and_use_the_rendered_height() {
 }
 
 #[test]
+#[allow(clippy::disallowed_macros)]
 fn large_catalog_keeps_global_selection_visible_at_the_end_and_after_moving_up() {
     let mut screen = screen();
     let mut search =

@@ -21,6 +21,8 @@ pub(crate) struct Http {
     client: Client,
     diagnostics: Option<Arc<RequestMeasurements>>,
     cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// `http://127.0.0.1:port` の番組表だけを許す。本番の配信先には使わない。
+    loopback_catalog: bool,
 }
 pub(crate) trait Fetch {
     fn get(
@@ -56,6 +58,14 @@ pub(crate) struct RawReply {
     pub bytes: Vec<u8>,
 }
 
+pub(crate) fn loopback_catalog_url(url: &Url) -> bool {
+    url.scheme() == "http"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_some()
+        && url.host_str() == Some("127.0.0.1")
+}
+
 pub(crate) fn trusted(url: &Url) -> bool {
     url.scheme() == "https"
         && url.username().is_empty()
@@ -84,7 +94,25 @@ impl Http {
             client,
             diagnostics: None,
             cancelled: None,
+            loopback_catalog: false,
         })
+    }
+    /// デバッグビルドの番組表試験用。`http://127.0.0.1` 以外はこれまでどおり拒否する。
+    #[cfg(debug_assertions)]
+    pub(crate) fn permit_loopback_catalog(&mut self) -> Result<(), ProbeError> {
+        self.client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .user_agent(concat!("radiko-client/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|_| ProbeError::Network)?;
+        self.loopback_catalog = true;
+        Ok(())
+    }
+    fn allowed(&self, url: &Url) -> bool {
+        trusted(url) || (self.loopback_catalog && loopback_catalog_url(url))
     }
     pub(crate) fn enable_diagnostics(&mut self) -> Arc<RequestMeasurements> {
         self.diagnostics
@@ -409,7 +437,7 @@ impl Fetch for Http {
         let _finish = FinishRequest(self.diagnostics.as_deref());
         for _ in 0..=5 {
             self.check_cancelled()?;
-            if !trusted(&url) {
+            if !self.allowed(&url) {
                 return Err(ProbeError::UnsafeUrl);
             }
             let step = self.exchange(&url, &headers, limit, range, redirects)?;

@@ -3110,7 +3110,7 @@ mod tests {
     const AUTH_EXPIRED: &str =
         "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください";
 
-    /// stderr of `main`'s `eprintln!("エラー: {}", cli_error_body(...))`.
+    /// stderr of main's `エラー: {}` line, using `cli_error_body`.
     fn cli_stderr(error: &PlaybackError) -> String {
         format!(
             "エラー: {}",

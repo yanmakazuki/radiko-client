@@ -1,4 +1,5 @@
 //! 連続再生CLIの操作と通知。認証確認、割り込み、対話コマンドを再生処理へ接続する。
+use crate::stderr::stderr_ln;
 use crate::stdout::stdout_ln;
 use chrono::{DateTime, FixedOffset, Utc};
 use radiko::player::seek::{Command, Controller, PlaybackRequest};
@@ -222,7 +223,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         return Ok(());
     }
     let membership = membership?;
-    eprintln!("放送枠・配信条件を確認して連続再生を準備しています…");
+    stderr_ln!("放送枠・配信条件を確認して連続再生を準備しています…");
     let initial_stop = stop.clone();
     let prepared = prepare_at_controlled(
         &request.station,
@@ -251,7 +252,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         info.ends_at.with_timezone(&jst).format("%Y-%m-%d %H:%M:%S")
     );
     let progress = |p: playback::Progress| {
-        eprintln!("{}", describe(&p));
+        stderr_ln!("{}", describe(&p));
     };
     let report = if request.interactive {
         let (tx, rx) = mpsc::sync_channel(4);
@@ -270,7 +271,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                             break;
                         }
                     }
-                    Err(error) => eprintln!("{error}"),
+                    Err(error) => stderr_ln!("{error}"),
                 }
             }
         });
@@ -294,7 +295,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
             .map(|s| Box::new(s) as Box<dyn SegmentSource>)
             .map_err(playback::PlaybackError::Source)
         });
-        eprintln!(
+        stderr_ln!(
             "操作: live 局ID / timefree 局ID YYYYMMDDHHmmss [--offset 秒数] / status / pause / resume / volume 0〜100 / seek 秒数 / +15 / -15 / q（Enterで確定）"
         );
         playback::play_controlled(source, request.seconds, stop, &mut controls, progress)?
