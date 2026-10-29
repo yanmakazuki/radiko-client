@@ -4,6 +4,18 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月29日：機器がないときの JACK のログを、列挙と出力オープンのあいだだけ隠す
+
+CPAL 0.16.0 の ALSA ホストは、`default_host` 自体では機器を開かない。`default_output_device` も名前 `default` を返すだけで PCM は開かない。ログが出るのは `output_devices` の列挙である。組み込み名は `default`、`pipewire`、`pulse`、`jack`、`oss` で、`DeviceHandles::open` は再生と録音の両方で `PCM::new` する。サーバがない `jack` は両方失敗し、libjack が fd 2 へ 10 行書く。内訳は接続失敗 2 行、要求チャネル 2 行、サーバ未起動 2 行、`JackShmReadWritePtr` のデストラクタ 4 行である。ALSA の `snd_lib_error_set_handler` はこの経路を通らない。`JACK_NO_START_SERVER=1` でも同じ 10 行が残った。CPAL の JACK ホスト機能は依存に入っていない。
+
+隠す範囲は、その列挙と、対応構成の問い合わせ、ストリームの作成、`play` だけである。fd 2 を `/dev/null` に `dup2` し、RAII のドロップで戻す。入れ子は深さを数える。アプリの `radiko::stderr` は、差し替える前に複製した元の標準エラーへ書く。この窓のあいだも、TUI の通知や `stderr_ln!` は残る。fd 2 へ直接書くもの（libjack、プラグイン、別スレッドのパニック）は、窓のあいだは捨てる。窓を持っているスレッドのパニックは、ドロップのあとなので表示される。`RADIKO_ALSA_LOG=1` のときはハンドラも fd 2 も替えない。`default` が JACK プラグインなら、これまでどおりその PCM を開く。ログを隠しても JACK を使えなくはしない。`dup` / `dup2` / `open` は rustix 1.1.5 の安全な関数である。このクレートの `rust-version` は 1.65 で、機能は `std`、`fs`、`stdio` だけである。このコードに `unsafe` はない。
+
+確認環境は Linux x86_64、`/dev/snd` なし、libjack-jackd2-0 1.9.21、`libasound_module_pcm_jack.so` あり、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。修正前の `output-info` と `probe-output 1` はどちらも終了 1 で、stderr は上の JACK 10 行に「エラー: 既定の音声出力機器がありません」が続いた。修正後はどちらも終了 1 のまま、stderr はその日本語の 1 行だけである。`RADIKO_ALSA_LOG=1` の `output-info` は修正前後で stderr が 3152 バイト一致し、JACK 10 行と `ALSA lib` と日本語のエラーが残った。`probe-output 1` に同じ変数を付けたときも、JACK 10 行と日本語のエラーが残った。
+
+自動テストは libjack がなくても、差し替え中の fd 2 への書き込みが出ないこと、入れ子の内側を戻しても外側が隠したままであること、並行の `stderr::write_line` が残ること、早期 return のあと fd 2 が戻り `AFTER` とエラー行が出ることを見る。`RADIKO_ALSA_LOG=1` では同じネイティブ書き込みが出る。CLI は、存在しないカードの設定で `output-info`、`probe-output 1`、`probe-output --mute 1` の stderr が日本語 1 行と完全一致し、終了コードが 1 のままであることを見る。閉じた標準エラーの既存テストも成功した。null sink の判定は `ALSA lib` に加え JACK の行でも失敗する。Python の単体テストは 58 件成功である。
+
+`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 402 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 fmt`、同じオプションの clippy とテストも 402 件成功、失敗 0、ignored 2 件である。PulseAudio の null sink ジョブはこの環境では実行していない。実機の Q2-N（#26）も未確認である。radiko への通信と実機の再生はない。
+
 ## 2026年10月29日：試験用の番組表オリジンはデバッグビルドだけ
 
 `RADIKO_CATALOG_ORIGIN` は、デバッグビルドが `http://127.0.0.1:ポート` の番組表を数えるときだけ読む。リリースビルドはこの変数を読まず、常に `https://radiko.jp` を使う。変数名はリリースの実行ファイルに含まれない。`cargo build --release` のバイナリを文字列検索し、`RADIKO_CATALOG_ORIGIN` は 0 件だった。同じ変数を付けたリリースの `programs TBS 20261001 20261002` は `127.0.0.1` へ繋がず、443 の radiko へ繋がった。リリースの単体テストは、変数が `http://127.0.0.1:9` でも URL が `https://radiko.jp/v3/program/station/date/20261015/TBS.xml` のままであることを確認する。

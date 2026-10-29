@@ -31,6 +31,16 @@ class OutputInfoTests(unittest.TestCase):
         self.assertIn("status=0", summary)
         self.assertIn("alsa_lib_lines=0", summary)
 
+    def test_jack_plugin_line_fails(self):
+        stderr = (
+            "Cannot connect to server socket err = No such file or directory\n"
+            "jack server is not running or cannot be started\n"
+            "JackShmReadWritePtr::~JackShmReadWritePtr - Init not done for -1, skipping unlock\n"
+        )
+        with self.assertRaises(CheckError) as raised:
+            check_output_info(0, OUTPUT_INFO_STDOUT, stderr)
+        self.assertIn("JACK", str(raised.exception))
+
     def test_alsa_lib_anywhere_in_a_stderr_line_fails(self):
         stderr = "note: ALSA lib confmisc.c:855:(parse_card) cannot find card '0'\n"
         with self.assertRaises(CheckError) as raised:

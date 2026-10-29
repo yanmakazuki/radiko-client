@@ -451,17 +451,21 @@ fn linux_output_commands_hide_alsa_diagnostics_and_name_a_missing_device() {
         let stderr = String::from_utf8_lossy(&quiet.stderr);
         let stdout = String::from_utf8_lossy(&quiet.stdout);
         assert!(
-            !stderr.contains("ALSA lib") && !stdout.contains("ALSA lib"),
-            "{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
             !quiet.status.success(),
             "{args:?} stdout={stdout} stderr={stderr}"
         );
-        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            quiet.status.code(),
+            Some(1),
+            "{args:?} stdout={stdout} stderr={stderr}"
+        );
+        assert_eq!(
+            stderr, "エラー: 既定の音声出力機器がありません\n",
+            "{args:?}\nstdout:\n{stdout}"
+        );
         assert!(
-            combined.contains("既定の音声出力機器がありません"),
-            "{args:?} {combined}"
+            stdout.is_empty(),
+            "{args:?} stdout should stay empty when the device is missing:\n{stdout}"
         );
     }
     let verbose = Command::new(env!("CARGO_BIN_EXE_radiko-client"))
