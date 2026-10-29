@@ -252,7 +252,7 @@ Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e
 
 対象は `a5b8786` の ignored テスト `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` である。環境は Linux x86_64、Rust 1.99.1、PulseAudio 16.1 の `module-null-sink`（シンク名 `null`、`libasound2-plugins` 経由の ALSA `default`）で、`/dev/snd` はない。ALSA の `null` PCM は使っていない。テストの判定は変えていない。
 
-`cargo +stable test --locked -p radiko --lib native_muted -- --ignored --test-threads=1 --nocapture` を 20 回続けた。`native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` は 20 回成功、0 回失敗である。各回 `gap_after=4` の不足は 0、`gap_after=1` の不足は 334,857〜339,893 フレームで、テストが 0 ではないことを求める側のままである。fragment の 5 秒は各回不足 0 で、1 回あたり約 55.5 秒だった。QA が同じ `a5b8786` で 4 回中 1 回失敗したときのメッセージと値は残っていない。この 20 回は直列で、その失敗は再現していない。実機の再生、耳での確認、radiko への通信はない。
+`cargo +stable test --locked -p radiko --lib native_muted -- --ignored --test-threads=1 --nocapture` を 20 回続けた。`native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` は 20 回成功、0 回失敗である。各回 `gap_after=4` の不足は 0、`gap_after=1` の不足は 334,857〜339,893 フレームで、テストが 0 ではないことを求める側のままである。fragment の 5 秒は各回不足 0 で、1 回あたり約 55.5 秒だった。QA が同じ `a5b8786` で 4 回中 1 回失敗したときのメッセージと値は残っていない。再現していないのは、`--test-threads=1` を付けたこの直列 20 回の結果である。`--test-threads` を付けない並列では再現している。記録は Issue #40（PulseAudio の null sink で、既定の並列数の 20 回中 1 回、`native_muted` の 2 件が約 45 秒で同時に `Output(Stalled)` になった）である。実機の再生、耳での確認、radiko への通信はない。
 
 ## 2026年10月27日：main の出力変更と再生中の 401 再認証を合わせる
 
