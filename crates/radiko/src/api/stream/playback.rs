@@ -1024,6 +1024,17 @@ mod tests {
         }
         text.into_bytes()
     }
+    /// `#EXT-X-DISCONTINUITY` immediately before sequence `tag_at`.
+    fn media_with_tag(first: u64, count: u64, tag_at: u64) -> Vec<u8> {
+        let mut text = format!("#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:{first}\n");
+        for n in first..first + count {
+            if n == tag_at {
+                text.push_str("#EXT-X-DISCONTINUITY\n");
+            }
+            text.push_str(&format!("#EXTINF:5,\ns{n}.aac?signature=b\n"));
+        }
+        text.into_bytes()
+    }
     fn parsed(bytes: &[u8]) -> m3u8_rs::MediaPlaylist {
         match parse_hls(bytes).unwrap() {
             Playlist::MediaPlaylist(m) => m,
@@ -1320,6 +1331,147 @@ mod tests {
         assert!(source.http.steps.borrow().is_empty());
     }
     #[test]
+    fn two_consecutive_in_window_realignments_accumulate_skipped_segments_without_resetting() {
+        let mut source = live_reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/media.m3u8", media(13, 2, false, "b", false)),
+                ("/audio/s13.aac", vec![13]),
+                ("/audio/s14.aac", vec![14]),
+                ("/audio/media.m3u8", media(18, 3, false, "c", false)),
+                ("/audio/s18.aac", vec![18]),
+                ("/audio/s19.aac", vec![19]),
+            ],
+        );
+        let opened = segment(&mut source);
+        assert_eq!(opened.bytes, [10]);
+        assert!(!opened.discontinuity);
+        let joined = segment(&mut source);
+        assert_eq!(joined.bytes, [13]);
+        assert!(joined.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert_eq!(source.http.resets.get(), 0);
+        let after = segment(&mut source);
+        assert_eq!(after.bytes, [14]);
+        assert!(!after.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert_eq!(source.http.resets.get(), 0);
+        let reload_at = source.reload_at;
+        let joined_again = segment_at(&mut source, reload_at);
+        assert_eq!(joined_again.bytes, [18]);
+        assert!(joined_again.discontinuity);
+        assert_eq!(source.http.skipped.get(), 5);
+        assert_eq!(source.http.resets.get(), 0);
+        let after_again = segment(&mut source);
+        assert_eq!(after_again.bytes, [19]);
+        assert!(!after_again.discontinuity);
+        assert_eq!(source.http.skipped.get(), 5);
+        assert_eq!(source.http.resets.get(), 0);
+        assert_eq!(
+            [
+                opened.discontinuity,
+                joined.discontinuity,
+                after.discontinuity,
+                joined_again.discontinuity,
+                after_again.discontinuity,
+            ]
+            .iter()
+            .filter(|flag| **flag)
+            .count(),
+            2
+        );
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    fn live_catch_up_with_tag(tag_at: u64) -> HlsStream<Mock> {
+        live_reader(
+            &media(10, 1, false, "a", false),
+            vec![
+                ("/audio/s10.aac", vec![10]),
+                ("/audio/media.m3u8", media_with_tag(13, 3, tag_at)),
+                ("/audio/s13.aac", vec![13]),
+                ("/audio/s14.aac", vec![14]),
+                ("/audio/s15.aac", vec![15]),
+            ],
+        )
+    }
+    #[test]
+    fn discontinuity_on_the_joined_segment_resets_the_decoder_once() {
+        let mut source = live_catch_up_with_tag(13);
+        let opened = segment(&mut source);
+        let joined = segment(&mut source);
+        let after = segment(&mut source);
+        let tail = segment(&mut source);
+        assert_eq!(opened.bytes, [10]);
+        assert_eq!(joined.bytes, [13]);
+        assert_eq!(after.bytes, [14]);
+        assert_eq!(tail.bytes, [15]);
+        assert!(!opened.discontinuity);
+        assert!(joined.discontinuity);
+        assert!(!after.discontinuity);
+        assert!(!tail.discontinuity);
+        assert_eq!(
+            [
+                opened.discontinuity,
+                joined.discontinuity,
+                after.discontinuity,
+                tail.discontinuity,
+            ]
+            .iter()
+            .filter(|flag| **flag)
+            .count(),
+            1
+        );
+        assert_eq!(source.http.skipped.get(), 2);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn discontinuity_after_the_join_resets_at_the_join_and_at_the_tag() {
+        let mut source = live_catch_up_with_tag(14);
+        let opened = segment(&mut source);
+        let joined = segment(&mut source);
+        let tagged = segment(&mut source);
+        let tail = segment(&mut source);
+        assert_eq!(opened.bytes, [10]);
+        assert_eq!(joined.bytes, [13]);
+        assert_eq!(tagged.bytes, [14]);
+        assert_eq!(tail.bytes, [15]);
+        assert!(!opened.discontinuity);
+        assert!(joined.discontinuity);
+        assert!(tagged.discontinuity);
+        assert!(!tail.discontinuity);
+        assert_eq!(
+            [
+                opened.discontinuity,
+                joined.discontinuity,
+                tagged.discontinuity,
+                tail.discontinuity,
+            ]
+            .iter()
+            .filter(|flag| **flag)
+            .count(),
+            2
+        );
+        assert_eq!(source.http.skipped.get(), 2);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn in_window_realign_rejects_a_join_target_behind_next() {
+        let mut source = live_reader(&media(10, 3, false, "a", false), vec![]);
+        source.next = 100;
+        let Err(error) = source.realign(false) else {
+            panic!("checked_sub must reject a join target behind next");
+        };
+        assert!(matches!(error, ProbeError::InvalidPlaylist));
+        assert_eq!(source.next, 100);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
+        assert!(!source.pending_discontinuity);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
     fn live_window_longer_than_three_target_durations_joins_near_the_edge() {
         let mut source = live_reader(
             &media(10, 1, false, "a", false),
@@ -1561,10 +1713,18 @@ mod tests {
         notes: Cell<usize>,
         cancel_auth: Cell<bool>,
         fail_auth: Cell<bool>,
+        skipped: Cell<u64>,
+        resets: Cell<u64>,
     }
     impl Fetch for Scripted {
         fn note_reauthentication(&self) {
             self.notes.set(self.notes.get() + 1);
+        }
+        fn note_skipped_segments(&self, count: u64) {
+            self.skipped.set(self.skipped.get().saturating_add(count));
+        }
+        fn note_sequence_reset(&self) {
+            self.resets.set(self.resets.get().saturating_add(1));
         }
         fn get(
             &self,
@@ -1675,6 +1835,8 @@ mod tests {
                 notes: Cell::new(0),
                 cancel_auth: Cell::new(false),
                 fail_auth: Cell::new(false),
+                skipped: Cell::new(0),
+                resets: Cell::new(0),
             },
             Url::parse("https://radiko.jp/audio/media.m3u8").unwrap(),
             headers,
@@ -1733,6 +1895,102 @@ mod tests {
         assert!(!second.discontinuity);
         assert_eq!(second.duration, Some(Wait::from_secs(5)));
         assert_eq!(source.next, 12);
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 1);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    fn playlist_401_then_ahead(live: bool) -> HlsStream<Scripted> {
+        let ahead = media(13, 2, false, "new", false);
+        let mut steps = vec![
+            step("/audio/s10.aac", Some("signature=old"), None, Ok(vec![10])),
+            step(
+                "/audio/media.m3u8",
+                None,
+                Some("synthetic-expired-token"),
+                Err(ProbeError::Authentication),
+            ),
+            step(
+                "/audio/media.m3u8",
+                None,
+                Some("synthetic-renewed-token"),
+                Ok(ahead),
+            ),
+        ];
+        if live {
+            steps.push(step(
+                "/audio/s13.aac",
+                Some("signature=new"),
+                None,
+                Ok(vec![13]),
+            ));
+            steps.push(step(
+                "/audio/s14.aac",
+                Some("signature=new"),
+                None,
+                Ok(vec![14]),
+            ));
+        }
+        let mut source = authed(&media(10, 1, false, "old", false), steps);
+        source.live = live;
+        source
+    }
+    fn segment_after_reauth(source: &mut HlsStream<Scripted>) -> Segment {
+        match source.poll(Instant::now()) {
+            Ok(Next::Segment(segment)) => segment,
+            Err(error @ (ProbeError::WindowLost | ProbeError::AuthExpired)) => {
+                panic!("re-auth catch-up must not stop with {error}");
+            }
+            Err(ProbeError::At(stage, error))
+                if matches!(
+                    error.as_ref(),
+                    ProbeError::WindowLost | ProbeError::AuthExpired
+                ) =>
+            {
+                panic!("re-auth catch-up must not stop with {stage}: {error}");
+            }
+            Err(error) => panic!("expected the caught-up segment, got {error}"),
+            Ok(Next::Pending(_)) => {
+                panic!("expected the caught-up segment, playlist reload is still waiting")
+            }
+            Ok(Next::End) => panic!("expected the caught-up segment, playlist ended"),
+        }
+    }
+    #[test]
+    fn live_playlist_401_catches_up_a_window_ahead_of_next_after_one_reauth() {
+        let mut source = playlist_401_then_ahead(true);
+        let opened = next_segment(&mut source);
+        assert_eq!(opened.bytes, [10]);
+        assert!(!opened.discontinuity);
+        assert_eq!(source.http.auth_calls.get(), 0);
+        assert_eq!(source.http.notes.get(), 0);
+        let joined = segment_after_reauth(&mut source);
+        assert_eq!(joined.bytes, [13]);
+        assert!(joined.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert_eq!(source.http.resets.get(), 0);
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 1);
+        let after = next_segment(&mut source);
+        assert_eq!(after.bytes, [14]);
+        assert!(!after.discontinuity);
+        assert_eq!(source.http.skipped.get(), 2);
+        assert_eq!(source.http.auth_calls.get(), 1);
+        assert_eq!(source.http.notes.get(), 1);
+        assert!(source.http.steps.borrow().is_empty());
+    }
+    #[test]
+    fn timefree_playlist_401_with_that_ahead_window_ends_in_window_lost() {
+        let mut source = playlist_401_then_ahead(false);
+        let opened = next_segment(&mut source);
+        assert_eq!(opened.bytes, [10]);
+        assert!(!opened.discontinuity);
+        assert_eq!(source.http.auth_calls.get(), 0);
+        let error = expect_err(source.poll(Instant::now()));
+        assert!(matches!(error, ProbeError::WindowLost));
+        assert!(!matches!(error, ProbeError::AuthExpired));
+        assert_eq!(source.next, 11);
+        assert_eq!(source.http.skipped.get(), 0);
+        assert_eq!(source.http.resets.get(), 0);
         assert_eq!(source.http.auth_calls.get(), 1);
         assert_eq!(source.http.notes.get(), 1);
         assert!(source.http.steps.borrow().is_empty());
