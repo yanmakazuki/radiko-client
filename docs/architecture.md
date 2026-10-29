@@ -153,7 +153,7 @@ macOS では、CPAL 0.16.0 の default ラッパーは `DeviceIsAlive` を付け
 
 Linux では、CPAL 0.16.0 の ALSA ホストが既定の名前を `default` に固定します。列挙の先頭に同じ名前の PCM があれば、それを開きます。列挙は、開ける `default`、`pipewire`、`pulse`、`jack`、`oss` と、カード名の `plughw` です。名前が `default` と違うものは選びません。ALSA が `POLLERR` を返すと CPAL は `StreamError` にし、このプレイヤーは同じ `OutputError::Device` にします。この切断と、`default` プラグインがデスクトップの既定を追うかは、実機では未確認です。機器の問い合わせに失敗したとき、Linux では `OutputError::NoDevice`（「既定の音声出力機器がありません」）にします。
 
-ALSA ライブラリの診断は、CPAL を呼ぶ前に `snd_lib_error_set_handler` で黙らせます。ハンドラはメッセージを読まず、戻り値の失敗はこれまでどおり日本語のエラーにします。`RADIKO_ALSA_LOG=1` のときは差し替えず、ALSA の既定の stderr 出力を残します。
+ALSA ライブラリの診断は、CPAL を呼ぶ前に `snd_lib_error_set_handler` で黙らせます。ハンドラはメッセージを読まず、戻り値の失敗はこれまでどおり日本語のエラーにします。`jack` の PCM を開いたときの libjack のログは、このハンドラを通らず fd 2 へ直接出ます。機器の列挙（`default_host` のあと `output_devices` が `jack` を再生と録音で開くところ）と、対応構成の問い合わせ、ストリームの作成、`play` のあいだだけ、fd 2 を `/dev/null` に差し替えます。ガードのドロップで元へ戻します。アプリの `radiko::stderr` は、差し替え前に複製した標準エラーへ書くので、この窓でも消えません。パニックメッセージはアンワインドより前に出るので、最初の差し替えで既存のパニックフックを包みます。窓の中では、そのフックを呼ぶ直前だけ fd 2 を元の標準エラーへ戻し、戻したあとに窓が残っていれば再び `/dev/null` にします。窓の外では、包む前のフックをそのまま呼びます。`RADIKO_ALSA_LOG=1` のときはハンドラも fd 2 も差し替えず、ALSA と JACK のログを残します。`JACK_NO_START_SERVER` ではこのログは止まりません。
 
 採用する形式は、要求レートを含む mono または stereo の f32、i32、i16 です。優先は f32、次に i32、次に i16 で、同じ形式ならチャンネル数が多い方です。整数のときはコールバック内で f32 をクリップしてから変換します。レート変換はしません。一致が無いときは、要求レートと機器が宣言した範囲を `OutputError::IncompatibleOutput` に載せます。
 

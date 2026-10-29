@@ -1361,6 +1361,7 @@ dependencies = [
  "quick-xml",
  "reqwest",
  "rtrb",
+ "rustix 1.1.5",
  "rusty_aac",
  "serde",
  "serde_json",

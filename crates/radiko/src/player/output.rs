@@ -247,26 +247,22 @@ fn supported_configs(
     device: &cpal::Device,
     on_error: OutputError,
 ) -> Result<Vec<cpal::SupportedStreamConfigRange>, OutputError> {
+    let _silence = crate::stderr::silence_native_stderr();
     device
         .supported_output_configs()
         .map(|configs| configs.collect())
         .map_err(|_| on_error)
 }
 
-/// `RADIKO_ALSA_LOG=1` leaves ALSA's own stderr handler in place.
-fn alsa_diagnostics_suppressed(value: Option<&str>) -> bool {
-    value != Some("1")
-}
-
+#[cfg(target_os = "linux")]
 fn prepare_alsa_errors() {
-    let suppress = alsa_diagnostics_suppressed(std::env::var("RADIKO_ALSA_LOG").ok().as_deref());
-    #[cfg(target_os = "linux")]
-    if suppress {
+    if !crate::stderr::show_native_audio_logs() {
         install_silent_alsa_error_handler();
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = suppress;
 }
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_alsa_errors() {}
 
 #[cfg(target_os = "linux")]
 static ALSA_ERROR_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -309,6 +305,7 @@ where
 {
     let channels = usize::from(config.channels);
     let failed = renderer.state.clone();
+    let _silence = crate::stderr::silence_native_stderr();
     device
         .build_output_stream(
             config,
@@ -335,6 +332,33 @@ where
         .map_err(|_| OutputError::Device)
 }
 
+fn start_output(stream: &cpal::Stream) -> Result<(), OutputError> {
+    let _silence = crate::stderr::silence_native_stderr();
+    stream.play().map_err(|_| OutputError::Device)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod enumeration_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn enable() {
+        ENABLED.with(|cell| cell.set(true));
+    }
+
+    /// 列挙の直前に呼ばれる。ガードが生きていれば fd 2 への書き込みは捨てられる。
+    pub(super) fn note() {
+        if !ENABLED.with(Cell::get) {
+            return;
+        }
+        let _ = rustix::io::write(rustix::stdio::stderr(), b"ENUM-FD2\n");
+        crate::stderr::write_line(format_args!("SEAM-RAN"));
+    }
+}
+
 /// The enumerated output whose name matches CPAL's current default.
 /// On macOS, CPAL 0.16 names that device after the CoreAudio default and registers
 /// `DeviceIsAlive` only for enumerated devices. The default wrapper follows later OS
@@ -343,9 +367,15 @@ where
 /// includes that name when it opens, so this selects the `default` PCM.
 fn selected_output_device() -> Result<cpal::Device, OutputError> {
     prepare_alsa_errors();
+    // Declared first so JACK PCM handles opened while enumerating drop before
+    // stderr is restored. CPAL 0.16 opens the builtin names `default`,
+    // `pipewire`, `pulse`, `jack`, and `oss`; `jack` is playback and capture.
+    let _silence = crate::stderr::silence_native_stderr();
     let host = cpal::default_host();
     let fallback = host.default_output_device().ok_or(OutputError::NoDevice)?;
     let name = fallback.name().map_err(|_| OutputError::DeviceInfo)?;
+    #[cfg(all(test, target_os = "linux"))]
+    enumeration_probe::note();
     if let Ok(devices) = host.output_devices() {
         for device in devices {
             if device.name().ok().as_deref() == Some(name.as_str()) {
@@ -669,7 +699,7 @@ pub fn play_pcm(
             cursor += channels;
         }
         if !started {
-            output.stream.play().map_err(|_| OutputError::Device)?;
+            start_output(&output.stream)?;
             output.state.enabled.store(true, Ordering::Release);
             started = true;
         }
@@ -867,7 +897,7 @@ impl ContinuousOutput {
             self.accepted += 1;
         }
         if !self.started && self.accepted >= self.maximum.min(u64::from(self.rate) * 2) {
-            self.output.stream.play().map_err(|_| OutputError::Device)?;
+            start_output(&self.output.stream)?;
             self.output.state.enabled.store(true, Ordering::Release);
             self.started = true;
             self.watch.start(Instant::now());
@@ -876,7 +906,7 @@ impl ContinuousOutput {
     }
     pub fn finish(&mut self) {
         if !self.started {
-            match self.output.stream.play() {
+            match start_output(&self.output.stream) {
                 Ok(()) => {
                     self.output.state.enabled.store(true, Ordering::Release);
                     self.started = true;
@@ -943,10 +973,7 @@ impl ContinuousOutput {
         output.state.paused.store(paused, Ordering::Release);
         output.state.volume.store(volume, Ordering::Release);
         if self.started {
-            output
-                .stream
-                .play()
-                .map_err(|_| OutputError::ReconnectGaveUp)?;
+            start_output(&output.stream).map_err(|_| OutputError::ReconnectGaveUp)?;
             output.state.enabled.store(true, Ordering::Release);
         }
         self.output = output;
@@ -1207,13 +1234,48 @@ mod tests {
         assert_ne!(opened.0.sample_rate.0, 96_000);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_enumeration_writes_fd2_only_while_silence_is_active() {
+        if std::env::var_os("RADIKO_ENUM_CHILD").is_some() {
+            super::enumeration_probe::enable();
+            let _ = super::selected_output_device();
+            return;
+        }
+        let name = std::thread::current()
+            .name()
+            .expect("libtest names the test thread")
+            .to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1"])
+            .env("RADIKO_ENUM_CHILD", "1")
+            .env_remove("RADIKO_ALSA_LOG")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "status {:?} stderr:\n{stderr}",
+            output.status.code()
+        );
+        assert!(
+            stderr.contains("SEAM-RAN"),
+            "enumeration seam did not run:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("ENUM-FD2"),
+            "fd 2 was not silenced during enumeration:\n{stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn alsa_library_diagnostics_stay_quiet_unless_the_debug_variable_is_one() {
-        assert!(alsa_diagnostics_suppressed(None));
-        assert!(alsa_diagnostics_suppressed(Some("")));
-        assert!(alsa_diagnostics_suppressed(Some("0")));
-        assert!(alsa_diagnostics_suppressed(Some("true")));
-        assert!(!alsa_diagnostics_suppressed(Some("1")));
+        assert!(crate::stderr::native_logs_suppressed(None));
+        assert!(crate::stderr::native_logs_suppressed(Some("")));
+        assert!(crate::stderr::native_logs_suppressed(Some("0")));
+        assert!(crate::stderr::native_logs_suppressed(Some("true")));
+        assert!(!crate::stderr::native_logs_suppressed(Some("1")));
     }
 
     #[cfg(target_os = "linux")]

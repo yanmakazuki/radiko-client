@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read null-sink CI logs and fail on ALSA diagnostics or unexpected underruns.
+"""Read null-sink CI logs and fail on ALSA or JACK diagnostics or unexpected underruns.
 
 The CLI lines this accepts are the ones printed today:
 
@@ -47,8 +47,24 @@ def normalize(text):
     return _ANSI.sub("", text)
 
 
+_JACK_MARKERS = (
+    "Cannot connect to server socket",
+    "Cannot connect to server request channel",
+    "jack server is not running",
+    "JackShmReadWritePtr",
+)
+
+
 def alsa_lib_lines(text):
     return [line for line in normalize(text).split("\n") if "ALSA lib" in line]
+
+
+def jack_lines(text):
+    return [
+        line
+        for line in normalize(text).split("\n")
+        if any(marker in line for marker in _JACK_MARKERS)
+    ]
 
 
 def _count(raw):
@@ -76,6 +92,8 @@ def _require_no_alsa(label, stdout, stderr, errors):
     for stream, text in (("stdout", stdout), ("stderr", stderr)):
         for line in alsa_lib_lines(text):
             errors.append(f"{label} {stream} contains an ALSA lib line: {line}")
+        for line in jack_lines(text):
+            errors.append(f"{label} {stream} contains a JACK line: {line}")
 
 
 def check_output_info(status, stdout, stderr):
@@ -88,7 +106,8 @@ def check_output_info(status, stdout, stderr):
     if errors:
         raise CheckError("\n".join(errors))
     alsa = len(alsa_lib_lines(stdout)) + len(alsa_lib_lines(stderr))
-    return f"cli-output-info status={status} alsa_lib_lines={alsa}"
+    jack = len(jack_lines(stdout)) + len(jack_lines(stderr))
+    return f"cli-output-info status={status} alsa_lib_lines={alsa} jack_lines={jack}"
 
 
 def check_probe(status, stdout, stderr, elapsed, min_elapsed):

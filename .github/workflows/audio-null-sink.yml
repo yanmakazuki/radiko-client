@@ -14,6 +14,7 @@ on:
       - "crates/radiko/src/lib.rs"
       - "crates/radiko/src/reconnect.rs"
       - "crates/radiko/src/stderr.rs"
+      - "crates/radiko/src/stderr_fd.rs"
       - "crates/radiko/src/api.rs"
       - "crates/radiko/src/api/http.rs"
       - "crates/radiko/src/api/http/**"
