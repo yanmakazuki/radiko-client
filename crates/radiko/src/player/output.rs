@@ -254,13 +254,15 @@ fn supported_configs(
         .map_err(|_| on_error)
 }
 
+#[cfg(target_os = "linux")]
 fn prepare_alsa_errors() {
-    if crate::stderr::show_native_audio_logs() {
-        return;
+    if !crate::stderr::show_native_audio_logs() {
+        install_silent_alsa_error_handler();
     }
-    #[cfg(target_os = "linux")]
-    install_silent_alsa_error_handler();
 }
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_alsa_errors() {}
 
 #[cfg(target_os = "linux")]
 static ALSA_ERROR_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);

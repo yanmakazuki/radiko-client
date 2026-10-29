@@ -16,6 +16,8 @@ CPAL 0.16.0 の ALSA ホストは、`default_host` 自体では機器を開か�
 
 `cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 402 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 fmt`、同じオプションの clippy とテストも 402 件成功、失敗 0、ignored 2 件である。PulseAudio の null sink ジョブはこの環境では実行していない。実機の Q2-N（#26）も未確認である。radiko への通信と実機の再生はない。
 
+macOS の stable clippy は、Linux 以外では `prepare_alsa_errors` の `return` が関数の最後になるため `needless_return` になった。Linux とそれ以外で関数を分け、早期 return は置いていない。Linux 以外はハンドラを入れず、標準エラーの書き先も変えない。この環境から `x86_64-apple-darwin` の clippy は、macOS SDK が無く `ring` の C が Linux のヘッダを読んで失敗した。
+
 ## 2026年10月29日：試験用の番組表オリジンはデバッグビルドだけ
 
 `RADIKO_CATALOG_ORIGIN` は、デバッグビルドが `http://127.0.0.1:ポート` の番組表を数えるときだけ読む。リリースビルドはこの変数を読まず、常に `https://radiko.jp` を使う。変数名はリリースの実行ファイルに含まれない。`cargo build --release` のバイナリを文字列検索し、`RADIKO_CATALOG_ORIGIN` は 0 件だった。同じ変数を付けたリリースの `programs TBS 20261001 20261002` は `127.0.0.1` へ繋がず、443 の radiko へ繋がった。リリースの単体テストは、変数が `http://127.0.0.1:9` でも URL が `https://radiko.jp/v3/program/station/date/20261015/TBS.xml` のままであることを確認する。

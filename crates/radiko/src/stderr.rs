@@ -24,28 +24,31 @@ pub(crate) fn native_logs_suppressed(value: Option<&str>) -> bool {
 }
 
 /// `RADIKO_ALSA_LOG=1` のとき、ALSA と JACK などのプラグインログをそのまま出す。
+#[cfg(target_os = "linux")]
 pub(crate) fn show_native_audio_logs() -> bool {
     !native_logs_suppressed(std::env::var("RADIKO_ALSA_LOG").ok().as_deref())
 }
 
 /// 改行を足さずに書く。ログインのプロンプトと同じである。
+#[cfg(target_os = "linux")]
 pub fn write(args: Arguments<'_>) {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        fd::write_fmt(args, false);
-    } else {
-        discard(write!(io::stderr(), "{args}"));
-    }
+    fd::write_fmt(args, false);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn write(args: Arguments<'_>) {
+    discard(write!(io::stderr(), "{args}"));
 }
 
 /// 一行を書く。開けているときのバイト列は、行末の改行まで含めて同じである。
+#[cfg(target_os = "linux")]
 pub fn write_line(args: Arguments<'_>) {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        fd::write_fmt(args, true);
-    } else {
-        discard(writeln!(io::stderr(), "{args}"));
-    }
+    fd::write_fmt(args, true);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn write_line(args: Arguments<'_>) {
+    discard(writeln!(io::stderr(), "{args}"));
 }
 
 /// プロンプトをすぐに見せる。失敗しても終了コードは変えない。
@@ -65,27 +68,32 @@ pub(crate) struct NativeStderrSilence {
     armed: bool,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn silence_native_stderr() -> NativeStderrSilence {
-    #[cfg(target_os = "linux")]
-    {
-        if show_native_audio_logs() {
-            return NativeStderrSilence { armed: false };
-        }
+    if show_native_audio_logs() {
+        NativeStderrSilence { armed: false }
+    } else {
         NativeStderrSilence {
             armed: fd::begin_redirect(),
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        NativeStderrSilence {}
-    }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn silence_native_stderr() -> NativeStderrSilence {
+    NativeStderrSilence {}
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for NativeStderrSilence {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
         if self.armed {
             fd::end_redirect();
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for NativeStderrSilence {
+    fn drop(&mut self) {}
 }
