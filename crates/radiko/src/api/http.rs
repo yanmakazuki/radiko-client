@@ -97,7 +97,8 @@ impl Http {
             loopback_catalog: false,
         })
     }
-    /// 番組表の試験用。`http://127.0.0.1` 以外はこれまでどおり拒否する。
+    /// デバッグビルドの番組表試験用。`http://127.0.0.1` 以外はこれまでどおり拒否する。
+    #[cfg(debug_assertions)]
     pub(crate) fn permit_loopback_catalog(&mut self) -> Result<(), ProbeError> {
         self.client = Client::builder()
             .no_proxy()

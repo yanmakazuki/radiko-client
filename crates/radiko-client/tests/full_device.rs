@@ -1,5 +1,6 @@
 //! `/dev/full` は Linux のデバイスである。macOS には無いので、このファイルは Linux だけでコンパイルする。
-#![cfg(target_os = "linux")]
+//! 番組表の試験用オリジンはデバッグビルドだけが読むので、リリースの `cargo test` には入れない。
+#![cfg(all(target_os = "linux", debug_assertions))]
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};

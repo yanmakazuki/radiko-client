@@ -86,9 +86,11 @@ pub fn parse_day(text: &str) -> Result<NaiveDate, CatalogError> {
     NaiveDate::parse_from_str(text, "%Y%m%d").map_err(|_| CatalogError::InvalidDate)
 }
 
-/// 自動テストが `http://127.0.0.1:ポート` の番組表を数えるときに使う。利用者向けではない。
+/// デバッグビルドの自動テストだけが読む。リリースビルドはこの名前を含まない。
+#[cfg(debug_assertions)]
 const CATALOG_ORIGIN_ENV: &str = "RADIKO_CATALOG_ORIGIN";
 
+#[cfg(any(debug_assertions, test))]
 pub(crate) fn loopback_catalog_origin(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     if super::http::loopback_catalog_url(&url)
@@ -102,6 +104,7 @@ pub(crate) fn loopback_catalog_origin(value: &str) -> Option<String> {
     }
 }
 
+#[cfg(debug_assertions)]
 fn prepare_catalog_http() -> Result<Http, CatalogError> {
     let mut http = Http::new()?;
     if std::env::var_os(CATALOG_ORIGIN_ENV).is_some() {
@@ -111,11 +114,19 @@ fn prepare_catalog_http() -> Result<Http, CatalogError> {
     Ok(http)
 }
 
+#[cfg(not(debug_assertions))]
+fn prepare_catalog_http() -> Result<Http, CatalogError> {
+    Ok(Http::new()?)
+}
+
 fn catalog_base() -> Result<String, CatalogError> {
-    match std::env::var(CATALOG_ORIGIN_ENV) {
-        Err(_) => Ok("https://radiko.jp".to_string()),
-        Ok(value) => loopback_catalog_origin(&value).ok_or(CatalogError::Network),
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(value) = std::env::var(CATALOG_ORIGIN_ENV) {
+            return loopback_catalog_origin(&value).ok_or(CatalogError::Network);
+        }
     }
+    Ok("https://radiko.jp".to_string())
 }
 
 fn catalog_url(path: &str) -> Result<Url, CatalogError> {
@@ -133,11 +144,21 @@ fn fetch_programs(
     station: &str,
     day: NaiveDate,
 ) -> Result<ProgramList, CatalogError> {
+    fetch_programs_from(http, station, day, &catalog_base()?)
+}
+
+fn fetch_programs_from(
+    http: &impl Fetch,
+    station: &str,
+    day: NaiveDate,
+    base: &str,
+) -> Result<ProgramList, CatalogError> {
     validate_station(station).map_err(|_| CatalogError::InvalidStation)?;
-    let url = catalog_url(&format!(
-        "/v3/program/station/date/{}/{station}.xml",
+    let url = Url::parse(&format!(
+        "{base}/v3/program/station/date/{}/{station}.xml",
         day.format("%Y%m%d")
-    ))?;
+    ))
+    .map_err(|_| CatalogError::InvalidDate)?;
     let bytes = fetch_xml(http, url)?;
     parse_programs(&bytes, station, day)
 }
@@ -412,6 +433,16 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_catalog_url_stays_on_https_radiko() {
+        let url = catalog_url("/v3/program/station/date/20261015/TBS.xml").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://radiko.jp/v3/program/station/date/20261015/TBS.xml"
+        );
+    }
+
+    #[test]
     fn loopback_catalog_origin_accepts_only_a_bare_local_port() {
         assert_eq!(
             loopback_catalog_origin("http://127.0.0.1:9").as_deref(),
@@ -498,11 +529,19 @@ mod tests {
     fn every_request_refetches_without_credentials_or_stale_fallback() {
         let mock = Mock(Cell::new(0));
         let day = parse_day("20261015").unwrap();
-        assert!(fetch_programs(&mock, "../TBS", day).is_err());
+        // 本番の URL を直接渡す。環境変数の試験用オリジンには依存しない。
+        let base = "https://radiko.jp";
+        assert!(fetch_programs_from(&mock, "../TBS", day, base).is_err());
         assert_eq!(mock.0.get(), 0);
-        assert_eq!(fetch_programs(&mock, "TBS", day).unwrap().programs.len(), 3);
+        assert_eq!(
+            fetch_programs_from(&mock, "TBS", day, base)
+                .unwrap()
+                .programs
+                .len(),
+            3
+        );
         assert!(matches!(
-            fetch_programs(&mock, "TBS", day),
+            fetch_programs_from(&mock, "TBS", day, base),
             Err(CatalogError::Network)
         ));
         assert_eq!(mock.0.get(), 2);
