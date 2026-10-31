@@ -34,6 +34,7 @@ impl Screen {
             notice_hold_until: None,
             notice_clock: None,
             playback_stopped: false,
+            stop_cause: None,
             playback_ended: false,
             seen_reauthentications: 0,
             seen_skipped_segments: 0,
@@ -152,6 +153,7 @@ impl Screen {
             self.notice_hold = super::NoticeHold::Other;
             self.notice_hold_until = None;
             self.playback_stopped = false;
+            self.stop_cause = None;
             self.playback_ended = false;
             self.seen_reauthentications = 0;
             self.seen_skipped_segments = 0;
@@ -286,6 +288,9 @@ impl Screen {
             }
         }
         if let Some(notice) = update.notice {
+            if let Some(cause) = super::StopCause::from_notice(&notice) {
+                self.stop_cause = Some(cause);
+            }
             self.playback_notice = notice;
             if self.playback_stopped || self.playback_ended {
                 self.notice_hold = super::NoticeHold::Other;
@@ -298,6 +303,20 @@ impl Screen {
     fn hold_action(&mut self, now: std::time::Instant) {
         self.notice_hold = super::NoticeHold::Action;
         self.notice_hold_until = Some(now + super::NOTICE_HOLD);
+    }
+    pub(super) fn apply_authentication(&mut self, event: radiko::app::auth::Event) {
+        let was_verified = matches!(
+            self.app.authentication.status,
+            radiko::app::auth::Status::Verified(_)
+        );
+        self.app.authentication.apply(event);
+        let verified = matches!(
+            self.app.authentication.status,
+            radiko::app::auth::Status::Verified(_)
+        );
+        if verified && !was_verified {
+            self.stop_cause = None;
+        }
     }
     pub(super) fn show_notice(&mut self, notice: impl Into<String>) {
         let now = self.playback_now();

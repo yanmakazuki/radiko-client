@@ -884,3 +884,147 @@ fn escape_does_not_replace_stop_reception_or_reconnect_with_the_quit_hint() {
         }
     }
 }
+fn drawn(screen: &mut Screen) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, screen, Utc::now().fixed_offset()))
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+        .replace(' ', "")
+}
+fn stop_with(screen: &mut Screen, notice: &str) {
+    screen.apply_playback(playback::Update {
+        stopped: true,
+        ended: true,
+        notice: Some(notice.to_owned()),
+        ..playback::Update::default()
+    });
+}
+#[test]
+fn stopped_auth_and_reconnect_lines_stay_after_escape_until_playback_or_auth_succeeds() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
+    let auth = radiko::api::stream::ProbeError::AuthExpired.to_string();
+    let reconnect = radiko::player::playback::PlaybackError::ReconnectGaveUp.to_string();
+    let auth_line = "停止中：認証期限切れ（aで再確認）";
+    let reconnect_line = "停止中：再接続できませんでした（番組を選び直してください）";
+    for (notice, line, auth_hint) in [
+        (auth.as_str(), auth_line, true),
+        (reconnect.as_str(), reconnect_line, false),
+    ] {
+        let mut screen = super::screen();
+        screen.app.authentication.status = AuthStatus::Verified(radiko::session::Membership {
+            area_free: Some(true),
+            time_free_30: Some(false),
+        });
+        stop_with(&mut screen, notice);
+        let before = drawn(&mut screen);
+        assert!(before.contains(&notice.replace(' ', "")), "{before}");
+        assert!(before.contains(line), "{before}");
+        if auth_hint {
+            assert!(before.contains("再生側で認証失敗"), "{before}");
+            assert!(before.contains("a再確認"), "{before}");
+        } else {
+            assert!(!before.contains("再生側で認証失敗"), "{before}");
+        }
+        assert!(!press(
+            &mut screen,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        assert!(screen.playback_notice.is_empty(), "{notice}");
+        assert!(screen.playback_stopped, "{notice}");
+        let after = drawn(&mut screen);
+        assert!(after.contains(line), "{after}");
+        assert!(
+            !after.contains("認証期限切れのため再生を停止しました"),
+            "{after}"
+        );
+        assert!(
+            !after.contains("再接続の上限を超えたため再生を停止しました"),
+            "{after}"
+        );
+        if auth_hint {
+            assert!(after.contains("再生側で認証失敗"), "{after}");
+        }
+        assert!(!press(
+            &mut screen,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        assert_eq!(screen.playback_notice, QUIT_HINT, "{notice}");
+        let hinted = drawn(&mut screen);
+        assert!(hinted.contains(line), "{hinted}");
+        assert!(hinted.contains(&QUIT_HINT.replace(' ', "")), "{hinted}");
+        if auth_hint {
+            assert!(hinted.contains("再生側で認証失敗"), "{hinted}");
+        }
+    }
+
+    let mut screen = super::screen();
+    stop_with(&mut screen, &auth);
+    screen.apply_playback(playback::Update {
+        new_session: true,
+        snapshot: Some(timefree_snapshot()),
+        ..playback::Update::default()
+    });
+    let playing = drawn(&mut screen);
+    assert!(!playing.contains("停止中："), "{playing}");
+    assert!(playing.contains("再生中:"), "{playing}");
+
+    let mut screen = super::screen();
+    stop_with(&mut screen, &reconnect);
+    let id = screen.app.authentication.begin().unwrap();
+    screen.apply_authentication(radiko::app::auth::Event {
+        id,
+        status: AuthStatus::Expired,
+    });
+    assert!(drawn(&mut screen).contains(reconnect_line));
+    assert!(screen.playback_stopped);
+    let id = screen.app.authentication.begin().unwrap();
+    screen.apply_authentication(radiko::app::auth::Event {
+        id,
+        status: AuthStatus::Verified(radiko::session::Membership {
+            area_free: Some(true),
+            time_free_30: Some(false),
+        }),
+    });
+    let cleared = drawn(&mut screen);
+    assert!(!cleared.contains("停止中："), "{cleared}");
+    assert!(cleared.contains("再生中:なし"), "{cleared}");
+    assert!(screen.playback_stopped);
+
+    let mut screen = super::screen();
+    stop_with(&mut screen, &auth);
+    let id = screen.app.authentication.begin_login().unwrap();
+    screen.apply_authentication(radiko::app::auth::Event {
+        id,
+        status: AuthStatus::LoginFailed(radiko::api::auth::AuthError::InvalidCredentials),
+    });
+    assert!(drawn(&mut screen).contains(auth_line));
+    let id = screen.app.authentication.begin_login().unwrap();
+    screen.apply_authentication(radiko::app::auth::Event {
+        id,
+        status: AuthStatus::Verified(radiko::session::Membership {
+            area_free: None,
+            time_free_30: None,
+        }),
+    });
+    assert!(!drawn(&mut screen).contains("停止中："));
+
+    let mut screen = super::screen();
+    let window = radiko::api::stream::ProbeError::WindowLost.to_string();
+    stop_with(&mut screen, &window);
+    let shown = drawn(&mut screen);
+    assert!(shown.contains("再生中:なし"), "{shown}");
+    assert!(!shown.contains("停止中："), "{shown}");
+    assert!(shown.contains("通信が長く途切れたため"), "{shown}");
+}

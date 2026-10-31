@@ -146,6 +146,29 @@ enum PlaybackAction {
 /// outage has passed 30 seconds. Confirmed stop messages are not on this timer.
 const NOTICE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A stop whose reason stays on the player line after Esc dismisses the notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopCause {
+    AuthExpired,
+    ReconnectLimit,
+}
+impl StopCause {
+    fn from_notice(notice: &str) -> Option<Self> {
+        if notice == radiko::api::stream::ProbeError::AuthExpired.to_string() {
+            Some(Self::AuthExpired)
+        } else if notice == radiko::player::playback::PlaybackError::ReconnectGaveUp.to_string() {
+            Some(Self::ReconnectLimit)
+        } else {
+            None
+        }
+    }
+    fn player_line(self) -> &'static str {
+        match self {
+            Self::AuthExpired => "停止中：認証期限切れ（a で再確認）",
+            Self::ReconnectLimit => "停止中：再接続できませんでした（番組を選び直してください）",
+        }
+    }
+}
 /// Why `playback_notice` is set. Gap text is cleared from this, not from the wording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoticeHold {
@@ -193,6 +216,8 @@ struct Screen {
     notice_clock: Option<std::time::Instant>,
     /// Set from a failed playback update. Not inferred from the notice text.
     playback_stopped: bool,
+    /// Auth expiry or reconnect limit, kept after the notice text is dismissed.
+    stop_cause: Option<StopCause>,
     /// The control session ended (program end, stop, or failure). Gap notices stay off.
     playback_ended: bool,
     seen_reauthentications: u64,
@@ -257,13 +282,13 @@ async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(
     }
     screen.dispatch_named(jobs.named);
     if let Some(event) = jobs.login.poll().await {
-        screen.app.authentication.apply(event);
+        screen.apply_authentication(event);
     }
     if let Some(event) = jobs.logout.poll().await {
-        screen.app.authentication.apply(event);
+        screen.apply_authentication(event);
     }
     if let Some(event) = jobs.authentication.poll().await {
-        screen.app.authentication.apply(event);
+        screen.apply_authentication(event);
     }
     for event in jobs.search.poll().await {
         screen.apply(event);
@@ -461,7 +486,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                         event.status.summary(),
                         event.status.detail()
                     ));
-                    screen.app.authentication.apply(event);
+                    screen.apply_authentication(event);
                 }
                 if logout.busy() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -476,7 +501,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                         event.status.summary(),
                         event.status.detail()
                     ));
-                    screen.app.authentication.apply(event);
+                    screen.apply_authentication(event);
                 }
                 if login_service.busy() {
                     tokio::time::sleep(Duration::from_millis(5)).await;

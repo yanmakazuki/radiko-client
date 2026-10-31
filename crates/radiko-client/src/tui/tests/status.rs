@@ -77,7 +77,11 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     assert!(!expired.contains("配信取得:"));
     assert!(!expired.contains("HLS一覧更新:"));
     assert!(!expired.contains("synthetic"));
-    screen.playback_notice = expired;
+    screen.apply_playback(radiko::app::playback::Update {
+        stopped: true,
+        notice: Some(expired),
+        ..radiko::app::playback::Update::default()
+    });
     let now = Utc::now().fixed_offset();
     let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
     let text = |terminal: &Terminal<TestBackend>| {
@@ -111,6 +115,7 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     };
     screen.playback_notice.clear();
     screen.apply_playback(radiko::app::playback::Update {
+        new_session: true,
         snapshot: Some(radiko::player::state::PlaybackSnapshot {
             info,
             state: PlaybackState::Playing,
