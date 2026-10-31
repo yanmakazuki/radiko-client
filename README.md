@@ -1,6 +1,6 @@
 # radiko-client
 
-macOS と Linux のターミナルで使う radiko クライアントです。全国・地域・局の番組を、最大30放送日の範囲でジャンル・出演者分類・キーワードから探し、ライブとタイムフリーを再生します。音声は純 Rust でデコードし、CPAL で出力します。Linux の再生はまだ実機で確認していません。
+macOS と Linux のターミナルで使う radiko クライアントです。全国・地域・局の番組を、最大30放送日の範囲でジャンル・出演者分類・キーワードから探し、ライブとタイムフリーを再生します。音声は純 Rust でデコードし、CPAL で出力します。Linux では、yanma の QEMU 仮想マシンで CLI の `play-live` を90分再生したことまで確認しています。物理 PC での TUI 再生と、同じ仮想マシンでの TUI 再生は未確認です。確認の範囲は [docs/validation.md](docs/validation.md) の「Linux の実機検証」です。
 
 | 知りたいこと | 文書 |
 | --- | --- |
@@ -14,7 +14,7 @@ macOS と Linux のターミナルで使う radiko クライアントです。�
 
 - macOS または Linux
 - Rust 1.85 以上。依存は `Cargo.lock` に固定する
-- Linux では pkg-config と libasound の開発ファイル。Debian と Ubuntu は `pkg-config` と `libasound2-dev`、Fedora は `pkgconf` と `alsa-lib-devel`
+- Linux では C コンパイラ、pkg-config、libasound の開発ファイル。Debian 13 と Ubuntu 24.04 は `build-essential`、`pkg-config`、`libasound2-dev`。Fedora は `gcc`、`pkgconf-pkg-config`、`alsa-lib-devel`。Ubuntu 24.04 の手順は次の節
 - 再生には、公式 Web にログインできるダブルプランの保存セッション
 - 番組表の閲覧はログイン不要
 
@@ -23,6 +23,123 @@ macOS では、既定の MacOSX27.0 SDK でリンクに失敗することがあ�
 ```sh
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 ```
+
+## Ubuntu 24.04 でビルドして output-info を実行する
+
+次のブロックは、クリーンな Ubuntu 24.04 で、このリポジトリのルートをカレントにして上から順に実行します。Rust は rustup の stable を入れます。1.85 以上です。root のときは `apt-get` を直接実行し、それ以外は `sudo` を付けます。
+
+```sh
+if [ "$(id -u)" -eq 0 ]; then
+  apt_get() { apt-get "$@"; }
+else
+  apt_get() { sudo apt-get "$@"; }
+fi
+export DEBIAN_FRONTEND=noninteractive
+apt_get update
+apt_get install -y --no-install-recommends build-essential pkg-config libasound2-dev curl ca-certificates
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+. "$HOME/.cargo/env"
+rustc --version
+cargo build --locked
+cargo run --locked --quiet -- output-info
+```
+
+`rustc --version` の版が 1.85 未満なら、ここで止めて `rustup toolchain install 1.85.0` と `rustup default 1.85.0` のあと、`. "$HOME/.cargo/env"` からやり直します。2026-10-31 にこの手順を実行したときの stable は 1.99.1 でした。
+
+音声機器がないときの `output-info` は終了コード 1 です。標準エラーは次の1行だけです。
+
+```text
+エラー: 既定の音声出力機器がありません
+```
+
+本体の「既定の音声出力機器がありません」は `OutputError::NoDevice` の表示です。CLI は `エラー: ` を先頭に付けます。
+
+## 音声サーバーごとの前提
+
+Linux の再生は CPAL 0.16.0 の ALSA ホストです。開く PCM の名前は `default` です。`pipewire`、`pulse`、`jack`、`oss`、カードの `plughw` は、名前が `default` と違うので選びません。使うサーバーは一つにします。Debian 13 と Ubuntu 24.04 では、パッケージ `pipewire-alsa` が `pulseaudio` と衝突します。
+
+確認に使う `aplay` は、Debian 13、Ubuntu 24.04、Fedora のどれもパッケージ `alsa-utils` です。
+
+```sh
+aplay -L
+```
+
+出力に PCM 名 `default` があることを見ます。説明の文は環境で違います。そのあと、ビルド済みのリポジトリルートで次を実行します。
+
+```sh
+cargo run --locked --quiet -- output-info
+cargo run --locked --quiet -- probe-output --mute 3
+```
+
+`output-info` は音を出さず、既定機器が 48000Hz（引数で 8000〜192000Hz）の mono または stereo の f32、i16、i32 のどれを宣言しているかを読みます。f32 を優先します。対応しているときの2行目は、`48000Hz / f32 / 2ch: 対応宣言あり（再生時に再確認）` のように、ソースの「対応宣言あり（再生時に再確認）」で終わります。`probe-output --mute` は通信も復号もせず、無音で機器だけを開きます。秒数は 1〜1800 で、省略時は 30 秒です。上の `3` は短い確認です。完了時の標準出力は「無音出力完了: 」で始まります。
+
+パッケージ名は、Ubuntu 24.04 は packages.ubuntu.com の noble、Debian 13 は trixie のパッケージ一覧、Fedora は packages.fedoraproject.org で存在を確認しています。
+
+### PipeWire
+
+ALSA から PipeWire へ出すプラグインは、三つのディストリビューションともパッケージ `pipewire-alsa` です。依存で `pipewire` が入り、`default` を PipeWire の PCM にします。デスクトップでは、そのセッションの PipeWire が動いている必要があります。サーバーの起動はこのクライアントの外です。
+
+yanma の QEMU 仮想マシンの PipeWire では、`output-info`、`probe-output 1`、CLI の `play-live` 90分までを確認しています。Ubuntu 24.04 の物理 PC の PipeWire は未確認です。
+
+### PulseAudio
+
+ALSA の pulse プラグインで `default` を PulseAudio に繋ぎます。
+
+| ディストリビューション | パッケージ |
+| --- | --- |
+| Debian 13、Ubuntu 24.04 | `pulseaudio` と `libasound2-plugins` |
+| Fedora | `pulseaudio` と `alsa-plugins-pulseaudio` |
+
+`libasound2-plugins` と `alsa-plugins-pulseaudio` が、PCM 名 `pulse` 用のプラグインと、`default` をそこへ向ける設定を入れます。Debian 13 のコンテナでは、PulseAudio 17.0 の null sink にこのプラグイン経由の `default` を繋ぎ、`output-info` と `probe-output --mute 3` を確認しています。実機ではありません。PulseAudio だけの物理 PC は未確認です。
+
+### 素の ALSA
+
+サウンドサーバーを使わないときは、`pipewire-alsa` も PulseAudio 用のプラグインも入れません。`default` はカード向けの定義です。カードがないと開けません。
+
+| ディストリビューション | ランタイム |
+| --- | --- |
+| Debian 13、Ubuntu 24.04 | `libasound2t64`（`libasound2-dev` が依存します） |
+| Fedora | `alsa-lib` |
+
+yanma の QEMU 仮想マシンでは、`hw:0,0` を既定にした `output-info` と `probe-output 1` を確認しています。その `play-live` は未確認です。i16 だけの機器を開いた再生は、その1秒の `probe-output` 以外は未確認です。
+
+## 音声のトラブル
+
+失敗の日本語はソースの表示そのままで、CLI は標準エラーの先頭に `エラー: ` を付けます。
+
+### 出力機器がない
+
+`default` を開けないとき、Linux は `OutputError::NoDevice` です。表示は「既定の音声出力機器がありません」です。`output-info` も `probe-output` も終了コード 1 で、標準エラーはその1行です。`aplay -L` に `default` が無い、またはあってもサーバーが止まっている、カードが無い、という状態です。上の節の、使っているサーバーのパッケージを入れてから、もう一度 `output-info` を実行します。カードもサーバーも無い環境では、この1行が正しい結果です。
+
+### レートまたは形式が合わない
+
+このプロセスはレートを変換しません。再生の PCM は 48000Hz です。機器の宣言に、そのレートの mono または stereo の f32、i16、i32 が無いとき、`OutputError::IncompatibleOutput` の表示は次の形です。48000Hz を要求し、機器が 44100Hz・f32・2ch だけを宣言した例です。
+
+```text
+必要な形式は48000Hzのmonoまたはstereoのf32・i16・i32です。機器の対応範囲: 44100Hz・f32・2ch
+```
+
+対応範囲の並びは、機器が宣言したレート、サンプル形式、チャンネル数です。`output-info` は、機器自体はあるがレートが範囲に入らないとき、終了コード 0 で機器名の次の行にこの文を出します。再生と `probe-output` は、同じ文を `エラー: ` 付きで出して終了コード 1 です。別のレートでは開きません。変換は ALSA プラグインやサウンドサーバーの側です。
+
+再生中に、開いた音声とサンプルレートまたはチャンネル数が違ったときは `OutputError::UnsupportedFormat` です。表示は「出力中のサンプルレートまたはチャンネル数が、開いた音声と一致しません」です。
+
+### エリア外
+
+認証エリアの外の局で、会員情報のエリアフリーが有効でないとき、取得は `ProbeError::ContractRequired` で止まります。表示は「対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）」です。タイムフリーで、放送終了の翌放送日午前5時から7日を過ぎ、タイムフリー30が有効でないときも、同じ文言です。CLI は `エラー: ` を付けます。
+
+エリアフリーが有効なときのエリア外は、このエラーにはしません。`probe-live` と `probe-timefree` は「認証エリア: 」の行に「エリア外: 」を出します。配信先が、そのモードと地域のどちらにも無いときは「対象モードと地域に対応する配信先がありません」です。国内エリアを確認できないときは「国内エリアを確認できませんでした」です。
+
+`session` はエリアフリーとタイムフリー30を「あり」「なし」「未確認」で出します。契約フラグがあることと、その番組を再生できることは別です。番組表の取得はこの判定をしません。
+
+### ALSA と JACK のログ
+
+起動前に環境変数を付けます。値が `1` のときだけ、ALSA のエラーハンドラも標準エラーの差し替えもせず、ALSA と JACK などのプラグインログを残します。
+
+```sh
+RADIKO_ALSA_LOG=1 cargo run --locked --quiet -- output-info
+```
+
+付けないときは、機器の列挙と出力を開くあいだのそれらのログは端末へ出さず、失敗は日本語のエラーだけです。`1` 以外の値も、ログを残しません。
 
 ## ビルド
 
@@ -70,13 +187,13 @@ cargo run -- tui TBS 20261015
 
 `tui` の後ろには、下の `programs` と同じ局・地域・期間・絞り込みを渡せます。
 
-終了は `q` または Ctrl+C です。入力欄を開いているときの `q` は文字として入ります。SIGINT、SIGTERM、SIGHUP でも音声を止めて端末を戻します。SIGKILL では端末の復元も、書き込み途中の保存完了も保証しません。
+終了は、画面内ヘルプと同じ「通常画面のq / Esc、またはCtrl+Cで終了」です。通常画面は番組一覧とライブ一覧です。操作一覧、取得状況、チャプター、名前付き条件では `q` と Esc は閉じるだけで、Ctrl+C は終了します。操作一覧、取得状況、名前付き条件の案内は「q / Esc 閉じる」です。ログアウト確認は「ログアウトはyで確定、n / Esc / qで取消」で、`q` はログアウトしません。Ctrl+C はそこでも終了します。キーワード、全条件、ログインの入力中は `q` が文字として入り、Esc は編集の取消、Ctrl+C は終了です。秒指定の入力中は `q` を捨て、Esc で入力を取り消し、Ctrl+C で終了します。SIGINT、SIGTERM、SIGHUP でも音声を止めて端末を戻します。SIGKILL では端末の復元も、書き込み途中の保存完了も保証しません。
 
 ### キー
 
 | 操作 | キー |
 | --- | --- |
-| 操作一覧 | `?`（一覧では Esc・`q` でも閉じる） |
+| 操作一覧 | `?`（`q` と Esc は閉じる。Ctrl+C は終了） |
 | 番組の選択 | 上下・`j`/`k`。PageUp/PageDown で1画面、Home/End で先頭と末尾 |
 | 今回の取得失敗 | `e`。地域の失敗、局と放送日の失敗、不正枠の除外を見る |
 | タイムフリーとライブ一覧 | `v`。切り替えるたびに取り直す |
@@ -210,7 +327,7 @@ cargo run -- probe-output --mute 180
 cargo run -- play-sample OBS
 ```
 
-`probe-live` と `probe-timefree` は音声を出さず、PCM も残しません。終了コード 0 は先頭サンプルの取得成功であり、連続再生の保証ではありません。`output-info` は、その時点の既定出力機器が指定レート（8000〜192000Hz、省略時 48000Hz）の mono/stereo の f32、i16、i32 のどれに対応すると宣言しているかを読みます。f32 を優先します。音は出さず、OS の設定も変えません。レートが合わないときは、必要なレートと機器の対応範囲を表示し、このプロセスでは変換しません。`probe-output` は生成音、`--mute` は通信も復号もせず無音で機器だけを確認します。どちらも採用した形式を表示します。Linux で ALSA や JACK プラグインの生の診断を見るときは `RADIKO_ALSA_LOG=1` を付けます。付けないときは、機器の列挙と出力を開くあいだのライブラリの診断を端末へ出さず、失敗は日本語のエラーにします。`play-sample` は条件を確認したあと、先頭1セグメントだけを出して止まります。
+`probe-live` と `probe-timefree` は音声を出さず、PCM も残しません。終了コード 0 は先頭サンプルの取得成功であり、連続再生の保証ではありません。`output-info` は、その時点の既定出力機器が指定レート（8000〜192000Hz、省略時 48000Hz）の mono/stereo の f32、i16、i32 のどれに対応すると宣言しているかを読みます。f32 を優先します。音は出さず、OS の設定も変えません。レートが合わないときは、必要なレートと機器の対応範囲を表示し、このプロセスでは変換しません。`probe-output` は生成音、`--mute` は通信も復号もせず無音で機器だけを確認します。どちらも採用した形式を表示します。Linux で ALSA や JACK プラグインの生の診断を見るときは `RADIKO_ALSA_LOG=1` を付けます。値が `1` のときだけ残ります。付けないときは、機器の列挙と出力を開くあいだのライブラリの診断を端末へ出さず、失敗は日本語のエラーにします。機器が無いときの文言と、レートが合わないときの文言は「音声のトラブル」です。`play-sample` は条件を確認したあと、先頭1セグメントだけを出して止まります。
 
 ## ライセンス
 
