@@ -4,6 +4,18 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月31日：検証の要約と画面内ヘルプを現行の CI に合わせる
+
+画面内ヘルプの「Macの出力先を確認し、番組一覧で対象を選びEnterで再生し直してください。」を、「音声の出力先（OSのサウンド設定）を確認し、番組一覧で対象を選びEnterで再生し直してください。」に変えた。`tui --help` の文言は変えていない。
+
+`docs/validation.md` の自動テストの段落は、先頭にこの日の再実行と Checks の run 40865375776 を書いた。2026年10月24日からの古い件数は、そのあとに残した。Linux の確認済みと未確認は、同ファイルの実機検証の表と揃えた。`--session-file` に Linux のパスを併記し、スリープ抑止に `systemd-inhibit --what=sleep:idle` を併記した。null sink の失敗条件に、ignored の `native_muted` が 2 件成功・失敗 0・ignored 0 であること、`synthetic_fragmented_muted` の不足が 0 であること、`gap_after=4` の不足が 0 であることを足した。
+
+2026年10月26日の節にある「この変更の GitHub 上の実行はまだ行っていない」は書き換えていない。その直後に、この日の追記で run 40865375776 の success を足した。
+
+確認は Linux x86_64 である。Rust 1.99.1（stable、`58cf8f9c3`、2026-10-13）と Rust 1.85.0（`4d91de4e4`、2025-02-17）で、`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features -- --test-threads=8` が成功した。どちらも 404 件成功、失敗 0、ignored 2 件である。件数は各 `test result` 行の成功数を足した。`tui::tests::keys::surface_and_quit_keys_follow_one_table` は stable で成功した。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 58 件成功である。
+
+GitHub の run 40865375776（`897f69d`）のログを読み、ジョブごとの `test result: ok` を足した。ubuntu-24.04 の stable と Rust 1.85.0 は 404 件成功、失敗 0、ignored 2 件である。macos-15 の stable と Rust 1.85.0 は 395 件成功、失敗 0、ignored 2 件である。Format, lint, and tests のログでは、`tests/cli.rs` が ubuntu-24.04 の 17 件に対し macos-15 は 16 件、`tests/full_device.rs` が 3 件と 0 件、最初の `test result`（`player::` などを含む）が 240 件と 235 件である。その 5 件のテスト名は突き止めていない。Rust 1.85.0 のジョブは合計だけを足し、ファイルごとの内訳は見ていない。Python は ubuntu-24.04 が `Ran 58 tests` の OK、macos-15 が `Ran 58 tests` の `OK (skipped=1)` である。Rust 1.85.0 のジョブに Python はない。macOS はこの環境では再実行していない。null sink、実機の再生、radiko への通信、`verify_tui_playback.py`、`verify_tui_catalog.py` は実行していない。
+
 ## 2026年10月29日：機器がないときの JACK のログを、列挙と出力オープンのあいだだけ隠す
 
 CPAL 0.16.0 の ALSA ホストは、`default_host` 自体では機器を開かない。`default_output_device` も名前 `default` を返すだけで PCM は開かない。ログが出るのは `output_devices` の列挙である。組み込み名は `default`、`pipewire`、`pulse`、`jack`、`oss` で、`DeviceHandles::open` は再生と録音の両方で `PCM::new` する。サーバがない `jack` は両方失敗し、libjack が fd 2 へ 10 行書く。内訳は接続失敗 2 行、要求チャネル 2 行、サーバ未起動 2 行、`JackShmReadWritePtr` のデストラクタ 4 行である。ALSA の `snd_lib_error_set_handler` はこの経路を通らない。`JACK_NO_START_SERVER=1` でも同じ 10 行が残った。CPAL の JACK ホスト機能は依存に入っていない。
@@ -309,6 +321,8 @@ PulseAudio 16.1 の `module-null-sink`（`libasound2-plugins` 経由の `default
 CPAL 0.16.0 の ALSA 実装を確認した。既定デバイスの名前は `default` 固定である。列挙は、開ける `default`、`pipewire`、`pulse`、`jack`、`oss` のあと、カード名の `plughw` である。選択は従来どおり既定と同じ名前の列挙デバイスなので、`default` が開けばその PCM を開く。`POLLERR` は CPAL が `StreamError` にし、プレイヤーは既存の `OutputError::Device` にする。このプロセスのレート変換と、OS デコーダーへの切り替えは足していない。ALSA プラグインが機器側で変換するかは未確認である。
 
 `.github/workflows/checks.yml` の検査を macos-15 と ubuntu-24.04 の両方で実行する。Linux では `libasound2-dev` と `pkg-config` を入れてから、stable の fmt・clippy・Rust/Python テストと、Rust 1.85.0 の Rust テストを `--locked` で実行する。ランナー名は [GitHub の hosted runners 資料](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) で確認した。checkout は v7 のままである。この変更の GitHub 上の実行はまだ行っていない。Linux の実機、音声出力、端末、radiko 通信は確認していない。macOS の再生結果は Linux の結果にしない。
+
+2026年10月31日の追記。直前の「この変更の GitHub 上の実行はまだ行っていない」は、2026年10月26日に書いた記録として残す。その後、main の `897f69d` に対する Checks の run 40865375776 は 4 ジョブすべて success だった。API の `run_started_at` は 2026-10-29T11:26:12Z、`updated_at` は 2026-10-29T11:29:07Z で、日本時間（JST、UTC+9）では 2026-10-29 20:26:12〜20:29:07 である。ジョブは Format, lint, and tests（ubuntu-24.04 と macos-15）と Rust 1.85.0（ubuntu-24.04 と macos-15）で、いずれも success である。同じログの `test result: ok` をジョブごとに足すと、ubuntu-24.04 の stable と Rust 1.85.0 はどちらも 404 件成功、失敗 0、ignored 2 件、macos-15 の stable と Rust 1.85.0 はどちらも 395 件成功、失敗 0、ignored 2 件である。Format, lint, and tests のログでは、`tests/cli.rs` が ubuntu-24.04 の 17 件に対し macos-15 は 16 件、`tests/full_device.rs` が 3 件と 0 件、最初の `test result`（`player::` などを含む）が 240 件と 235 件である。その 5 件のテスト名は突き止めていない。Rust 1.85.0 のジョブは合計だけを足し、ファイルごとの内訳は見ていない。Python は ubuntu-24.04 が `Ran 58 tests` の OK、macos-15 が `Ran 58 tests` の `OK (skipped=1)` である。Rust 1.85.0 のジョブは Python を実行しない。この追記の時点では、上の文が書いた「まだ行っていない」は過去の状態である。
 
 ローカルの確認は macOS、通常の Rust 1.98.1、`SDKROOT` は MacOSX26.5 である。`cargo fmt --all -- --check`、`cargo clippy --workspace --offline --all-targets --all-features -- -D warnings`、`cargo test --workspace --offline --all-targets --all-features` は 306 件成功、ライブラリの ignored 4 件はそのままである。Rust 1.85 では再ビルドしていない。アカウント、通信、音声出力、TUI の操作確認はしていない。
 
