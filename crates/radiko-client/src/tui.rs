@@ -6,9 +6,11 @@ macro_rules! quit_key_wording {
 }
 macro_rules! dismiss_notice_wording {
     () => {
-        "通常画面のEscは通知を消す。通知がなければ何もしない"
+        "通常画面のEscは出ている通知を消す。このEscでは終了案内を出さない。通知がなければ「終了は q（または Ctrl+C）」を出し、もう一度Escで消す。停止文・受信待ち・再接続中は案内に替えない"
     };
 }
+/// 通知がない通常画面の Esc。終了はしない。
+pub(super) const QUIT_HINT: &str = "終了は q（または Ctrl+C）";
 macro_rules! logout_key_wording {
     () => {
         "ログアウトはyで確定、n / Esc / qで取消"

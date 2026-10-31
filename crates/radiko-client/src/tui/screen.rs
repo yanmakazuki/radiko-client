@@ -304,6 +304,11 @@ impl Screen {
         self.playback_notice = notice.into();
         self.hold_action(now);
     }
+    fn has_footer_notice(&self) -> bool {
+        !self.playback_notice.is_empty()
+            || !self.app.notification.is_empty()
+            || !self.preferences_notice.is_empty()
+    }
     /// 通常画面の Esc。再生・一時停止・選択・条件と停止フラグは残す。
     fn dismiss_notices(&mut self) {
         self.playback_notice.clear();
@@ -791,9 +796,14 @@ impl Screen {
     fn key_browser(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
         match key.code {
             KeyCode::Char('q') => return Ok(true),
-            // 通常画面の Esc は終了しない。出ている通知だけを消し、再生は続ける。
+            // 通常画面の Esc は終了しない。出ている通知は消すだけ。無いときは終了案内を出す。
+            // 停止文・受信待ち・再接続中も通知なので消し、同じ Esc では案内に替えない。
             KeyCode::Esc => {
-                self.dismiss_notices();
+                if self.has_footer_notice() {
+                    self.dismiss_notices();
+                } else {
+                    self.show_notice(super::QUIT_HINT);
+                }
                 return Ok(false);
             }
             KeyCode::Char('?') => {
@@ -991,7 +1001,7 @@ impl Screen {
         let tail = if self.app.chapters.target.is_some() {
             "q・Esc 詳細へ / Ctrl+C 終了"
         } else {
-            "Esc 通知を消す / q・Ctrl+C 終了"
+            "Esc 通知を消す・終了案内 / q・Ctrl+C 終了"
         };
         format!(
             "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / {tail}"

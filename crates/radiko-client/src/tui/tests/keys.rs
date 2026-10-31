@@ -87,6 +87,8 @@ enum KeyEffect {
     Close,
     Quit,
     Cancel,
+    /// 通知がない通常画面。終了案内を出す。終了しない。
+    Hint,
     /// 文字として入る。
     Insert,
     /// 秒数欄は数字以外を捨てる。終了も閉じもしない。
@@ -163,12 +165,12 @@ fn key_cases() -> Vec<KeyCase> {
     let mut cases = Vec::new();
     for surface in [Surface::MainList, Surface::Live] {
         cases.extend(quit_keys(surface));
-        // 通知がなければ Esc は何もしない。終了しない。
+        // 通知がなければ Esc は終了案内を出す。終了しない。
         cases.push(case(
             surface,
             KeyCode::Esc,
             KeyModifiers::NONE,
-            KeyEffect::None,
+            KeyEffect::Hint,
         ));
         // #22 の n / o と #23 の = は未実装。一覧とライブでは何もしない。
         for code in [KeyCode::Char('n'), KeyCode::Char('o'), KeyCode::Char('=')] {
@@ -431,6 +433,16 @@ fn surface_and_quit_keys_follow_one_table() {
                 assert_eq!(case.surface, Surface::Seconds, "{case:?}");
                 assert_eq!(screen.seek.as_ref().unwrap().input, "", "{case:?}");
             }
+            KeyEffect::Hint => {
+                assert!(!quit, "{case:?}");
+                assert_eq!(screen.playback_notice, QUIT_HINT, "{case:?}");
+                assert!(screen.playback_action.is_none(), "{case:?}");
+                assert_eq!(
+                    screen.live_mode,
+                    matches!(case.surface, Surface::Live),
+                    "{case:?}"
+                );
+            }
             KeyEffect::None => {
                 assert!(!quit, "{case:?}");
                 assert!(
@@ -585,7 +597,8 @@ fn escape_during_playback_dismisses_notices_without_stopping_audio() {
         assert_eq!(playback.state, PlaybackState::Playing);
         assert_eq!(playback.position, Some(Duration::from_secs(25)));
         assert_eq!(playback.volume, 25);
-        assert!(screen.playback_notice.is_empty());
+        assert!(screen.playback_notice.is_empty(), "{live}");
+        assert_ne!(screen.playback_notice, QUIT_HINT, "{live}");
         assert!(screen.app.notification.is_empty());
         assert!(screen.preferences_notice.is_empty());
         assert_eq!(screen.notice_hold, NoticeHold::Other);
@@ -611,6 +624,7 @@ fn escape_during_playback_dismisses_notices_without_stopping_audio() {
             screen.app.playback.as_ref().unwrap().position,
             Some(Duration::from_secs(25))
         );
+        assert_eq!(screen.playback_notice, QUIT_HINT);
         let mut paused = screen;
         let mut snapshot = timefree_snapshot();
         snapshot.state = PlaybackState::Paused;
@@ -623,6 +637,8 @@ fn escape_during_playback_dismisses_notices_without_stopping_audio() {
             KeyModifiers::NONE
         ));
         assert!(paused.playback_action.is_none());
+        assert!(paused.playback_notice.is_empty());
+        assert_ne!(paused.playback_notice, QUIT_HINT);
         assert_eq!(
             paused.app.playback.as_ref().unwrap().state,
             PlaybackState::Paused
@@ -653,6 +669,7 @@ fn escape_dismisses_stop_notices_without_resuming_or_clearing_the_stop() {
             KeyModifiers::NONE
         ));
         assert!(screen.playback_notice.is_empty());
+        assert_ne!(screen.playback_notice, QUIT_HINT);
         assert!(screen.playback_stopped);
         assert!(screen.app.playback.is_none());
         assert!(screen.playback_action.is_none());
@@ -706,4 +723,109 @@ fn escape_twice_in_chapter_view_returns_to_details_without_quitting() {
     assert_eq!(screen.app.committed, committed);
     assert!(screen.filters.is_none());
     assert!(screen.app.draft.is_none());
+}
+#[test]
+fn escape_without_a_notice_shows_the_quit_hint_and_the_next_escape_clears_it() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
+    for live in [false, true] {
+        for paused in [false, true] {
+            let mut screen = screen();
+            screen.live_mode = live;
+            let mut snapshot = timefree_snapshot();
+            if paused {
+                snapshot.state = PlaybackState::Paused;
+            }
+            let state = snapshot.state;
+            screen.app.playback = Some(snapshot);
+            screen.list.select(Some(3));
+            let committed = screen.app.committed.clone();
+            assert!(screen.playback_notice.is_empty());
+            assert!(!press(
+                &mut screen,
+                &mut search,
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            ));
+            assert_eq!(screen.playback_notice, QUIT_HINT);
+            assert!(screen.playback_action.is_none());
+            assert_eq!(screen.app.playback.as_ref().unwrap().state, state);
+            assert_eq!(
+                screen.app.playback.as_ref().unwrap().position,
+                Some(Duration::from_secs(25))
+            );
+            assert_eq!(screen.list.selected(), Some(3));
+            assert_eq!(screen.app.committed, committed);
+            assert!(screen.filters.is_none());
+            assert!(!press(
+                &mut screen,
+                &mut search,
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            ));
+            assert!(screen.playback_notice.is_empty());
+            assert!(screen.playback_action.is_none());
+            assert_eq!(screen.app.playback.as_ref().unwrap().state, state);
+            assert_eq!(
+                screen.app.playback.as_ref().unwrap().position,
+                Some(Duration::from_secs(25))
+            );
+            assert_eq!(screen.list.selected(), Some(3));
+            assert_eq!(screen.app.committed, committed);
+        }
+    }
+}
+#[test]
+fn escape_does_not_replace_stop_reception_or_reconnect_with_the_quit_hint() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
+    let reconnect = radiko::player::playback::reconnect_notice(Duration::from_secs(30));
+    assert_eq!(reconnect, "再接続中…（30秒）");
+    let protected = [
+        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください",
+        "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください",
+        radiko::player::playback::RECEPTION_NOTICE,
+        reconnect.as_str(),
+    ];
+    for (index, notice) in protected.into_iter().enumerate() {
+        let stopped = index < 2;
+        let mut screen = screen();
+        screen.live_mode = index % 2 == 1;
+        if stopped {
+            screen.playback_stopped = true;
+            screen.app.playback = None;
+        } else {
+            screen.app.playback = Some(timefree_snapshot());
+        }
+        screen.playback_notice = notice.into();
+        screen.list.select(Some(4));
+        let committed = screen.app.committed.clone();
+        assert!(!press(
+            &mut screen,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        assert!(screen.playback_notice.is_empty(), "{notice}");
+        assert_ne!(screen.playback_notice, QUIT_HINT, "{notice}");
+        assert!(screen.playback_action.is_none(), "{notice}");
+        assert_eq!(screen.playback_stopped, stopped, "{notice}");
+        assert_eq!(screen.list.selected(), Some(4), "{notice}");
+        assert_eq!(screen.app.committed, committed, "{notice}");
+        assert!(screen.filters.is_none(), "{notice}");
+        if stopped {
+            assert!(screen.app.playback.is_none(), "{notice}");
+        } else {
+            assert_eq!(
+                screen.app.playback.as_ref().unwrap().state,
+                PlaybackState::Playing,
+                "{notice}"
+            );
+            assert_eq!(
+                screen.app.playback.as_ref().unwrap().position,
+                Some(Duration::from_secs(25)),
+                "{notice}"
+            );
+        }
+    }
 }
