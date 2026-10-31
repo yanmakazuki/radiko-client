@@ -1,0 +1,136 @@
+# macOS Apple silicon release.
+#
+# This file runs only when a tag matching v* is pushed. Pull requests and
+# branch pushes, including main, do not run it. permissions is contents: write
+# and nothing else.
+#
+# Tag rule. Both crates must use the same Cargo.toml version, MAJOR.MINOR.PATCH
+# (currently 0.1.0). A suffix in Cargo.toml is rejected.
+#
+# - vX.Y.Z publishes a release when X.Y.Z is that version.
+# - vX.Y.Z-<semver prerelease> publishes a GitHub prerelease when X.Y.Z is that
+#   version. v0.1.0-test.1 is the example: the crates stay at 0.1.0, and the
+#   suffix is not written into Cargo.toml. Notes still come from the
+#   ## [X.Y.Z] section of CHANGELOG.md. The release is not marked Latest.
+# - Any other tag fails in check-tag before `gh release create`, so no release
+#   is created. That includes v0.2.0 while the crates are 0.1.0, a suffix whose
+#   core does not match, and build metadata (v0.1.0+gha).
+#
+# The job builds on macos-15 with `cargo build --release --locked` and publishes
+# one tar.gz plus a SHA256 file. The names include the tag version and
+# aarch64-apple-darwin. There is no Linux artifact and no Intel Mac artifact.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS aarch64 release
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check the tag against both Cargo.toml versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_version.py check-tag --tag "$RELEASE_TAG" --env-file "$RUNNER_TEMP/release.env"
+          cat "$RUNNER_TEMP/release.env" >> "$GITHUB_ENV"
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build the release binary
+        run: cargo build --release --locked
+
+      - name: Package the binary and SHA256
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | awk '/^host: / { print $2 }')
+          test "$host" = "aarch64-apple-darwin"
+          case "$ASSET_BASENAME" in
+            radiko-client-*-aarch64-apple-darwin) ;;
+            *)
+              echo "refusing asset name: $ASSET_BASENAME" >&2
+              exit 1
+              ;;
+          esac
+          file_out=$(file target/release/radiko-client)
+          case "$file_out" in
+            *arm64*) ;;
+            *)
+              echo "expected an arm64 Mach-O binary: $file_out" >&2
+              exit 1
+              ;;
+          esac
+          stage="$RUNNER_TEMP/$ASSET_BASENAME"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp target/release/radiko-client "$stage/radiko-client"
+          cp LICENSE "$stage/LICENSE"
+          chmod 755 "$stage/radiko-client"
+          COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/${ASSET_BASENAME}.tar.gz" "$ASSET_BASENAME"
+          (
+            cd "$RUNNER_TEMP"
+            shasum -a 256 "${ASSET_BASENAME}.tar.gz" > "${ASSET_BASENAME}.tar.gz.sha256"
+          )
+          grep -F -q "${ASSET_BASENAME}.tar.gz" "$RUNNER_TEMP/${ASSET_BASENAME}.tar.gz.sha256"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_version.py check-tag --tag "$RELEASE_TAG" --env-file "$RUNNER_TEMP/release-again.env"
+          release_version=
+          tag_version=
+          prerelease=
+          asset_basename=
+          while IFS= read -r line; do
+            case "$line" in
+              RELEASE_VERSION=*) release_version=${line#RELEASE_VERSION=} ;;
+              TAG_VERSION=*) tag_version=${line#TAG_VERSION=} ;;
+              PRERELEASE=*) prerelease=${line#PRERELEASE=} ;;
+              ASSET_BASENAME=*) asset_basename=${line#ASSET_BASENAME=} ;;
+              *)
+                echo "unexpected release env line" >&2
+                exit 1
+                ;;
+            esac
+          done < "$RUNNER_TEMP/release-again.env"
+          test -n "$release_version"
+          test -n "$tag_version"
+          test "$asset_basename" = "radiko-client-${tag_version}-aarch64-apple-darwin"
+          case "$prerelease" in
+            true|false) ;;
+            *)
+              echo "unexpected prerelease flag" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/${asset_basename}.tar.gz"
+          checksum="$RUNNER_TEMP/${asset_basename}.tar.gz.sha256"
+          test -f "$archive"
+          test -f "$checksum"
+          python3 scripts/release_version.py changelog --version "$release_version" --output "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md"
+          args=(--title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag)
+          if [ "$prerelease" = true ]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" "${args[@]}" "$archive" "$checksum"
