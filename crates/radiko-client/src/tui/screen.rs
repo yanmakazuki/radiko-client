@@ -802,7 +802,10 @@ impl Screen {
                 if self.has_footer_notice() {
                     self.dismiss_notices();
                 } else {
-                    self.show_notice(super::QUIT_HINT);
+                    // 5秒保持にすると、直後の受信待ち・再接続中・追いつきが隠れる。
+                    self.playback_notice = super::QUIT_HINT.into();
+                    self.notice_hold = super::NoticeHold::Other;
+                    self.notice_hold_until = None;
                 }
                 return Ok(false);
             }

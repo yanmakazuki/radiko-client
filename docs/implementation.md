@@ -4,6 +4,12 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月31日：終了案内は受信待ちと再接続中を5秒隠さない
+
+終了案内「終了は q（または Ctrl+C）」は `show_notice` を使わない。`playback_notice` にその文を入れ、`notice_hold` は `Other`、`notice_hold_until` はなしである。5秒保持がないので、案内の直後の再生更新で「受信待ち…」と「再接続中…（N秒）」がすぐ出る。停止理由を画面に残す変更は入れていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 411 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 411 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+
 ## 2026年10月31日：通知がない通常画面の Esc は終了案内を出す
 
 番組一覧とライブ一覧で通知がないときの Esc は「終了は q（または Ctrl+C）」を出す。もう一度 Esc でその案内だけを消す。どちらも `Ok(false)` で、再生・一時停止・選択・条件は変えない。出ている通知を消す Esc では案内を出さない。停止文、受信待ち、再接続中も消すだけで、案内には替えない。

@@ -748,6 +748,8 @@ fn escape_without_a_notice_shows_the_quit_hint_and_the_next_escape_clears_it() {
                 KeyModifiers::NONE
             ));
             assert_eq!(screen.playback_notice, QUIT_HINT);
+            assert_eq!(screen.notice_hold, NoticeHold::Other);
+            assert!(screen.notice_hold_until.is_none());
             assert!(screen.playback_action.is_none());
             assert_eq!(screen.app.playback.as_ref().unwrap().state, state);
             assert_eq!(
@@ -774,6 +776,59 @@ fn escape_without_a_notice_shows_the_quit_hint_and_the_next_escape_clears_it() {
             assert_eq!(screen.app.committed, committed);
         }
     }
+}
+#[test]
+fn quit_hint_does_not_hold_and_yields_immediately_to_reception_and_reconnect() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
+    let mut screen = super::screen();
+    screen.app.playback = Some(timefree_snapshot());
+    assert!(!press(
+        &mut screen,
+        &mut search,
+        KeyCode::Esc,
+        KeyModifiers::NONE
+    ));
+    assert_eq!(screen.playback_notice, QUIT_HINT);
+    assert_eq!(screen.notice_hold, NoticeHold::Other);
+    assert!(screen.notice_hold_until.is_none());
+    let mut receiving = timefree_snapshot();
+    receiving.receiving_for = Some(Duration::from_secs(2));
+    screen.apply_playback(playback::Update {
+        snapshot: Some(receiving),
+        ..playback::Update::default()
+    });
+    assert_eq!(
+        screen.playback_notice,
+        radiko::player::playback::RECEPTION_NOTICE
+    );
+    assert_ne!(screen.playback_notice, QUIT_HINT);
+    assert_eq!(
+        screen.app.playback.as_ref().unwrap().state,
+        PlaybackState::Playing
+    );
+
+    let mut reconnect_screen = super::screen();
+    assert!(!press(
+        &mut reconnect_screen,
+        &mut search,
+        KeyCode::Esc,
+        KeyModifiers::NONE
+    ));
+    assert_eq!(reconnect_screen.playback_notice, QUIT_HINT);
+    let mut reconnecting = timefree_snapshot();
+    reconnecting.reconnecting_for = Some(Duration::from_secs(30));
+    reconnect_screen.apply_playback(playback::Update {
+        snapshot: Some(reconnecting),
+        ..playback::Update::default()
+    });
+    assert_eq!(reconnect_screen.playback_notice, "再接続中…（30秒）");
+    assert_ne!(reconnect_screen.playback_notice, QUIT_HINT);
+    assert_eq!(
+        reconnect_screen.app.playback.as_ref().unwrap().state,
+        PlaybackState::Playing
+    );
+    assert!(reconnect_screen.playback_action.is_none());
 }
 #[test]
 fn escape_does_not_replace_stop_reception_or_reconnect_with_the_quit_hint() {
