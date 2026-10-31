@@ -29,7 +29,7 @@ export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 
 公開するバイナリは、macOS の Apple silicon（`aarch64-apple-darwin`）だけです。Intel Mac（`x86_64-apple-darwin`）向けのファイルは出していません。Intel Mac は、下の「ソースからビルドする」で作ります。
 
-Linux のバイナリも、このリリースにはありません。Linux はソースからビルドします。Linux の成果物は、[#26](https://github.com/yanmakazuki/radiko-client/issues/26) の実機確認のあと別途出します。
+Linux のバイナリも、このリリースにはありません。Linux はソースからビルドします。Linux の成果物は、物理 PC で再生を確認したあとに出します。
 
 ### リリースから入れる
 
@@ -37,25 +37,28 @@ Linux のバイナリも、このリリースにはありません。Linux は�
 
 `v0.1.0-test.1` のように、核の版のあとに SemVer のプレリリース接尾辞を付けたタグは、核が Cargo.toml と一致すれば通ります。接尾辞は Cargo.toml には書きません。GitHub 上のリリースはプレリリースになり、Latest にはしません。本文は CHANGELOG のその核の節（`## [0.1.0]`）です。`v0.1.0+gha` のようなビルドメタデータは受け付けません。
 
-次の例の `0.1.0` は、入れる版に置き換えます。ファイル名には版と `aarch64-apple-darwin` が入ります。SHA256 の確認は、二つのファイルを同じディレクトリに置いてから `shasum -c` します。
+次の例の `0.1.0` は、入れる版に置き換えます。ファイル名には版と `aarch64-apple-darwin` が入ります。バイナリには Developer ID の署名がなく、公証（notarization）もされていません（ad-hoc 署名のみです）。
+
+`curl -LO` で受け取ったファイルには隔離属性 `com.apple.quarantine` が付かないので、Gatekeeper は警告しません。
 
 ```sh
 ver=0.1.0
+base="https://github.com/yanmakazuki/radiko-client/releases/download/v${ver}"
 asset="radiko-client-${ver}-aarch64-apple-darwin.tar.gz"
-curl -fL -o "$asset" "https://github.com/yanmakazuki/radiko-client/releases/download/v${ver}/${asset}"
-curl -fL -o "${asset}.sha256" "https://github.com/yanmakazuki/radiko-client/releases/download/v${ver}/${asset}.sha256"
+curl -LO "${base}/${asset}"
+curl -LO "${base}/${asset}.sha256"
 shasum -a 256 -c "${asset}.sha256"
-tar -xzf "$asset"
-```
-
-アーカイブの中は `radiko-client` と `LICENSE` です。バイナリは署名していません。ブラウザで保存したアーカイブには、macOS が隔離属性 `com.apple.quarantine` を付けることがあります。展開した実行ファイルにそれが残っていると、Gatekeeper が「開発元を確認できないため、開けません」と表示して起動を止めます。SHA256 が合ったあとに属性を外すか、初回だけシステム設定の「プライバシーとセキュリティ」から「このまま開く」を選びます。Finder でバイナリを右クリックして「開く」でも同じです。
-
-```sh
-xattr -dr com.apple.quarantine "radiko-client-${ver}-aarch64-apple-darwin"
+tar xzf "${asset}"
 "radiko-client-${ver}-aarch64-apple-darwin/radiko-client" --help
 ```
 
-`curl` で取ったファイルには、隔離属性が付かないことが多いです。ブラウザで保存したときは、上の `xattr` を実行します。
+アーカイブの中は `radiko-client` と `LICENSE` です。
+
+ブラウザで保存したファイルを展開したときは、`radiko-client` があるディレクトリで隔離属性を外します。macOS 15 以降は、System Settings > Privacy & Security > Open Anyway からも開けます。
+
+```sh
+xattr -d com.apple.quarantine ./radiko-client
+```
 
 ### ソースからビルドする
 
