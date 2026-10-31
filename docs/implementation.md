@@ -4,6 +4,12 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月31日：停止中のプレイヤー行を文面の完全一致で確かめる
+
+`StopCause::player_line` を `assert_eq!` でそのまま比べる。認証期限切れは「停止中：認証期限切れ（a で再確認）」、再接続上限は「停止中：再接続できませんでした（番組を選び直してください）」である。空白を除く描画比較は使っていない。製品の表示は変えていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 416 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 416 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+
 ## 2026年10月31日：停止理由は再生エラーの型から渡す
 
 認証期限切れと再接続上限の停止理由は、通知文面との一致では決めない。`app::playback` が再生結果のエラー型から `StopReason` を作り、`Update.stop_reason` で TUI に渡す。TUI は `stopped` のときだけその理由を立てる。停止ではない更新に同じ文面や理由値があっても、プレイヤー行の「停止中：」は出ない。表示と、新しい再生・再確認・再ログインで消える条件は変えていない。

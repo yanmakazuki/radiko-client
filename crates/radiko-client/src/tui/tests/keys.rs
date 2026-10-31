@@ -1090,3 +1090,17 @@ fn the_same_stop_sentence_without_stopped_does_not_record_a_stop_cause() {
         assert!(drawn(&mut screen).contains("停止中："), "{notice}");
     }
 }
+#[test]
+fn auth_expired_player_line_matches_the_stop_sentence_exactly() {
+    assert_eq!(
+        StopCause::AuthExpired.player_line(),
+        "停止中：認証期限切れ（a で再確認）"
+    );
+}
+#[test]
+fn reconnect_limit_player_line_matches_the_stop_sentence_exactly() {
+    assert_eq!(
+        StopCause::ReconnectLimit.player_line(),
+        "停止中：再接続できませんでした（番組を選び直してください）"
+    );
+}
