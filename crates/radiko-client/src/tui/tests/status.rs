@@ -79,6 +79,7 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     assert!(!expired.contains("synthetic"));
     screen.apply_playback(radiko::app::playback::Update {
         stopped: true,
+        stop_reason: Some(radiko::app::playback::StopReason::AuthExpired),
         notice: Some(expired),
         ..radiko::app::playback::Update::default()
     });
@@ -175,6 +176,7 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     assert!(!expired.contains("HLS音声取得:"));
     screen.apply_playback(radiko::app::playback::Update {
         stopped: true,
+        stop_reason: Some(radiko::app::playback::StopReason::AuthExpired),
         notice: Some(expired),
         ..radiko::app::playback::Update::default()
     });

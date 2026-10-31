@@ -153,13 +153,10 @@ enum StopCause {
     ReconnectLimit,
 }
 impl StopCause {
-    fn from_notice(notice: &str) -> Option<Self> {
-        if notice == radiko::api::stream::ProbeError::AuthExpired.to_string() {
-            Some(Self::AuthExpired)
-        } else if notice == radiko::player::playback::PlaybackError::ReconnectGaveUp.to_string() {
-            Some(Self::ReconnectLimit)
-        } else {
-            None
+    fn from_update(reason: radiko::app::playback::StopReason) -> Self {
+        match reason {
+            radiko::app::playback::StopReason::AuthExpired => Self::AuthExpired,
+            radiko::app::playback::StopReason::ReconnectLimit => Self::ReconnectLimit,
         }
     }
     fn player_line(self) -> &'static str {

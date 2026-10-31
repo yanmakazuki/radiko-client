@@ -64,6 +64,33 @@ pub fn availability(
         ListeningAvailability::Unknown
     }
 }
+/// Why playback stopped, taken from the error value rather than its display text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    AuthExpired,
+    ReconnectLimit,
+}
+/// `Some` only for an auth-expiry or reconnect-limit failure. Other errors, including
+/// window loss and a normal program end, are `None`.
+pub fn stop_reason(error: &playback::PlaybackError) -> Option<StopReason> {
+    match error {
+        playback::PlaybackError::ReconnectGaveUp => Some(StopReason::ReconnectLimit),
+        playback::PlaybackError::Output(crate::player::output::OutputError::ReconnectGaveUp) => {
+            Some(StopReason::ReconnectLimit)
+        }
+        playback::PlaybackError::Source(error) => probe_stop_reason(error),
+        _ => None,
+    }
+}
+fn probe_stop_reason(error: &crate::api::stream::ProbeError) -> Option<StopReason> {
+    use crate::api::stream::ProbeError;
+    match error {
+        ProbeError::At(_, inner) => probe_stop_reason(inner),
+        ProbeError::AuthExpired => Some(StopReason::AuthExpired),
+        ProbeError::ReconnectGaveUp => Some(StopReason::ReconnectLimit),
+        _ => None,
+    }
+}
 #[derive(Default)]
 pub struct Update {
     /// A previous control session has finished; reset its visible state before this update.
@@ -72,6 +99,8 @@ pub struct Update {
     pub notice: Option<String>,
     /// `notice` is a playback failure. Reconnect and catch-up must not replace it.
     pub stopped: bool,
+    /// Set only together with [`Self::stopped`], from [`stop_reason`].
+    pub stop_reason: Option<StopReason>,
     pub ended: bool,
     pub final_diagnostics: Option<String>,
 }
@@ -348,6 +377,7 @@ impl Service {
                     }
                     // Preserve an undelivered snapshot so the UI can retain diagnostics on failure.
                     update.stopped = result.is_err();
+                    update.stop_reason = result.as_ref().err().and_then(stop_reason);
                     update.notice = Some(match &result {
                         Ok(report) => match report.reason {
                             playback::EndReason::ProgramEnd => "番組終了".into(),
@@ -472,6 +502,48 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(3));
             thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn stop_reason_is_taken_from_the_error_and_not_from_other_failures() {
+        use crate::api::stream::ProbeError;
+        let expired = playback::PlaybackError::Source(ProbeError::At(
+            "HLS一覧更新",
+            Box::new(ProbeError::AuthExpired),
+        ));
+        assert_eq!(stop_reason(&expired), Some(StopReason::AuthExpired));
+        assert_eq!(
+            stop_reason(&playback::PlaybackError::Source(ProbeError::AuthExpired)),
+            Some(StopReason::AuthExpired)
+        );
+        assert_eq!(
+            stop_reason(&playback::PlaybackError::ReconnectGaveUp),
+            Some(StopReason::ReconnectLimit)
+        );
+        assert_eq!(
+            stop_reason(&playback::PlaybackError::Output(
+                crate::player::output::OutputError::ReconnectGaveUp
+            )),
+            Some(StopReason::ReconnectLimit)
+        );
+        assert_eq!(
+            stop_reason(&playback::PlaybackError::Source(
+                ProbeError::ReconnectGaveUp
+            )),
+            Some(StopReason::ReconnectLimit)
+        );
+        assert_eq!(
+            stop_reason(&playback::PlaybackError::Source(ProbeError::WindowLost)),
+            None
+        );
+        assert_eq!(stop_reason(&playback::PlaybackError::LoginRequired), None);
+        let update = Update {
+            stopped: false,
+            notice: Some(expired.to_string()),
+            stop_reason: None,
+            ..Update::default()
+        };
+        assert!(!update.stopped);
+        assert!(update.stop_reason.is_none());
     }
     #[test]
     fn rejected_volume_commands_never_change_the_value_used_by_the_next_session() {

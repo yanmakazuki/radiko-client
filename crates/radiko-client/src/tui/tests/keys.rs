@@ -898,10 +898,11 @@ fn drawn(screen: &mut Screen) -> String {
         .collect::<String>()
         .replace(' ', "")
 }
-fn stop_with(screen: &mut Screen, notice: &str) {
+fn stop_with(screen: &mut Screen, notice: &str, reason: Option<playback::StopReason>) {
     screen.apply_playback(playback::Update {
         stopped: true,
         ended: true,
+        stop_reason: reason,
         notice: Some(notice.to_owned()),
         ..playback::Update::default()
     });
@@ -914,16 +915,26 @@ fn stopped_auth_and_reconnect_lines_stay_after_escape_until_playback_or_auth_suc
     let reconnect = radiko::player::playback::PlaybackError::ReconnectGaveUp.to_string();
     let auth_line = "停止中：認証期限切れ（aで再確認）";
     let reconnect_line = "停止中：再接続できませんでした（番組を選び直してください）";
-    for (notice, line, auth_hint) in [
-        (auth.as_str(), auth_line, true),
-        (reconnect.as_str(), reconnect_line, false),
+    for (notice, line, auth_hint, reason) in [
+        (
+            auth.as_str(),
+            auth_line,
+            true,
+            Some(playback::StopReason::AuthExpired),
+        ),
+        (
+            reconnect.as_str(),
+            reconnect_line,
+            false,
+            Some(playback::StopReason::ReconnectLimit),
+        ),
     ] {
         let mut screen = super::screen();
         screen.app.authentication.status = AuthStatus::Verified(radiko::session::Membership {
             area_free: Some(true),
             time_free_30: Some(false),
         });
-        stop_with(&mut screen, notice);
+        stop_with(&mut screen, notice, reason);
         let before = drawn(&mut screen);
         assert!(before.contains(&notice.replace(' ', "")), "{before}");
         assert!(before.contains(line), "{before}");
@@ -970,7 +981,7 @@ fn stopped_auth_and_reconnect_lines_stay_after_escape_until_playback_or_auth_suc
     }
 
     let mut screen = super::screen();
-    stop_with(&mut screen, &auth);
+    stop_with(&mut screen, &auth, Some(playback::StopReason::AuthExpired));
     screen.apply_playback(playback::Update {
         new_session: true,
         snapshot: Some(timefree_snapshot()),
@@ -981,7 +992,11 @@ fn stopped_auth_and_reconnect_lines_stay_after_escape_until_playback_or_auth_suc
     assert!(playing.contains("再生中:"), "{playing}");
 
     let mut screen = super::screen();
-    stop_with(&mut screen, &reconnect);
+    stop_with(
+        &mut screen,
+        &reconnect,
+        Some(playback::StopReason::ReconnectLimit),
+    );
     let id = screen.app.authentication.begin().unwrap();
     screen.apply_authentication(radiko::app::auth::Event {
         id,
@@ -1003,7 +1018,7 @@ fn stopped_auth_and_reconnect_lines_stay_after_escape_until_playback_or_auth_suc
     assert!(screen.playback_stopped);
 
     let mut screen = super::screen();
-    stop_with(&mut screen, &auth);
+    stop_with(&mut screen, &auth, Some(playback::StopReason::AuthExpired));
     let id = screen.app.authentication.begin_login().unwrap();
     screen.apply_authentication(radiko::app::auth::Event {
         id,
@@ -1022,9 +1037,56 @@ fn stopped_auth_and_reconnect_lines_stay_after_escape_until_playback_or_auth_suc
 
     let mut screen = super::screen();
     let window = radiko::api::stream::ProbeError::WindowLost.to_string();
-    stop_with(&mut screen, &window);
+    stop_with(&mut screen, &window, None);
     let shown = drawn(&mut screen);
     assert!(shown.contains("再生中:なし"), "{shown}");
     assert!(!shown.contains("停止中："), "{shown}");
     assert!(shown.contains("通信が長く途切れたため"), "{shown}");
+}
+#[test]
+fn the_same_stop_sentence_without_stopped_does_not_record_a_stop_cause() {
+    let auth = radiko::api::stream::ProbeError::AuthExpired.to_string();
+    let reconnect = radiko::player::playback::PlaybackError::ReconnectGaveUp.to_string();
+    for (notice, reason) in [
+        (auth.as_str(), playback::StopReason::AuthExpired),
+        (reconnect.as_str(), playback::StopReason::ReconnectLimit),
+    ] {
+        let mut screen = super::screen();
+        screen.apply_playback(playback::Update {
+            stopped: false,
+            notice: Some(notice.to_owned()),
+            stop_reason: Some(reason),
+            ..playback::Update::default()
+        });
+        assert!(screen.stop_cause.is_none(), "{notice}");
+        assert!(!screen.playback_stopped, "{notice}");
+        assert_eq!(screen.playback_notice, notice, "{notice}");
+        let shown = drawn(&mut screen);
+        assert!(!shown.contains("停止中："), "{shown}");
+        assert!(!shown.contains("再生側で認証失敗"), "{shown}");
+
+        screen.apply_playback(playback::Update {
+            stopped: true,
+            ended: true,
+            notice: Some(notice.to_owned()),
+            ..playback::Update::default()
+        });
+        assert!(screen.stop_cause.is_none(), "{notice}");
+        assert!(screen.playback_stopped, "{notice}");
+        assert!(!drawn(&mut screen).contains("停止中："), "{notice}");
+
+        screen.apply_playback(playback::Update {
+            stopped: true,
+            ended: true,
+            notice: Some(notice.to_owned()),
+            stop_reason: Some(reason),
+            ..playback::Update::default()
+        });
+        assert_eq!(
+            screen.stop_cause,
+            Some(StopCause::from_update(reason)),
+            "{notice}"
+        );
+        assert!(drawn(&mut screen).contains("停止中："), "{notice}");
+    }
 }

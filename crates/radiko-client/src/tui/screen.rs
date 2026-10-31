@@ -161,6 +161,9 @@ impl Screen {
         }
         if update.stopped {
             self.playback_stopped = true;
+            if let Some(reason) = update.stop_reason {
+                self.stop_cause = Some(super::StopCause::from_update(reason));
+            }
         }
         if update.ended {
             self.playback_ended = true;
@@ -288,9 +291,6 @@ impl Screen {
             }
         }
         if let Some(notice) = update.notice {
-            if let Some(cause) = super::StopCause::from_notice(&notice) {
-                self.stop_cause = Some(cause);
-            }
             self.playback_notice = notice;
             if self.playback_stopped || self.playback_ended {
                 self.notice_hold = super::NoticeHold::Other;
