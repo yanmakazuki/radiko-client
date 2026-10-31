@@ -117,7 +117,6 @@ fn quit_keys(surface: Surface) -> Vec<KeyCase> {
             KeyModifiers::NONE,
             KeyEffect::Quit,
         ),
-        case(surface, KeyCode::Esc, KeyModifiers::NONE, KeyEffect::Quit),
         case(
             surface,
             KeyCode::Char('c'),
@@ -164,6 +163,13 @@ fn key_cases() -> Vec<KeyCase> {
     let mut cases = Vec::new();
     for surface in [Surface::MainList, Surface::Live] {
         cases.extend(quit_keys(surface));
+        // 通知がなければ Esc は何もしない。終了しない。
+        cases.push(case(
+            surface,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEffect::None,
+        ));
         // #22 の n / o と #23 の = は未実装。一覧とライブでは何もしない。
         for code in [KeyCode::Char('n'), KeyCode::Char('o'), KeyCode::Char('=')] {
             cases.push(case(surface, code, KeyModifiers::NONE, KeyEffect::None));
@@ -445,6 +451,9 @@ fn surface_and_quit_keys_follow_one_table() {
     }
     assert!(help::KEYS.contains(QUIT_KEY_WORDING));
     assert!(USAGE.contains(QUIT_KEY_WORDING));
+    assert!(help::KEYS.contains(DISMISS_NOTICE_WORDING));
+    assert!(USAGE.contains(DISMISS_NOTICE_WORDING));
+    assert!(!QUIT_KEY_WORDING.contains("Esc"));
     assert!(help::KEYS.contains(LOGOUT_KEY_WORDING));
     assert!(USAGE.contains(LOGOUT_KEY_WORDING));
     assert!(LOGOUT_KEY_WORDING.contains("n / Esc / qで取消"));
@@ -454,15 +463,19 @@ fn surface_and_quit_keys_follow_one_table() {
             .filter(|case| case.surface == surface && case.effect == KeyEffect::Quit)
             .map(|case| match (case.code, case.modifiers) {
                 (KeyCode::Char('q'), KeyModifiers::NONE) => "q",
-                (KeyCode::Esc, KeyModifiers::NONE) => "Esc",
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => "Ctrl+C",
                 _ => panic!("終了キーが表にありません: {case:?}"),
             })
             .collect();
-        assert_eq!(tokens, ["q", "Esc", "Ctrl+C"]);
+        assert_eq!(tokens, ["q", "Ctrl+C"]);
         for token in tokens {
             assert!(QUIT_KEY_WORDING.contains(token), "{token}");
         }
+        let hint = prepare(surface, &mut search).control_hint();
+        assert!(hint.contains("Esc 通知を消す"), "{hint}");
+        assert!(hint.contains("q・Ctrl+C 終了"), "{hint}");
+        assert!(!hint.contains("q・Esc"), "{hint}");
+        assert!(!hint.contains("Esc・Ctrl+C"), "{hint}");
     }
     let logout_q = cases.iter().find(|case| {
         case.surface == Surface::LogoutConfirm
@@ -502,4 +515,195 @@ fn surface_and_quit_keys_follow_one_table() {
     );
     let busy = named::Manager::new(ViewId(2));
     assert!(busy.controls().contains(DIALOG_CLOSE_HINT));
+    let chapters = prepare(Surface::Chapters, &mut search);
+    let hint = chapters.control_hint();
+    assert!(hint.contains("q・Esc 詳細へ"), "{hint}");
+    assert!(hint.contains("Ctrl+C 終了"), "{hint}");
+    assert!(!hint.contains("Esc 通知を消す"), "{hint}");
+    assert!(!hint.contains("q・Esc・Ctrl+C"), "{hint}");
+}
+fn press(
+    screen: &mut Screen,
+    search: &mut Service,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> bool {
+    screen.key(KeyEvent::new(code, modifiers), search).unwrap()
+}
+#[test]
+fn escape_on_program_and_live_lists_returns_false_and_q_and_ctrl_c_return_true() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("quit keys must not fetch") });
+    for surface in [Surface::MainList, Surface::Live] {
+        let mut screen = prepare(surface, &mut search);
+        assert!(!press(
+            &mut screen,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        let mut screen = prepare(surface, &mut search);
+        assert!(press(
+            &mut screen,
+            &mut search,
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        ));
+        let mut screen = prepare(surface, &mut search);
+        assert!(press(
+            &mut screen,
+            &mut search,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        ));
+    }
+}
+#[test]
+fn escape_during_playback_dismisses_notices_without_stopping_audio() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
+    for live in [false, true] {
+        let mut screen = screen();
+        screen.live_mode = live;
+        screen.app.playback = Some(timefree_snapshot());
+        screen.app.notification = "検索に失敗しました".into();
+        screen.preferences_notice = "「朝」を保存しました".into();
+        screen.show_notice("シーク不可");
+        screen.list.select(Some(2));
+        screen.volume = 40;
+        let committed = screen.app.committed.clone();
+        assert!(!press(
+            &mut screen,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        assert!(screen.playback_action.is_none());
+        assert!(!screen.playback_stopped);
+        assert!(!screen.playback_ended);
+        let playback = screen.app.playback.as_ref().unwrap();
+        assert_eq!(playback.state, PlaybackState::Playing);
+        assert_eq!(playback.position, Some(Duration::from_secs(25)));
+        assert_eq!(playback.volume, 25);
+        assert!(screen.playback_notice.is_empty());
+        assert!(screen.app.notification.is_empty());
+        assert!(screen.preferences_notice.is_empty());
+        assert_eq!(screen.notice_hold, NoticeHold::Other);
+        assert!(screen.notice_hold_until.is_none());
+        assert_eq!(screen.list.selected(), Some(2));
+        assert_eq!(screen.volume, 40);
+        assert_eq!(screen.app.committed, committed);
+        assert!(screen.app.draft.is_none());
+        assert!(screen.filters.is_none());
+        assert_eq!(screen.live_mode, live);
+        assert!(!press(
+            &mut screen,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        assert!(screen.playback_action.is_none());
+        assert_eq!(
+            screen.app.playback.as_ref().unwrap().state,
+            PlaybackState::Playing
+        );
+        assert_eq!(
+            screen.app.playback.as_ref().unwrap().position,
+            Some(Duration::from_secs(25))
+        );
+        let mut paused = screen;
+        let mut snapshot = timefree_snapshot();
+        snapshot.state = PlaybackState::Paused;
+        paused.app.playback = Some(snapshot);
+        paused.playback_notice = "一時停止".into();
+        assert!(!press(
+            &mut paused,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        assert!(paused.playback_action.is_none());
+        assert_eq!(
+            paused.app.playback.as_ref().unwrap().state,
+            PlaybackState::Paused
+        );
+        assert_eq!(paused.list.selected(), Some(2));
+        assert_eq!(paused.app.committed, committed);
+    }
+}
+#[test]
+fn escape_dismisses_stop_notices_without_resuming_or_clearing_the_stop() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
+    let sentences = [
+        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください",
+        "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください",
+    ];
+    for sentence in sentences {
+        let mut screen = screen();
+        screen.playback_stopped = true;
+        screen.app.playback = None;
+        screen.playback_notice = sentence.into();
+        screen.list.select(Some(1));
+        let committed = screen.app.committed.clone();
+        assert!(!press(
+            &mut screen,
+            &mut search,
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ));
+        assert!(screen.playback_notice.is_empty());
+        assert!(screen.playback_stopped);
+        assert!(screen.app.playback.is_none());
+        assert!(screen.playback_action.is_none());
+        assert_eq!(screen.list.selected(), Some(1));
+        assert_eq!(screen.app.committed, committed);
+        assert!(screen.filters.is_none());
+    }
+}
+#[test]
+fn escape_twice_in_chapter_view_returns_to_details_without_quitting() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("chapters must not fetch") });
+    let mut screen = prepare(Surface::Chapters, &mut search);
+    screen.app.playback = Some(timefree_snapshot());
+    screen.playback_notice = "再生準備中".into();
+    screen.list.select(Some(0));
+    let committed = screen.app.committed.clone();
+    assert!(screen.app.chapters.target.is_some());
+    assert!(!press(
+        &mut screen,
+        &mut search,
+        KeyCode::Esc,
+        KeyModifiers::NONE
+    ));
+    assert!(screen.app.chapters.target.is_none());
+    assert_eq!(screen.playback_notice, "再生準備中");
+    assert!(screen.playback_action.is_none());
+    assert_eq!(
+        screen.app.playback.as_ref().unwrap().state,
+        PlaybackState::Playing
+    );
+    assert!(!press(
+        &mut screen,
+        &mut search,
+        KeyCode::Esc,
+        KeyModifiers::NONE
+    ));
+    assert!(screen.app.chapters.target.is_none());
+    assert!(screen.playback_notice.is_empty());
+    assert!(screen.playback_action.is_none());
+    assert!(!screen.playback_stopped);
+    assert_eq!(
+        screen.app.playback.as_ref().unwrap().state,
+        PlaybackState::Playing
+    );
+    assert_eq!(
+        screen.app.playback.as_ref().unwrap().position,
+        Some(Duration::from_secs(25))
+    );
+    assert_eq!(screen.list.selected(), Some(0));
+    assert_eq!(screen.app.committed, committed);
+    assert!(screen.filters.is_none());
+    assert!(screen.app.draft.is_none());
 }

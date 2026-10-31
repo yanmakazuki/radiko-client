@@ -14,7 +14,9 @@ pub(super) const KEYS: &str = concat!(
     logout_key_wording!(),
     "。パスワードは表示・保存しません。\n",
     quit_key_wording!(),
-    "します。\n操作一覧を開いている間も検索・再生は継続します。"
+    "します。",
+    dismiss_notice_wording!(),
+    "。再生・一時停止・選択・条件は変えません。\n操作一覧を開いている間も検索・再生は継続します。"
 );
 
 pub fn draw(

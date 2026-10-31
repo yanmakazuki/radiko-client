@@ -304,6 +304,19 @@ impl Screen {
         self.playback_notice = notice.into();
         self.hold_action(now);
     }
+    /// 通常画面の Esc。再生・一時停止・選択・条件と停止フラグは残す。
+    fn dismiss_notices(&mut self) {
+        self.playback_notice.clear();
+        self.app.notification.clear();
+        self.preferences_notice.clear();
+        if matches!(
+            self.notice_hold,
+            super::NoticeHold::Action | super::NoticeHold::CatchUp | super::NoticeHold::AuthRenewal
+        ) {
+            self.notice_hold = super::NoticeHold::Other;
+            self.notice_hold_until = None;
+        }
+    }
     pub(super) fn rows(&self) -> &[usize] {
         if self.live_mode {
             &self.live_rows
@@ -777,7 +790,12 @@ impl Screen {
     }
     fn key_browser(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('q') => return Ok(true),
+            // 通常画面の Esc は終了しない。出ている通知だけを消し、再生は続ける。
+            KeyCode::Esc => {
+                self.dismiss_notices();
+                return Ok(false);
+            }
             KeyCode::Char('?') => {
                 self.help_open = true;
                 self.help_scroll = scroll::Scroll::default();
@@ -970,8 +988,13 @@ impl Screen {
         } else {
             "Enter TF再生 / v ライブ画面 / l ライブ / f 条件 / b 保存条件 / c チャプター"
         };
+        let tail = if self.app.chapters.target.is_some() {
+            "q・Esc 詳細へ / Ctrl+C 終了"
+        } else {
+            "Esc 通知を消す / q・Ctrl+C 終了"
+        };
         format!(
-            "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q・Esc・Ctrl+C 終了"
+            "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / {tail}"
         )
     }
 }
