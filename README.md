@@ -39,14 +39,14 @@ Linux のバイナリも、このリリースにはありません。Linux は�
 
 次の例の `0.1.0` は、入れる版に置き換えます。ファイル名には版と `aarch64-apple-darwin` が入ります。バイナリには Developer ID の署名がなく、公証（notarization）もされていません（ad-hoc 署名のみです）。
 
-`curl -LO` で受け取ったファイルには隔離属性 `com.apple.quarantine` が付かないので、Gatekeeper は警告しません。
+`curl -fLO` で受け取ったファイルには隔離属性 `com.apple.quarantine` が付かないので、Gatekeeper は警告しません。
 
 ```sh
 ver=0.1.0
 base="https://github.com/yanmakazuki/radiko-client/releases/download/v${ver}"
 asset="radiko-client-${ver}-aarch64-apple-darwin.tar.gz"
-curl -LO "${base}/${asset}"
-curl -LO "${base}/${asset}.sha256"
+curl -fLO "${base}/${asset}"
+curl -fLO "${base}/${asset}.sha256"
 shasum -a 256 -c "${asset}.sha256"
 tar xzf "${asset}"
 "radiko-client-${ver}-aarch64-apple-darwin/radiko-client" --help
@@ -54,10 +54,10 @@ tar xzf "${asset}"
 
 アーカイブの中は `radiko-client` と `LICENSE` です。
 
-ブラウザで保存したファイルを展開したときは、`radiko-client` があるディレクトリで隔離属性を外します。macOS 15 以降は、System Settings > Privacy & Security > Open Anyway からも開けます。
+ブラウザで保存したファイルを展開したときは、ダウンロードと同じディレクトリで隔離属性を外します。macOS 15 以降は、「システム設定 > プライバシーとセキュリティ > このまま開く」からも開けます。
 
 ```sh
-xattr -d com.apple.quarantine ./radiko-client
+xattr -d com.apple.quarantine "radiko-client-${ver}-aarch64-apple-darwin/radiko-client"
 ```
 
 ### ソースからビルドする
