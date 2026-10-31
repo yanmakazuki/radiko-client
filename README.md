@@ -9,12 +9,13 @@ macOS と Linux のターミナルで使う radiko クライアントです。�
 | コードの分かれ方と上限 | [docs/architecture.md](docs/architecture.md) |
 | 実機で確認できた範囲と、その手順 | [docs/validation.md](docs/validation.md) |
 | 日付・ビルドごとの検証記録 | [docs/implementation.md](docs/implementation.md) |
+| 版ごとの変更 | [CHANGELOG.md](CHANGELOG.md) |
 
 ## 必要なもの
 
 - macOS または Linux
 - Rust 1.85 以上。依存は `Cargo.lock` に固定する
-- Linux では C コンパイラ、pkg-config、libasound の開発ファイル。Debian 13 と Ubuntu 24.04 は `build-essential`、`pkg-config`、`libasound2-dev`。Fedora は `gcc`、`pkgconf-pkg-config`、`alsa-lib-devel`。Ubuntu 24.04 の手順は次の節
+- Linux では C コンパイラ、pkg-config、libasound の開発ファイル。Debian 13 と Ubuntu 24.04 は `build-essential`、`pkg-config`、`libasound2-dev`。Fedora は `gcc`、`pkgconf-pkg-config`、`alsa-lib-devel`。Ubuntu 24.04 でソースからビルドする手順は「Ubuntu 24.04 でビルドして output-info を実行する」
 - 再生には、公式 Web にログインできるダブルプランの保存セッション
 - 番組表の閲覧はログイン不要
 
@@ -23,6 +24,48 @@ macOS では、既定の MacOSX27.0 SDK でリンクに失敗することがあ�
 ```sh
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 ```
+
+## インストール
+
+公開するバイナリは、macOS の Apple silicon（`aarch64-apple-darwin`）だけです。Intel Mac（`x86_64-apple-darwin`）向けのファイルは出していません。Intel Mac は、下の「ソースからビルドする」で作ります。
+
+Linux のバイナリも、このリリースにはありません。Linux はソースからビルドします。Linux の成果物は、[#26](https://github.com/yanmakazuki/radiko-client/issues/26) の実機確認のあと別途出します。
+
+### リリースから入れる
+
+安定版のタグは `v` に、`crates/radiko` と `crates/radiko-client` の `Cargo.toml` の `version` を続けたものです。どちらもいまは `0.1.0` なので、タグは `v0.1.0` です。二つの `version` が違うとき、またはタグの `MAJOR.MINOR.PATCH` がそれと違うとき（クレートが `0.1.0` なのに `v0.2.0` など）は、ワークフローがリリースを作る前に失敗します。
+
+`v0.1.0-test.1` のように、核の版のあとに SemVer のプレリリース接尾辞を付けたタグは、核が Cargo.toml と一致すれば通ります。接尾辞は Cargo.toml には書きません。GitHub 上のリリースはプレリリースになり、Latest にはしません。本文は CHANGELOG のその核の節（`## [0.1.0]`）です。`v0.1.0+gha` のようなビルドメタデータは受け付けません。
+
+次の例の `0.1.0` は、入れる版に置き換えます。ファイル名には版と `aarch64-apple-darwin` が入ります。SHA256 の確認は、二つのファイルを同じディレクトリに置いてから `shasum -c` します。
+
+```sh
+ver=0.1.0
+asset="radiko-client-${ver}-aarch64-apple-darwin.tar.gz"
+curl -fL -o "$asset" "https://github.com/yanmakazuki/radiko-client/releases/download/v${ver}/${asset}"
+curl -fL -o "${asset}.sha256" "https://github.com/yanmakazuki/radiko-client/releases/download/v${ver}/${asset}.sha256"
+shasum -a 256 -c "${asset}.sha256"
+tar -xzf "$asset"
+```
+
+アーカイブの中は `radiko-client` と `LICENSE` です。バイナリは署名していません。ブラウザで保存したアーカイブには、macOS が隔離属性 `com.apple.quarantine` を付けることがあります。展開した実行ファイルにそれが残っていると、Gatekeeper が「開発元を確認できないため、開けません」と表示して起動を止めます。SHA256 が合ったあとに属性を外すか、初回だけシステム設定の「プライバシーとセキュリティ」から「このまま開く」を選びます。Finder でバイナリを右クリックして「開く」でも同じです。
+
+```sh
+xattr -dr com.apple.quarantine "radiko-client-${ver}-aarch64-apple-darwin"
+"radiko-client-${ver}-aarch64-apple-darwin/radiko-client" --help
+```
+
+`curl` で取ったファイルには、隔離属性が付かないことが多いです。ブラウザで保存したときは、上の `xattr` を実行します。
+
+### ソースからビルドする
+
+Linux と Intel Mac は、リポジトリを取得してビルドします。Ubuntu 24.04 の手順は次の節です。依存の入れ方は「必要なもの」です。
+
+```sh
+cargo build --locked --release
+```
+
+出来たバイナリは `target/release/radiko-client` です。
 
 ## Ubuntu 24.04 でビルドして output-info を実行する
 
@@ -142,6 +185,8 @@ RADIKO_ALSA_LOG=1 cargo run --locked --quiet -- output-info
 付けないときは、機器の列挙と出力を開くあいだのそれらのログは端末へ出さず、失敗は日本語のエラーだけです。`1` 以外の値も、ログを残しません。
 
 ## ビルド
+
+Apple silicon の公開バイナリは「インストール」です。ここはソースの確認に使うコマンドです。
 
 ```sh
 cargo fmt --all -- --check
