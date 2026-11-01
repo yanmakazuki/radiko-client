@@ -10,15 +10,15 @@
 
 再生が続いているあいだの文は、エラーの型から決める。ライブラリの `Display` と CLI の文は変えていない。
 
-- `SourceStalled`：「新しいセグメントを確認できません。再生は続いています」
-- `EarlyEnd`：「配信が途中で終わりました。再生は続いています」
+- `SourceStalled`：「切り替え先の音声が届きませんでした。再生は続いています」
+- `EarlyEnd`：「切り替え先の配信が途中で終わりました。再生は続いています」
 - ワーカーの `Failed`（取得失敗、デコード失敗、ワーカーの終了）：「切り替えられませんでした。再生は続いています」
 
 これらの文に「停止しました」は入れない。接頭辞は「再生準備失敗（現在の状態を維持）」のままである。何も再生していないときは、これまでの停止文のままである。`SourceStalled` は「30秒間新しいセグメントを確認できないため停止しました」、`EarlyEnd` は「放送枠末尾より前に配信が終了しました」、取得失敗は「配信取得: 配信の検証中に通信に失敗しました」である。利用者が別の局を選び直したときは、何も報告しない。
 
 準備の無音上限は本番では 30 秒のままである。テストは 15 ミリ秒に縮め、30 秒は待たない。子トークンを同じトークンに戻すと、再生中の `SourceStalled`、`Failed`、`EarlyEnd` と、何も再生していないときの `SourceStalled` は 3 秒で時間切れになり、利用者の取り消しは報告されないままだった。戻したあとは成功した。
 
-確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 450 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 test` も同じオプションで 450 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。macOS はこの環境では実行していない。
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 450 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 test` も同じオプションで 450 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。macOS はこの環境では実行していない。そのあと、再生中の `SourceStalled` と `EarlyEnd` の文を上の二つへ改めた。取得失敗の「切り替えられませんでした。再生は続いています」と、何も再生していないときの停止文は変えていない。同じ確認をやり直しても 450 件成功、失敗 0、ignored 2 件のままである。
 
 ## 2026年11月1日：出力機器エラーの対処をプレイヤー欄に出す
 

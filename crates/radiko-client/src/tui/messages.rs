@@ -12,8 +12,9 @@ pub(super) const RECONNECT_CONTINUES: &str =
 pub(super) const DEADLINE_CONTINUES: &str = "番組は終了しています。再生は続いています";
 pub(super) const PROBE_TIMEOUT_CONTINUES: &str = "切り替えられませんでした。再生は続いています";
 pub(super) const SOURCE_STALLED_CONTINUES: &str =
-    "新しいセグメントを確認できません。再生は続いています";
-pub(super) const EARLY_END_CONTINUES: &str = "配信が途中で終わりました。再生は続いています";
+    "切り替え先の音声が届きませんでした。再生は続いています";
+pub(super) const EARLY_END_CONTINUES: &str =
+    "切り替え先の配信が途中で終わりました。再生は続いています";
 pub(super) const STREAM_AUTHENTICATION: &str =
     "配信認証が拒否されました。a で再確認 / I で再ログイン";
 pub(super) const OUTSIDE_AREA: &str = "この局は現在地のエリア外です（エリアフリー未加入）";

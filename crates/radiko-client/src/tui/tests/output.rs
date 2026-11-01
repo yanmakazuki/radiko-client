@@ -507,8 +507,8 @@ fn help_quotes_the_output_guide_sentences() {
     assert!(help.contains("再生が続いているあいだは「再生を停止しました」を出しません。"));
     assert!(help.contains("番組は終了しています。再生は続いています"));
     assert!(help.contains("切り替えられませんでした。再生は続いています"));
-    assert!(help.contains("新しいセグメントを確認できません。再生は続いています"));
-    assert!(help.contains("配信が途中で終わりました。再生は続いています"));
+    assert!(help.contains("切り替え先の音声が届きませんでした。再生は続いています"));
+    assert!(help.contains("切り替え先の配信が途中で終わりました。再生は続いています"));
 }
 
 #[test]
@@ -569,12 +569,12 @@ fn prep_failure_while_playing_replaces_the_stop_sentence() {
         (
             radiko::app::playback::NoticeKind::SourceStalledWhilePlaying,
             "30秒間新しいセグメントを確認できないため停止しました",
-            "新しいセグメントを確認できません。再生は続いています",
+            "切り替え先の音声が届きませんでした。再生は続いています",
         ),
         (
             radiko::app::playback::NoticeKind::EarlyEndWhilePlaying,
             "放送枠末尾より前に配信が終了しました",
-            "配信が途中で終わりました。再生は続いています",
+            "切り替え先の配信が途中で終わりました。再生は続いています",
         ),
         (
             radiko::app::playback::NoticeKind::StreamFailedWhilePlaying,
