@@ -11,7 +11,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, TrySendError},
     },
     thread,
@@ -62,6 +62,10 @@ struct Job {
 struct Completed {
     id: u64,
     result: Result<Ready, PlaybackError>,
+    /// The prepared stream did not match the request or the current slot.
+    /// The error stays `InvalidPosition` so Display and CLI text stay the same.
+    /// While playback continues, the TUI must not call that a user position.
+    slot_mismatch: bool,
 }
 type Reporter = dyn FnMut(
         String,
@@ -85,6 +89,15 @@ pub struct Controller {
     pub(super) volume: u32,
     /// Set by the play loop from whether an output is open. Preparation before that is not playback.
     playback_active: bool,
+    /// TUI selections use the schedule slot start as `cursor`. A stream that
+    /// only contains that instant is another slot. CLI cursors are the
+    /// requested time, so this stays off for the CLI controller.
+    compare_schedule_start: Arc<AtomicBool>,
+    /// Last completed job's slot-mismatch bit. Tests read it after the play loop returns.
+    #[cfg(test)]
+    last_slot_mismatch: AtomicBool,
+    #[cfg(test)]
+    prepare_stall_ms: Arc<AtomicU64>,
 }
 impl Controller {
     pub fn new(
@@ -162,7 +175,17 @@ impl Controller {
         let latest = Arc::new(Mutex::new(None::<Job>));
         let generation = Arc::new(AtomicU64::new(0));
         let (tx, results) = mpsc::sync_channel(1);
-        let (mailbox, ids, shutdown) = (latest.clone(), generation.clone(), stop.clone());
+        let stall_ms = Arc::new(AtomicU64::new(30_000));
+        #[cfg(test)]
+        let prepare_stall_ms = stall_ms.clone();
+        let compare_schedule_start = Arc::new(AtomicBool::new(false));
+        let (mailbox, ids, shutdown, stall_ms, compare_schedule_start_flag) = (
+            latest.clone(),
+            generation.clone(),
+            stop.clone(),
+            stall_ms,
+            compare_schedule_start.clone(),
+        );
         let preparation_worker = thread::spawn(move || {
             while !shutdown.is_cancelled() {
                 let job = match mailbox.lock() {
@@ -176,28 +199,51 @@ impl Controller {
                 if job.stop.is_cancelled() {
                     continue;
                 }
-                let result = factory(job.request.clone(), job.stop.clone()).and_then(|source| {
-                    let info = source.info();
-                    let same_slot = job.expected.as_ref().is_none_or(|expected| {
-                        expected.station == info.station
-                            && expected.starts_at == info.starts_at
-                            && expected.ends_at == info.ends_at
-                            && expected.mode == info.mode
-                    });
-                    if !job.request.matches(info) || !same_slot {
-                        return Err(PlaybackError::Source(
-                            crate::api::stream::ProbeError::InvalidPosition,
-                        ));
+                let (result, slot_mismatch) = match factory(job.request.clone(), job.stop.clone()) {
+                    Err(error) => (Err(error), false),
+                    Ok(source) => {
+                        let info = source.info();
+                        let same_slot = job.expected.as_ref().is_none_or(|expected| {
+                            expected.station == info.station
+                                && expected.starts_at == info.starts_at
+                                && expected.ends_at == info.ends_at
+                                && expected.mode == info.mode
+                        });
+                        // A live slot can move, or the source can disagree with the
+                        // request, without the user naming a position. Keep
+                        // `InvalidPosition` for Display and CLI. The flag tells the
+                        // TUI this is not a user position error.
+                        // `starts_at != cursor` is the TUI schedule slot versus the
+                        // stream slot. CLI cursors are the requested time, so the
+                        // comparison runs only when the app service opts in.
+                        let schedule_start = compare_schedule_start_flag.load(Ordering::Acquire)
+                            && info.starts_at != job.request.cursor;
+                        if !job.request.matches(info) || !same_slot || schedule_start {
+                            (
+                                Err(PlaybackError::Source(
+                                    crate::api::stream::ProbeError::InvalidPosition,
+                                )),
+                                true,
+                            )
+                        } else if job.stop.is_cancelled() {
+                            (Err(PlaybackError::Worker), false)
+                        } else {
+                            let stall = Duration::from_millis(stall_ms.load(Ordering::Acquire));
+                            (prepare_ready(source, job.stop.clone(), stall), false)
+                        }
                     }
-                    if job.stop.is_cancelled() {
-                        return Err(PlaybackError::Worker);
-                    }
-                    prepare_ready(source, job.stop.clone())
-                });
+                };
+                // `prepare_ready` drops its worker on failure. That drop cancels a
+                // child token, not `job.stop`. A cancelled `job.stop` is a user
+                // cancel (another selection, pause, or stop) and is not reported.
                 if job.id != ids.load(Ordering::Acquire) || job.stop.is_cancelled() {
                     continue;
                 }
-                let mut value = Completed { id: job.id, result };
+                let mut value = Completed {
+                    id: job.id,
+                    result,
+                    slot_mismatch,
+                };
                 loop {
                     if shutdown.is_cancelled() || job.id != ids.load(Ordering::Acquire) {
                         break;
@@ -228,7 +274,28 @@ impl Controller {
             paused: false,
             volume: 25,
             playback_active: false,
+            compare_schedule_start,
+            #[cfg(test)]
+            last_slot_mismatch: AtomicBool::new(false),
+            #[cfg(test)]
+            prepare_stall_ms,
         }
+    }
+    /// Whether the latest completed preparation was an internal slot mismatch.
+    #[cfg(test)]
+    pub(crate) fn last_slot_mismatch(&self) -> bool {
+        self.last_slot_mismatch.load(Ordering::Acquire)
+    }
+    /// The TUI identifies a slot by its schedule start. Enable the
+    /// `starts_at != cursor` mismatch check. The CLI controller leaves this off.
+    pub(crate) fn reject_contained_schedule_start(&self) {
+        self.compare_schedule_start.store(true, Ordering::Release);
+    }
+    /// Shortens only the silence limit inside `prepare_ready`. Production stays at 30 seconds.
+    #[cfg(test)]
+    pub(crate) fn set_prepare_stall(&self, stall: Duration) {
+        let millis = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX);
+        self.prepare_stall_ms.store(millis, Ordering::Release);
     }
     /// Call only from the owning background control thread, after output has been stopped.
     /// Prevents a replacement session from accumulating workers blocked in old HTTP requests.
@@ -248,11 +315,20 @@ impl Controller {
     /// CLI text stays `{prefix}: {error}`. The kind and prefix let the TUI replace that error.
     /// The continuing sentence is only for a failure while output is already open.
     pub(super) fn report_failure(&mut self, prefix: &'static str, error: &PlaybackError) {
-        let kind = if self.playback_active {
+        self.report_failure_with(prefix, error, None);
+    }
+    /// `kind_override` is the path decision. Display and the `{prefix}: {error}` CLI line stay.
+    fn report_failure_with(
+        &mut self,
+        prefix: &'static str,
+        error: &PlaybackError,
+        kind_override: Option<crate::player::playback::NoticeKind>,
+    ) {
+        let kind = kind_override.or(if self.playback_active {
             crate::player::playback::continuing_notice_kind(error)
         } else {
             crate::player::playback::notice_kind(error)
-        };
+        });
         let shown_prefix = kind.map(|_| prefix);
         let output = crate::player::playback::output_failure(error);
         (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix, output);
@@ -406,11 +482,23 @@ impl Controller {
             self.pending_target = None;
             match completed.result {
                 Ok(ready) => {
+                    #[cfg(test)]
+                    self.last_slot_mismatch
+                        .store(completed.slot_mismatch, Ordering::Release);
                     self.pending = None;
                     return Some(ready);
                 }
                 Err(error) => {
-                    self.report_failure("再生準備失敗（現在の状態を維持）", &error);
+                    #[cfg(test)]
+                    self.last_slot_mismatch
+                        .store(completed.slot_mismatch, Ordering::Release);
+                    let kind_override = (completed.slot_mismatch && self.playback_active)
+                        .then_some(crate::player::playback::NoticeKind::StreamFailedWhilePlaying);
+                    self.report_failure_with(
+                        "再生準備失敗（現在の状態を維持）",
+                        &error,
+                        kind_override,
+                    );
                 }
             }
             self.pending = None;

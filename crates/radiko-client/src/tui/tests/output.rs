@@ -370,10 +370,7 @@ fn continued_playback_does_not_say_that_playback_stopped() {
     });
     assert_eq!(
         preparing.playback_notice,
-        format!(
-            "再生準備失敗（現在の状態を維持）: {}",
-            super::super::messages::AUTH_EXPIRED_CONTINUES
-        )
+        "認証期限切れです。再生は続いています。a で再確認 / I で再ログイン"
     );
     assert!(!preparing.playback_notice.contains("再生を停止しました"));
     assert!(!preparing.playback_stopped);
@@ -398,10 +395,7 @@ fn continued_playback_does_not_say_that_playback_stopped() {
     });
     assert_eq!(
         switching.playback_notice,
-        format!(
-            "再生切替失敗（現在の状態を維持）: {}",
-            super::super::messages::RECONNECT_CONTINUES
-        )
+        "再接続の上限です。再生は続いています。番組を選び直してください"
     );
     assert!(!switching.playback_notice.contains("再生を停止しました"));
     let narrow = content_rows(&mut switching, 80, 24).join("\n");
@@ -507,6 +501,13 @@ fn help_quotes_the_output_guide_sentences() {
     assert!(help.contains("再生が続いているあいだは「再生を停止しました」を出しません。"));
     assert!(help.contains("番組は終了しています。再生は続いています"));
     assert!(help.contains("切り替えられませんでした。再生は続いています"));
+    assert!(help.contains("切り替え先の音声が届きませんでした。再生は続いています"));
+    assert!(help.contains("切り替え先の配信が途中で終わりました。再生は続いています"));
+    assert!(help.contains("指定した位置は番組の範囲外です。再生は続いています"));
+    assert!(help.contains("切り替え先の配信を取得できませんでした。再生は続いています"));
+    assert!(help.contains(
+        "再生準備失敗（現在の状態を維持）」も「再生切替失敗（現在の状態を維持）」も付けません。"
+    ));
 }
 
 #[test]
@@ -526,7 +527,6 @@ fn deadline_and_probe_timeout_switch_text_follows_whether_playback_continues() {
     ];
     for (kind, stop_body, continues) in cases {
         let raw = format!("{prefix}: {stop_body}");
-        let continued = format!("{prefix}: {continues}");
         let mut playing = super::screen();
         playing.app.playback = Some(playing_snapshot());
         playing.apply_playback(radiko::app::playback::Update {
@@ -536,7 +536,7 @@ fn deadline_and_probe_timeout_switch_text_follows_whether_playback_continues() {
             notice_prefix: Some(prefix),
             ..radiko::app::playback::Update::default()
         });
-        assert_eq!(playing.playback_notice, continued);
+        assert_eq!(playing.playback_notice, continues);
         assert!(!playing.playback_notice.contains("音声を停止しました"));
         assert!(!playing.playback_notice.contains("停止しました"));
         let shown = content_rows(&mut playing, 160, 40).join("\n");
@@ -557,6 +557,234 @@ fn deadline_and_probe_timeout_switch_text_follows_whether_playback_continues() {
         let narrow = content_rows(&mut idle, 80, 24).join("\n");
         assert!(narrow.contains("再生中: なし"), "{narrow}");
         assert!(!narrow.contains(continues), "{narrow}");
+    }
+}
+
+#[test]
+fn prep_failure_while_playing_replaces_the_stop_sentence() {
+    let prefix = "再生準備失敗（現在の状態を維持）";
+    let cases = [
+        (
+            radiko::app::playback::NoticeKind::SourceStalledWhilePlaying,
+            "30秒間新しいセグメントを確認できないため停止しました",
+            "切り替え先の音声が届きませんでした。再生は続いています",
+        ),
+        (
+            radiko::app::playback::NoticeKind::EarlyEndWhilePlaying,
+            "放送枠末尾より前に配信が終了しました",
+            "切り替え先の配信が途中で終わりました。再生は続いています",
+        ),
+        (
+            radiko::app::playback::NoticeKind::StreamFailedWhilePlaying,
+            "配信取得: 配信の検証中に通信に失敗しました",
+            "切り替えられませんでした。再生は続いています",
+        ),
+    ];
+    for (kind, stop_body, continues) in cases {
+        let raw = format!("{prefix}: {stop_body}");
+        let mut playing = super::screen();
+        playing.app.playback = Some(playing_snapshot());
+        playing.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(playing_snapshot()),
+            notice: Some(raw.clone()),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(playing.playback_notice, continues);
+        assert!(
+            !playing.playback_notice.contains("停止しました"),
+            "{continues}"
+        );
+        let shown = content_rows(&mut playing, 160, 40).join("\n");
+        assert!(shown.contains("再生中:"), "{shown}");
+        assert!(shown.contains(continues), "{shown}");
+        assert!(!shown.contains("停止しました"), "{shown}");
+
+        let mut idle = super::screen();
+        idle.apply_playback(radiko::app::playback::Update {
+            notice: Some(raw.clone()),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(idle.playback_notice, raw);
+        assert!(idle.app.playback.is_none());
+        assert!(!idle.playback_notice.contains("再生は続いています"));
+        let narrow = content_rows(&mut idle, 80, 24).join("\n");
+        assert!(narrow.contains("再生中: なし"), "{narrow}");
+        assert!(!narrow.contains(continues), "{narrow}");
+    }
+}
+
+#[test]
+fn slot_mismatch_sentence_is_not_the_position_sentence() {
+    let generic = "切り替えられませんでした。再生は続いています";
+    let position = "指定した位置は番組の範囲外です。再生は続いています";
+    let mut mismatch = super::screen();
+    mismatch.app.playback = Some(playing_snapshot());
+    mismatch.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(playing_snapshot()),
+        notice: Some(
+            "再生準備失敗（現在の状態を維持）: 配信取得: シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+                .into(),
+        ),
+        notice_kind: Some(radiko::app::playback::NoticeKind::StreamFailedWhilePlaying),
+        notice_prefix: Some("再生準備失敗（現在の状態を維持）"),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(mismatch.playback_notice, generic);
+    assert!(
+        !mismatch
+            .playback_notice
+            .contains("指定した位置は番組の範囲外です")
+    );
+    assert_full_notice_row(&mut mismatch, 80, 24, generic);
+    assert_full_notice_row(&mut mismatch, 160, 40, generic);
+
+    let mut chosen = super::screen();
+    chosen.app.playback = Some(playing_snapshot());
+    chosen.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(playing_snapshot()),
+        notice: Some(
+            "再生準備失敗（現在の状態を維持）: 配信取得: シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+                .into(),
+        ),
+        notice_kind: Some(radiko::app::playback::NoticeKind::InvalidPositionWhilePlaying),
+        notice_prefix: Some("再生準備失敗（現在の状態を維持）"),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(chosen.playback_notice, position);
+    assert_full_notice_row(&mut chosen, 80, 24, position);
+    assert_full_notice_row(&mut chosen, 160, 40, position);
+}
+
+fn assert_full_notice_row(screen: &mut Screen, width: u16, height: u16, sentence: &str) {
+    let rows = content_rows(screen, width, height);
+    assert!(
+        rows.iter().any(|row| row == sentence),
+        "{width}x{height} did not show {sentence:?} as one full row\n{}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn while_playing_notices_fit_one_row_without_the_failure_prefix() {
+    let playing = [
+        (
+            radiko::app::playback::NoticeKind::AuthExpiredWhilePlaying,
+            "認証期限切れです。再生は続いています。a で再確認 / I で再ログイン",
+            "再生準備失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying,
+            "再接続の上限です。再生は続いています。番組を選び直してください",
+            "再生切替失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::DeadlineWhilePlaying,
+            "番組は終了しています。再生は続いています",
+            "再生切替失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::ProbeTimeoutWhilePlaying,
+            "切り替えられませんでした。再生は続いています",
+            "再生切替失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::SourceStalledWhilePlaying,
+            "切り替え先の音声が届きませんでした。再生は続いています",
+            "再生準備失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::EarlyEndWhilePlaying,
+            "切り替え先の配信が途中で終わりました。再生は続いています",
+            "再生準備失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::StreamFailedWhilePlaying,
+            "切り替えられませんでした。再生は続いています",
+            "再生準備失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::InvalidPositionWhilePlaying,
+            "指定した位置は番組の範囲外です。再生は続いています",
+            "再生準備失敗（現在の状態を維持）",
+        ),
+        (
+            radiko::app::playback::NoticeKind::HttpWhilePlaying,
+            "切り替え先の配信を取得できませんでした。再生は続いています",
+            "再生準備失敗（現在の状態を維持）",
+        ),
+    ];
+    for (kind, sentence, prefix) in playing {
+        let mut screen = super::screen();
+        screen.app.playback = Some(playing_snapshot());
+        screen.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(playing_snapshot()),
+            notice: Some(format!("{prefix}: 配信取得: 合成の失敗")),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(screen.playback_notice, sentence);
+        assert!(!screen.playback_notice.starts_with(prefix), "{sentence}");
+        for (width, height) in [(80u16, 24u16), (160, 40)] {
+            assert_full_notice_row(&mut screen, width, height, sentence);
+        }
+    }
+
+    let mut named = super::screen();
+    named.app.playback = Some(playing_snapshot());
+    named.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(playing_snapshot()),
+        notice: Some(
+            "再生準備失敗（現在の状態を維持）: 未ログインです。loginでログインしてください".into(),
+        ),
+        notice_kind: Some(radiko::app::playback::NoticeKind::LoginRequired),
+        notice_prefix: Some("再生準備失敗（現在の状態を維持）"),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(
+        named.playback_notice,
+        "再生準備失敗（現在の状態を維持）: 未ログインです。I でログイン"
+    );
+
+    let idle_cases = [
+        (
+            radiko::app::playback::NoticeKind::SourceStalledWhilePlaying,
+            "再生準備失敗（現在の状態を維持）: 30秒間新しいセグメントを確認できないため停止しました",
+        ),
+        (
+            radiko::app::playback::NoticeKind::HttpWhilePlaying,
+            "再生準備失敗（現在の状態を維持）: 配信取得: 配信サーバーがHTTP 503を返しました",
+        ),
+        (
+            radiko::app::playback::NoticeKind::InvalidPositionWhilePlaying,
+            "再生切替失敗（現在の状態を維持）: 配信取得: シーク位置は番組冒頭以上・放送枠末尾未満で指定してください",
+        ),
+    ];
+    for (kind, raw) in idle_cases {
+        let mut idle = super::screen();
+        idle.apply_playback(radiko::app::playback::Update {
+            notice: Some(raw.to_owned()),
+            notice_kind: Some(kind),
+            notice_prefix: Some(if raw.starts_with("再生切替失敗") {
+                "再生切替失敗（現在の状態を維持）"
+            } else {
+                "再生準備失敗（現在の状態を維持）"
+            }),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(idle.playback_notice, raw);
+        assert!(idle.app.playback.is_none());
+        let rows = content_rows(&mut idle, 80, 24);
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("再生準備失敗（現在の状態を維持）:")
+                    || row.starts_with("再生切替失敗（現在の状態を維持）:")),
+            "{rows:?}"
+        );
     }
 }
 

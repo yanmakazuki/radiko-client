@@ -317,14 +317,14 @@ impl Screen {
                 {
                     Some(radiko::app::playback::NoticeKind::AuthExpired)
                 }
-                Some(
-                    radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying
-                    | radiko::app::playback::NoticeKind::DeadlineWhilePlaying
-                    | radiko::app::playback::NoticeKind::ProbeTimeoutWhilePlaying,
-                ) if self.app.playback.is_none() => None,
+                Some(kind) if self.app.playback.is_none() && kind.while_playing() => None,
                 other => other,
             };
+            // While playback continues, a *WhilePlaying kind is the sentence alone.
+            // The failure prefix stays for every other kind, and for the stop
+            // sentence used when no snapshot is playing.
             self.playback_notice = match kind {
+                Some(kind) if kind.while_playing() => super::messages::playback_notice(kind),
                 Some(kind) => match update.notice_prefix {
                     Some(prefix) => {
                         format!("{prefix}: {}", super::messages::playback_notice(kind))

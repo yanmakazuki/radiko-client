@@ -1209,21 +1209,28 @@ mod tests {
         }
         let mock = flow();
         mock.steps.borrow_mut()[0].bytes = program_json(start, end, 0);
-        assert!(matches!(
-            prepare_with(
-                &mock,
-                "TBS",
-                ProbeMode::TimeFree,
-                RequestedPosition {
-                    at: dt(start),
-                    position: std::time::Duration::from_secs(3600)
-                },
-                dt("2026-10-15T12:00:00+09:00"),
-                &member(),
-                &membership()
+        let Err(out_of_range) = prepare_with(
+            &mock,
+            "TBS",
+            ProbeMode::TimeFree,
+            RequestedPosition {
+                at: dt(start),
+                position: std::time::Duration::from_secs(3600),
+            },
+            dt("2026-10-15T12:00:00+09:00"),
+            &member(),
+            &membership(),
+        ) else {
+            panic!("a position past the slot must be InvalidPosition");
+        };
+        assert!(matches!(&out_of_range, ProbeError::InvalidPosition));
+        assert_eq!(
+            crate::player::playback::continuing_notice_kind(
+                &crate::player::playback::PlaybackError::Source(out_of_range)
             ),
-            Err(ProbeError::InvalidPosition)
-        ));
+            Some(crate::player::playback::NoticeKind::InvalidPositionWhilePlaying),
+            "a position past the slot must show 「指定した位置は番組の範囲外です。再生は続いています」, not 「切り替えられませんでした。再生は続いています」"
+        );
         assert_eq!(mock.seen.borrow().len(), 1);
     }
     #[test]

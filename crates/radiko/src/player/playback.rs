@@ -104,7 +104,35 @@ pub enum NoticeKind {
     DeadlineWhilePlaying,
     /// A switch-time output probe timed out, and the current playback is still running.
     ProbeTimeoutWhilePlaying,
+    /// The next stream produced no segment before the prepare limit, and playback continues.
+    SourceStalledWhilePlaying,
+    /// The next stream ended before its audio was ready, and playback continues.
+    EarlyEndWhilePlaying,
+    /// The next stream's worker failed, and playback continues.
+    StreamFailedWhilePlaying,
+    /// The requested position is outside the slot, and playback continues.
+    InvalidPositionWhilePlaying,
+    /// The next stream's HTTP fetch failed, and playback continues.
+    HttpWhilePlaying,
     OutsideArea,
+}
+impl NoticeKind {
+    /// A failure that leaves the current playback running.
+    /// The TUI shows this kind's sentence with no failure prefix.
+    pub fn while_playing(self) -> bool {
+        matches!(
+            self,
+            Self::AuthExpiredWhilePlaying
+                | Self::ReconnectLimitWhilePlaying
+                | Self::DeadlineWhilePlaying
+                | Self::ProbeTimeoutWhilePlaying
+                | Self::SourceStalledWhilePlaying
+                | Self::EarlyEndWhilePlaying
+                | Self::StreamFailedWhilePlaying
+                | Self::InvalidPositionWhilePlaying
+                | Self::HttpWhilePlaying
+        )
+    }
 }
 /// `Some` when the TUI must replace the CLI sentence for this error.
 pub fn notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
@@ -131,7 +159,17 @@ pub fn continuing_notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
         PlaybackError::Output(OutputError::ProbeTimeout) => {
             Some(NoticeKind::ProbeTimeoutWhilePlaying)
         }
-        _ => notice_kind(error),
+        PlaybackError::SourceStalled => Some(NoticeKind::SourceStalledWhilePlaying),
+        PlaybackError::EarlyEnd => Some(NoticeKind::EarlyEndWhilePlaying),
+        PlaybackError::Decode(_) | PlaybackError::Worker => {
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        }
+        PlaybackError::Source(error) => Some(continuing_source_kind(error)),
+        PlaybackError::Storage(_)
+        | PlaybackError::LoginRequired
+        | PlaybackError::Auth(_)
+        | PlaybackError::Output(_)
+        | PlaybackError::ReconnectGaveUp => notice_kind(error),
     }
 }
 fn auth_expired_error(error: &PlaybackError) -> bool {
@@ -225,6 +263,14 @@ fn probe_reconnect_limit(error: &ProbeError) -> bool {
         | ProbeError::NoEndpoint
         | ProbeError::WindowLost
         | ProbeError::AuthExpired => false,
+    }
+}
+fn continuing_source_kind(error: &ProbeError) -> NoticeKind {
+    match error {
+        ProbeError::At(_, inner) => continuing_source_kind(inner),
+        ProbeError::InvalidPosition => NoticeKind::InvalidPositionWhilePlaying,
+        ProbeError::Http(_) => NoticeKind::HttpWhilePlaying,
+        other => probe_notice_kind(other).unwrap_or(NoticeKind::StreamFailedWhilePlaying),
     }
 }
 fn probe_notice_kind(error: &ProbeError) -> Option<NoticeKind> {
@@ -779,9 +825,14 @@ pub(super) struct Ready {
 pub(super) fn prepare_ready(
     source: Box<dyn SegmentSource>,
     stop: StopToken,
+    stall_after: Duration,
 ) -> Result<Ready, PlaybackError> {
     let info = source.info().clone();
-    let (worker, rx) = worker(source, stop.clone());
+    // The worker token is a child of the caller's token. Dropping the worker
+    // cancels only that child so the decode thread exits. It does not mark the
+    // caller's token cancelled, which the preparation loop uses for a real
+    // user cancel (another selection, pause, or stop).
+    let (worker, rx) = worker(source, stop.child());
     let began = Instant::now();
     let mut primed: Option<DecodedPcm> = None;
     let mut segments = 0;
@@ -789,7 +840,7 @@ pub(super) fn prepare_ready(
         if stop.is_cancelled() {
             return Err(PlaybackError::Worker);
         }
-        if began.elapsed() > Duration::from_secs(30) {
+        if began.elapsed() > stall_after {
             return Err(PlaybackError::SourceStalled);
         }
         match rx.recv_timeout(Duration::from_millis(10)) {
@@ -3326,11 +3377,548 @@ mod tests {
             continuing_notice_kind(&PlaybackError::Output(OutputError::NoDevice)),
             None
         );
+        assert_eq!(notice_kind(&PlaybackError::SourceStalled), None);
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::SourceStalled),
+            Some(NoticeKind::SourceStalledWhilePlaying)
+        );
+        assert_eq!(notice_kind(&PlaybackError::EarlyEnd), None);
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::EarlyEnd),
+            Some(NoticeKind::EarlyEndWhilePlaying)
+        );
+        let failed = PlaybackError::Source(ProbeError::Network);
+        assert_eq!(notice_kind(&failed), None);
+        assert_eq!(
+            continuing_notice_kind(&failed),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::Source(ProbeError::InvalidPosition)),
+            Some(NoticeKind::InvalidPositionWhilePlaying)
+        );
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::Source(ProbeError::Http(503))),
+            Some(NoticeKind::HttpWhilePlaying)
+        );
+        assert_eq!(
+            notice_kind(&PlaybackError::Source(ProbeError::InvalidPosition)),
+            None
+        );
+        assert_eq!(
+            notice_kind(&PlaybackError::Source(ProbeError::Http(404))),
+            None
+        );
         assert!(expired.to_string().contains("再生を停止しました"));
+        assert!(
+            PlaybackError::SourceStalled
+                .to_string()
+                .contains("停止しました")
+        );
+        assert!(
+            !PlaybackError::SourceStalled
+                .to_string()
+                .contains("再生は続いています")
+        );
+        assert!(
+            !PlaybackError::EarlyEnd
+                .to_string()
+                .contains("再生は続いています")
+        );
+        assert!(!failed.to_string().contains("再生は続いています"));
         assert!(failure_notice(&expired).contains("再生を停止しました"));
         assert!(reconnect.to_string().contains("再生を停止しました"));
         assert!(failure_notice(&reconnect).contains("再生を停止しました"));
         assert!(!format!("{expired}").contains("再生は続いています"));
+    }
+    #[test]
+    fn invalid_position_while_playing_keeps_its_own_kind() {
+        let bare = PlaybackError::Source(ProbeError::InvalidPosition);
+        let staged = PlaybackError::Source(ProbeError::At(
+            "シーク",
+            Box::new(ProbeError::InvalidPosition),
+        ));
+        for error in [&bare, &staged] {
+            assert_eq!(notice_kind(error), None);
+            assert_eq!(
+                continuing_notice_kind(error),
+                Some(NoticeKind::InvalidPositionWhilePlaying)
+            );
+        }
+        assert_eq!(
+            ProbeError::InvalidPosition.to_string(),
+            "シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+        );
+        assert!(
+            !ProbeError::InvalidPosition
+                .to_string()
+                .contains("再生は続いています")
+        );
+    }
+    #[test]
+    fn http_failure_while_playing_keeps_its_own_kind() {
+        let bare = PlaybackError::Source(ProbeError::Http(503));
+        let staged = PlaybackError::Source(ProbeError::At(
+            "HLS音声取得",
+            Box::new(ProbeError::Http(404)),
+        ));
+        for error in [&bare, &staged] {
+            assert_eq!(notice_kind(error), None);
+            assert_eq!(
+                continuing_notice_kind(error),
+                Some(NoticeKind::HttpWhilePlaying)
+            );
+        }
+        assert_eq!(
+            ProbeError::Http(503).to_string(),
+            "配信サーバーがHTTP 503を返しました"
+        );
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::Source(ProbeError::Network)),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
+    }
+    #[test]
+    fn decode_failure_while_playing_uses_the_generic_switch_kind() {
+        let error = PlaybackError::Decode(AacError::DecodeFailed);
+        assert_eq!(notice_kind(&error), None);
+        assert_eq!(
+            continuing_notice_kind(&error),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
+        assert_eq!(
+            error.to_string(),
+            "デコード: AACパケットのデコードに失敗しました"
+        );
+    }
+    #[test]
+    fn worker_failure_while_playing_uses_the_generic_switch_kind() {
+        let error = PlaybackError::Worker;
+        assert_eq!(notice_kind(&error), None);
+        assert_eq!(
+            continuing_notice_kind(&error),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
+        assert_eq!(error.to_string(), "再生ワーカーが予期せず終了しました");
+    }
+    /// Internal slot disagreement is not a position the user asked for.
+    /// Display stays `InvalidPosition`. The TUI kind does not.
+    #[test]
+    fn internal_slot_mismatch_while_playing_uses_the_generic_switch_sentence() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone, Copy, Debug)]
+        enum Mismatch {
+            Request,
+            Slot,
+            ScheduleStart,
+            IdleScheduleStart,
+            UserPosition,
+            IdleRequest,
+        }
+        struct Quiet {
+            info: StreamInfo,
+            polls: Arc<AtomicUsize>,
+            audio: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Quiet {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                Ok(match self.audio.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        for case in [
+            Mismatch::Request,
+            Mismatch::Slot,
+            Mismatch::ScheduleStart,
+            Mismatch::IdleScheduleStart,
+            Mismatch::UserPosition,
+            Mismatch::IdleRequest,
+        ] {
+            let while_playing =
+                !matches!(case, Mismatch::IdleRequest | Mismatch::IdleScheduleStart);
+            let mut playing = info(3_600_000);
+            playing.starts_at -= chrono::Duration::hours(2);
+            playing.ends_at -= chrono::Duration::hours(2);
+            let cursor = playing.starts_at + chrono::Duration::hours(1);
+            let template = playing.clone();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let polls_for_source = polls.clone();
+            let audio = packet(24_000).repeat(80);
+            let (tx, rx) = mpsc::channel();
+            let (found, received) = mpsc::channel();
+            let stop = StopToken::default();
+            let mut controller = Controller::with_reporter(
+                rx,
+                stop.clone(),
+                move |request| match case {
+                    Mismatch::UserPosition => {
+                        let Err(error) = crate::api::stream::playback::prepare_at_controlled(
+                            "TBS",
+                            ProbeMode::Live,
+                            request.cursor,
+                            &crate::session::MemberSession::new("synthetic-member".into()).unwrap(),
+                            &crate::session::Membership {
+                                area_free: Some(true),
+                                time_free_30: Some(true),
+                            },
+                            Duration::from_secs(1),
+                            std::sync::Arc::new(|| false),
+                        ) else {
+                            panic!("live playback with a position is InvalidPosition");
+                        };
+                        assert!(
+                            matches!(error, ProbeError::InvalidPosition),
+                            "the live position check must be the real InvalidPosition"
+                        );
+                        Err(PlaybackError::Source(error))
+                    }
+                    Mismatch::ScheduleStart | Mismatch::IdleScheduleStart => {
+                        let mut selected = template.clone();
+                        selected.station = request.station.clone();
+                        selected.mode = request.mode;
+                        selected.position = request.position;
+                        selected.starts_at = request.cursor - chrono::Duration::hours(1);
+                        selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                        Ok(Box::new(Quiet {
+                            info: selected,
+                            polls: polls_for_source.clone(),
+                            audio: Some(audio.clone()),
+                        }) as Box<dyn SegmentSource>)
+                    }
+                    Mismatch::Request | Mismatch::IdleRequest => {
+                        let mut selected = template.clone();
+                        selected.station = "ZZZ".into();
+                        selected.starts_at = request.cursor;
+                        selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                        selected.position = request.position;
+                        selected.mode = request.mode;
+                        Ok(Box::new(Quiet {
+                            info: selected,
+                            polls: polls_for_source.clone(),
+                            audio: Some(audio.clone()),
+                        }) as Box<dyn SegmentSource>)
+                    }
+                    Mismatch::Slot => {
+                        let mut selected = template.clone();
+                        selected.station = request.station.clone();
+                        selected.mode = request.mode;
+                        selected.starts_at = request.cursor;
+                        selected.position = request.position;
+                        selected.ends_at = request.cursor + chrono::Duration::hours(3);
+                        // The seek sits 10s into the slot. One short segment ends before
+                        // that point, so preparation would wait out the stall. Keep enough
+                        // audio that a removed `same_slot` check reaches the kind report.
+                        Ok(Box::new(Quiet {
+                            info: selected,
+                            polls: polls_for_source.clone(),
+                            audio: Some(audio.repeat(8)),
+                        }) as Box<dyn SegmentSource>)
+                    }
+                },
+                move |message, kind, _prefix, _output| {
+                    if message.starts_with("再生準備失敗") || message.starts_with("再生切替完了")
+                    {
+                        let _ = found.send((message, kind));
+                    }
+                },
+            );
+            controller.reject_contained_schedule_start();
+            let mut requested = false;
+            let send = tx.clone();
+            let quit = tx.clone();
+            let handle = thread::spawn(move || {
+                let began = Instant::now();
+                let report = loop {
+                    if let Ok(report) = received.try_recv() {
+                        break report;
+                    }
+                    if began.elapsed() > Duration::from_secs(3) {
+                        let _ = quit.send(Command::Stop);
+                        panic!("timed out waiting for the {case:?} preparation report");
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                };
+                let _ = quit.send(Command::Stop);
+                report
+            });
+            let initial = if while_playing {
+                Initial::Source(Box::new(Holding {
+                    info: playing.clone(),
+                    bytes: Some(packet(24_000).repeat(8)),
+                }) as Box<dyn SegmentSource>)
+            } else {
+                Initial::Idle(playing.clone())
+            };
+            if !while_playing {
+                let cursor = if matches!(case, Mismatch::IdleScheduleStart) {
+                    playing.starts_at + chrono::Duration::hours(1)
+                } else {
+                    playing.starts_at
+                };
+                tx.send(Command::Select(PlaybackRequest {
+                    station: playing.station.clone(),
+                    mode: playing.mode,
+                    cursor,
+                    position: Duration::ZERO,
+                }))
+                .unwrap();
+            }
+            let report = play_loop(
+                initial,
+                None,
+                stop,
+                |snapshot| {
+                    if while_playing
+                        && !requested
+                        && snapshot
+                            .output
+                            .as_ref()
+                            .is_some_and(|output| output.frames > 0)
+                    {
+                        requested = true;
+                        let command = if matches!(case, Mismatch::Slot) {
+                            Command::Seek(Duration::from_secs(10))
+                        } else {
+                            Command::Select(PlaybackRequest {
+                                station: "OBS".into(),
+                                mode: ProbeMode::TimeFree,
+                                cursor,
+                                position: Duration::ZERO,
+                            })
+                        };
+                        send.send(command).unwrap();
+                    }
+                },
+                sink,
+                Some(&mut controller),
+            )
+            .unwrap();
+            assert_eq!(report.reason, EndReason::Cancelled);
+            let (message, kind) = handle.join().unwrap();
+            match case {
+                Mismatch::Request | Mismatch::Slot | Mismatch::ScheduleStart => {
+                    assert_eq!(
+                        (kind, controller.last_slot_mismatch()),
+                        (Some(NoticeKind::StreamFailedWhilePlaying), true),
+                        "{case:?} must report StreamFailedWhilePlaying from the slot-mismatch path (slot_mismatch set), 「切り替えられませんでした。再生は続いています」. report={message}"
+                    );
+                    assert_eq!(
+                        polls.load(Ordering::SeqCst),
+                        0,
+                        "{case:?} mismatched source was decoded"
+                    );
+                    assert!(
+                        message
+                            .contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+                        "Display and CLI text must stay the InvalidPosition sentence: {message}"
+                    );
+                    assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
+                    assert_ne!(kind, Some(NoticeKind::InvalidPositionWhilePlaying));
+                }
+                Mismatch::UserPosition => {
+                    assert_eq!(
+                        (kind, controller.last_slot_mismatch()),
+                        (Some(NoticeKind::InvalidPositionWhilePlaying), false),
+                        "a user position error must show 「指定した位置は番組の範囲外です。再生は続いています」. report={message}"
+                    );
+                    assert!(
+                        message
+                            .contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+                        "Display and CLI text must stay the InvalidPosition sentence: {message}"
+                    );
+                    assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
+                }
+                Mismatch::IdleRequest | Mismatch::IdleScheduleStart => {
+                    assert_eq!(kind, None);
+                    assert!(controller.last_slot_mismatch());
+                    assert!(
+                        message
+                            .contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+                        "Display and CLI text must stay the InvalidPosition sentence: {message}"
+                    );
+                    assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
+                    assert!(!message.contains("再生は続いています"));
+                    assert!(!message.contains("指定した位置は番組の範囲外です"));
+                }
+            }
+        }
+    }
+    /// CLI `live` uses now as the cursor and `timefree` uses the requested
+    /// instant. Both can sit inside a slot whose start is earlier. The CLI
+    /// controller does not opt into the schedule-start check.
+    #[test]
+    fn cli_mid_slot_select_prepares_instead_of_rejecting_the_position() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for mode in [ProbeMode::Live, ProbeMode::TimeFree] {
+            let now = Utc::now().fixed_offset();
+            let cursor = if mode == ProbeMode::Live {
+                now
+            } else {
+                now - chrono::Duration::hours(2)
+            };
+            let mut playing = info(3_600_000);
+            playing.starts_at -= chrono::Duration::hours(4);
+            playing.ends_at -= chrono::Duration::hours(4);
+            let base = playing.clone();
+            let (tx, rx) = mpsc::channel();
+            let (found, received) = mpsc::channel();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let polls_for_source = polls.clone();
+            let audio = packet(24_000).repeat(80);
+            let stop = StopToken::default();
+            let mut controller = Controller::with_cancellable_reporter(
+                rx,
+                stop.clone(),
+                move |request, _| {
+                    let mut selected = base.clone();
+                    selected.station = request.station.clone();
+                    selected.mode = request.mode;
+                    selected.position = request.position;
+                    selected.starts_at = request.cursor - chrono::Duration::minutes(30);
+                    selected.ends_at = request.cursor + chrono::Duration::minutes(30);
+                    let polls = polls_for_source.clone();
+                    let audio = audio.clone();
+                    Ok(Box::new(HoldingOnce {
+                        info: selected,
+                        polls,
+                        audio: Some(audio),
+                    }) as Box<dyn SegmentSource>)
+                },
+                move |message, kind, _prefix, _output| {
+                    let _ = found.send((message, kind));
+                },
+            );
+            struct HoldingOnce {
+                info: StreamInfo,
+                polls: Arc<AtomicUsize>,
+                audio: Option<Vec<u8>>,
+            }
+            impl SegmentSource for HoldingOnce {
+                fn info(&self) -> &StreamInfo {
+                    &self.info
+                }
+                fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    Ok(match self.audio.take() {
+                        Some(bytes) => Next::Segment(Segment {
+                            initialization: None,
+                            duration: None,
+                            bytes,
+                            codec: None,
+                            discontinuity: false,
+                            starts_at: Some(self.info.starts_at),
+                        }),
+                        None => Next::Pending(Duration::from_millis(20)),
+                    })
+                }
+            }
+            let mut requested = false;
+            let send = tx.clone();
+            let quit = tx.clone();
+            let handle = thread::spawn(move || {
+                let began = Instant::now();
+                loop {
+                    if let Ok((message, kind)) = received.try_recv() {
+                        if message.starts_with("再生切替完了") {
+                            let _ = quit.send(Command::Stop);
+                            return Ok((message, kind));
+                        }
+                        if message.starts_with("再生準備失敗") {
+                            let _ = quit.send(Command::Stop);
+                            return Err((message, kind));
+                        }
+                    }
+                    if began.elapsed() > Duration::from_secs(3) {
+                        let _ = quit.send(Command::Stop);
+                        panic!(
+                            "{mode:?} mid-slot select did not reach preparation; CLI must not apply starts_at != cursor"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+            let report = play_loop(
+                Initial::Source(Box::new(HoldingOnce {
+                    info: playing.clone(),
+                    polls: Arc::new(AtomicUsize::new(0)),
+                    audio: Some(packet(24_000).repeat(8)),
+                }) as Box<dyn SegmentSource>),
+                None,
+                stop,
+                |snapshot| {
+                    if !requested
+                        && snapshot
+                            .output
+                            .as_ref()
+                            .is_some_and(|output| output.frames > 0)
+                    {
+                        requested = true;
+                        send.send(Command::Select(PlaybackRequest {
+                            station: "OBS".into(),
+                            mode,
+                            cursor,
+                            position: Duration::ZERO,
+                        }))
+                        .unwrap();
+                    }
+                },
+                sink,
+                Some(&mut controller),
+            )
+            .unwrap();
+            assert_eq!(report.reason, EndReason::Cancelled);
+            let switched = handle
+                .join()
+                .unwrap()
+                .expect("CLI select must prepare, not reject");
+            assert!(
+                switched.0.starts_with("再生切替完了: OBS"),
+                "{mode:?} did not proceed to playback: {}",
+                switched.0
+            );
+            assert!(
+                polls.load(Ordering::SeqCst) > 0,
+                "{mode:?} select never started preparation"
+            );
+            assert_ne!(switched.1, Some(NoticeKind::InvalidPositionWhilePlaying));
+        }
     }
     #[test]
     fn idle_preparation_failure_reports_the_stop_kind_not_the_continuing_sentence() {
@@ -3675,6 +4263,380 @@ mod tests {
             wait_for_switch_failure(false, false),
             "再生切替失敗（現在の状態を維持）: 無音出力診断の実時間上限を超えたため停止しました"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SecondPrepFault {
+        SourceStalled,
+        Failed,
+        EarlyEnd,
+    }
+    /// Second preparation fails after its worker has started.
+    /// A missing report fails the bounded wait. The stall limit is not the 30s production value.
+    fn wait_for_second_prep(
+        fault: SecondPrepFault,
+        while_playing: bool,
+    ) -> (String, Option<NoticeKind>) {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        struct Failing {
+            info: StreamInfo,
+            fault: SecondPrepFault,
+        }
+        impl SegmentSource for Failing {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                match self.fault {
+                    SecondPrepFault::Failed => Err(ProbeError::Network),
+                    SecondPrepFault::EarlyEnd => Ok(Next::End),
+                    SecondPrepFault::SourceStalled => Ok(Next::Pending(Duration::from_millis(1))),
+                }
+            }
+        }
+        let stop_sentence = match fault {
+            SecondPrepFault::SourceStalled => {
+                "再生準備失敗（現在の状態を維持）: 30秒間新しいセグメントを確認できないため停止しました"
+            }
+            SecondPrepFault::Failed => {
+                "再生準備失敗（現在の状態を維持）: 配信取得: 配信の検証中に通信に失敗しました"
+            }
+            SecondPrepFault::EarlyEnd => {
+                "再生準備失敗（現在の状態を維持）: 放送枠末尾より前に配信が終了しました"
+            }
+        };
+        let expected_kind = match fault {
+            SecondPrepFault::SourceStalled => NoticeKind::SourceStalledWhilePlaying,
+            SecondPrepFault::Failed => NoticeKind::StreamFailedWhilePlaying,
+            SecondPrepFault::EarlyEnd => NoticeKind::EarlyEndWhilePlaying,
+        };
+        let mut playing = info(3_600_000);
+        playing.starts_at -= chrono::Duration::hours(2);
+        playing.ends_at -= chrono::Duration::hours(2);
+        let cursor = playing.starts_at + chrono::Duration::hours(1);
+        let template = playing.clone();
+        let (tx, rx) = mpsc::channel();
+        let (found, received) = mpsc::channel();
+        let stop = StopToken::default();
+        let mut controller = Controller::with_reporter(
+            rx,
+            stop.clone(),
+            move |request| {
+                let mut selected = template.clone();
+                selected.station = request.station.clone();
+                selected.starts_at = request.cursor;
+                selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                selected.position = request.position;
+                Ok(Box::new(Failing {
+                    info: selected,
+                    fault,
+                }) as Box<dyn SegmentSource>)
+            },
+            move |message, kind, _prefix, _output| {
+                let matched = if while_playing {
+                    message.starts_with("再生準備失敗（現在の状態を維持）: ")
+                        && kind == Some(expected_kind)
+                } else {
+                    message == stop_sentence && kind.is_none()
+                };
+                if matched {
+                    let _ = found.send((message, kind));
+                }
+            },
+        );
+        if matches!(fault, SecondPrepFault::SourceStalled) {
+            controller.set_prepare_stall(Duration::from_millis(15));
+        }
+        let request = PlaybackRequest {
+            station: "OBS".into(),
+            mode: ProbeMode::TimeFree,
+            cursor,
+            position: Duration::ZERO,
+        };
+        if !while_playing {
+            tx.send(Command::Select(request.clone())).unwrap();
+        }
+        let mut requested = false;
+        let send = tx.clone();
+        let quit = tx.clone();
+        let handle = thread::spawn(move || {
+            let got = received.recv_timeout(Duration::from_secs(3));
+            let _ = quit.send(Command::Stop);
+            got.unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for the {fault:?} preparation failure (while_playing={while_playing}); a dropped post-start error does not report that kind"
+                )
+            })
+        });
+        let initial = if while_playing {
+            Initial::Source(Box::new(Holding {
+                info: playing.clone(),
+                bytes: Some(packet(24_000).repeat(8)),
+            }) as Box<dyn SegmentSource>)
+        } else {
+            Initial::Idle(playing)
+        };
+        let report = play_loop(
+            initial,
+            None,
+            stop,
+            |snapshot| {
+                if while_playing
+                    && !requested
+                    && snapshot
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.frames > 0)
+                {
+                    requested = true;
+                    send.send(Command::Select(request.clone())).unwrap();
+                }
+            },
+            sink,
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        if while_playing {
+            assert!(
+                report.output.is_some(),
+                "the first stream's output was not open"
+            );
+        }
+        handle.join().unwrap()
+    }
+    #[test]
+    fn active_playback_reports_source_stalled_while_the_next_prep_is_running() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::SourceStalled, true);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 30秒間新しいセグメントを確認できないため停止しました"
+        );
+        assert_eq!(kind, Some(NoticeKind::SourceStalledWhilePlaying));
+    }
+    #[test]
+    fn active_playback_reports_worker_failure_while_the_next_prep_is_running() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::Failed, true);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 配信取得: 配信の検証中に通信に失敗しました"
+        );
+        assert_eq!(kind, Some(NoticeKind::StreamFailedWhilePlaying));
+    }
+    #[test]
+    fn active_playback_reports_early_end_while_the_next_prep_is_running() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::EarlyEnd, true);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 放送枠末尾より前に配信が終了しました"
+        );
+        assert_eq!(kind, Some(NoticeKind::EarlyEndWhilePlaying));
+    }
+    #[test]
+    fn idle_source_stalled_prep_keeps_the_stop_sentence() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::SourceStalled, false);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 30秒間新しいセグメントを確認できないため停止しました"
+        );
+        assert_eq!(kind, None);
+        assert!(message.contains("停止しました"));
+        assert!(!message.contains("再生は続いています"));
+    }
+    #[test]
+    fn idle_worker_failure_prep_keeps_the_stop_sentence() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::Failed, false);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 配信取得: 配信の検証中に通信に失敗しました"
+        );
+        assert_eq!(kind, None);
+        assert!(!message.contains("再生は続いています"));
+    }
+    #[test]
+    fn idle_early_end_prep_keeps_the_stop_sentence() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::EarlyEnd, false);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 放送枠末尾より前に配信が終了しました"
+        );
+        assert_eq!(kind, None);
+        assert!(!message.contains("再生は続いています"));
+    }
+    #[test]
+    fn replacing_the_next_prep_after_its_worker_starts_reports_nothing() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        struct WaitForCancel {
+            info: StreamInfo,
+            stop: StopToken,
+            entered: mpsc::Sender<()>,
+            announced: bool,
+        }
+        impl SegmentSource for WaitForCancel {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                if !self.announced {
+                    self.announced = true;
+                    let _ = self.entered.send(());
+                }
+                let began = Instant::now();
+                while !self.stop.is_cancelled() {
+                    if began.elapsed() > Duration::from_secs(2) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(ProbeError::Network)
+            }
+        }
+        let mut playing = info(3_600_000);
+        playing.starts_at -= chrono::Duration::hours(2);
+        playing.ends_at -= chrono::Duration::hours(2);
+        let cursor = playing.starts_at + chrono::Duration::hours(1);
+        let template = playing.clone();
+        let (tx, rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let (switched_tx, switched_rx) = mpsc::channel();
+        let stop = StopToken::default();
+        let audio = packet(24_000).repeat(80);
+        let mut controller = Controller::with_cancellable_reporter(
+            rx,
+            stop.clone(),
+            move |request, job_stop| {
+                let mut selected = template.clone();
+                selected.station = request.station.clone();
+                selected.starts_at = request.cursor;
+                selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                selected.position = request.position;
+                if request.station == "OBS" {
+                    Ok(Box::new(WaitForCancel {
+                        info: selected,
+                        stop: job_stop,
+                        entered: entered_tx.clone(),
+                        announced: false,
+                    }) as Box<dyn SegmentSource>)
+                } else {
+                    Ok(Box::new(Holding {
+                        info: selected,
+                        bytes: Some(audio.clone()),
+                    }) as Box<dyn SegmentSource>)
+                }
+            },
+            move |message, kind, _prefix, _output| {
+                if message.starts_with("再生準備失敗") {
+                    let _ = failed_tx.send((message, kind));
+                } else if message == "再生切替完了: QRR / TimeFree" {
+                    let _ = switched_tx.send(());
+                }
+            },
+        );
+        let mut requested = false;
+        let send = tx.clone();
+        let select_next = tx.clone();
+        let quit = tx.clone();
+        let handle = thread::spawn(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the second stream's worker did not start");
+            select_next
+                .send(Command::Select(PlaybackRequest {
+                    station: "QRR".into(),
+                    mode: ProbeMode::TimeFree,
+                    cursor,
+                    position: Duration::ZERO,
+                }))
+                .unwrap();
+            switched_rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for the replacement stream; a stuck prepare does not finish the switch"
+                )
+            });
+            match failed_rx.recv_timeout(Duration::from_millis(200)) {
+                Err(mpsc::RecvTimeoutError::Timeout)
+                | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Ok((message, kind)) => {
+                    panic!("user cancel reported {kind:?}: {message}")
+                }
+            }
+            let _ = quit.send(Command::Stop);
+        });
+        let report = play_loop(
+            Initial::Source(Box::new(Holding {
+                info: playing,
+                bytes: Some(packet(24_000).repeat(8)),
+            }) as Box<dyn SegmentSource>),
+            None,
+            stop,
+            |snapshot| {
+                if !requested
+                    && snapshot
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.frames > 0)
+                {
+                    requested = true;
+                    send.send(Command::Select(PlaybackRequest {
+                        station: "OBS".into(),
+                        mode: ProbeMode::TimeFree,
+                        cursor,
+                        position: Duration::ZERO,
+                    }))
+                    .unwrap();
+                }
+            },
+            sink,
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        handle.join().unwrap();
     }
 
     const WINDOW_LOST: &str =
