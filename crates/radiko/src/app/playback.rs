@@ -70,7 +70,7 @@ pub enum StopReason {
     AuthExpired,
     ReconnectLimit,
 }
-pub use crate::player::playback::{NoticeKind, notice_kind};
+pub use crate::player::playback::{NoticeKind, OutputFailure, notice_kind, output_failure};
 /// `Some` only for an auth-expiry or reconnect-limit failure. Other errors, including
 /// window loss and a normal program end, are `None`.
 pub fn stop_reason(error: &playback::PlaybackError) -> Option<StopReason> {
@@ -102,6 +102,9 @@ pub struct Update {
     pub stopped: bool,
     /// Set only together with [`Self::stopped`], from [`stop_reason`].
     pub stop_reason: Option<StopReason>,
+    /// Set only together with [`Self::stopped`], from [`output_failure`].
+    /// Not inferred from [`Self::notice`].
+    pub output_failure: Option<OutputFailure>,
     /// Set from [`notice_kind`] when `notice` is a playback failure. The TUI rewords from this.
     pub notice_kind: Option<NoticeKind>,
     /// When set with [`Self::notice_kind`], the TUI keeps this prefix and replaces only the error.
@@ -338,11 +341,12 @@ impl Service {
                     rx,
                     shutdown.clone(),
                     move |request, stop| factory(request, stop),
-                    move |notice, kind, prefix| {
+                    move |notice, kind, prefix, failure| {
                         if let Ok(mut update) = notices.lock() {
                             update.notice = Some(notice);
                             update.notice_kind = kind;
                             update.notice_prefix = prefix;
+                            update.output_failure = failure;
                         }
                     },
                 );
@@ -378,6 +382,7 @@ impl Service {
                     // Preserve an undelivered snapshot so the UI can retain diagnostics on failure.
                     update.stopped = result.is_err();
                     update.stop_reason = result.as_ref().err().and_then(stop_reason);
+                    update.output_failure = result.as_ref().err().and_then(output_failure);
                     update.notice_kind = result.as_ref().err().and_then(notice_kind);
                     update.notice_prefix = None;
                     update.notice = Some(match &result {
@@ -704,10 +709,257 @@ mod tests {
             stopped: false,
             notice: Some(expired.to_string()),
             stop_reason: None,
+            output_failure: None,
             ..Update::default()
         };
         assert!(!update.stopped);
         assert!(update.stop_reason.is_none());
+        assert!(update.output_failure.is_none());
+        let device = playback::PlaybackError::Output(crate::player::output::OutputError::NoDevice);
+        assert_eq!(output_failure(&device), Some(OutputFailure::NoDevice));
+        assert_eq!(stop_reason(&device), None);
+        assert_ne!(output_failure(&device), None);
+        assert!(output_failure(&expired).is_none());
+        assert_eq!(
+            output_failure(&playback::PlaybackError::Output(
+                crate::player::output::OutputError::UnsupportedFormat
+            )),
+            Some(OutputFailure::UnsupportedFormat)
+        );
+        assert_eq!(
+            output_failure(&playback::PlaybackError::Output(
+                crate::player::output::OutputError::IncompatibleOutput {
+                    requested_rate: 48_000,
+                    offered: vec![crate::player::output::OfferedOutputFormat {
+                        channels: 2,
+                        min_sample_rate: 44_100,
+                        max_sample_rate: 44_100,
+                        sample_format: "f32",
+                    }],
+                }
+            )),
+            Some(OutputFailure::UnsupportedFormat)
+        );
+        assert_eq!(
+            output_failure(&playback::PlaybackError::Output(
+                crate::player::output::OutputError::Device
+            )),
+            Some(OutputFailure::Device)
+        );
+        assert_eq!(
+            output_failure(&playback::PlaybackError::Output(
+                crate::player::output::OutputError::DeviceInfo
+            )),
+            Some(OutputFailure::Device)
+        );
+        assert_eq!(
+            output_failure(&playback::PlaybackError::Output(
+                crate::player::output::OutputError::Stalled
+            )),
+            Some(OutputFailure::Stalled)
+        );
+        for excluded in [
+            crate::player::output::OutputError::InvalidPcm,
+            crate::player::output::OutputError::ProbeTimeout,
+            crate::player::output::OutputError::Deadline,
+            crate::player::output::OutputError::ReconnectGaveUp,
+        ] {
+            assert_eq!(
+                output_failure(&playback::PlaybackError::Output(excluded)),
+                None
+            );
+        }
+        let same_words = Update {
+            stopped: true,
+            notice: Some(device.to_string()),
+            output_failure: None,
+            ..Update::default()
+        };
+        assert!(same_words.output_failure.is_none());
+        assert!(
+            same_words
+                .notice
+                .unwrap()
+                .contains("既定の音声出力機器がありません")
+        );
+    }
+    struct HeldSource {
+        info: StreamInfo,
+        bytes: Option<Vec<u8>>,
+    }
+    impl SegmentSource for HeldSource {
+        fn info(&self) -> &StreamInfo {
+            &self.info
+        }
+        fn poll_segment(
+            &mut self,
+        ) -> Result<crate::api::stream::playback::Next, crate::api::stream::ProbeError> {
+            if let Some(bytes) = self.bytes.take() {
+                return Ok(crate::api::stream::playback::Next::Segment(
+                    crate::api::stream::playback::Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: Some("mp4a.40.2".into()),
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    },
+                ));
+            }
+            Ok(crate::api::stream::playback::Next::Pending(
+                Duration::from_millis(50),
+            ))
+        }
+    }
+    struct FailingSink {
+        kind: OutputFailure,
+        rate: u32,
+        channels: u16,
+    }
+    impl playback::AudioSink for FailingSink {
+        fn enqueue(
+            &mut self,
+            pcm: &crate::player::aac::DecodedPcm,
+            cursor: &mut usize,
+        ) -> Result<bool, crate::player::output::OutputError> {
+            *cursor = pcm.samples.len();
+            Ok(true)
+        }
+        fn accepted(&self) -> u64 {
+            0
+        }
+        fn summary(&self) -> crate::player::output::OutputSummary {
+            crate::player::output::OutputSummary {
+                frames: 0,
+                underrun_frames: 0,
+                sample_rate: self.rate,
+                channels: self.channels,
+                sample_format: crate::player::output::OutputSampleFormat::F32,
+            }
+        }
+        fn poll(&mut self) -> Result<bool, crate::player::output::OutputError> {
+            Err(match self.kind {
+                OutputFailure::Device => crate::player::output::OutputError::Device,
+                OutputFailure::Stalled => crate::player::output::OutputError::Stalled,
+                OutputFailure::NoDevice | OutputFailure::UnsupportedFormat => {
+                    crate::player::output::OutputError::Device
+                }
+            })
+        }
+        fn finish(&mut self) {}
+    }
+    #[test]
+    fn output_device_errors_do_not_request_playback_again() {
+        use std::sync::atomic::AtomicUsize;
+        for kind in [
+            OutputFailure::NoDevice,
+            OutputFailure::UnsupportedFormat,
+            OutputFailure::Device,
+            OutputFailure::Stalled,
+        ] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let after_error = Arc::new(AtomicUsize::new(0));
+            let failed = Arc::new(AtomicBool::new(false));
+            let p = program();
+            let info = short_info(&p);
+            let bytes = short_adts();
+            let mut service = Service::with_test_sink(
+                {
+                    let requests = requests.clone();
+                    let after_error = after_error.clone();
+                    let failed = failed.clone();
+                    move |_, _| {
+                        if failed.load(Ordering::SeqCst) {
+                            after_error.fetch_add(1, Ordering::SeqCst);
+                        }
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Ok(Box::new(HeldSource {
+                            info: info.clone(),
+                            bytes: Some(bytes.clone()),
+                        }))
+                    }
+                },
+                {
+                    let failed = failed.clone();
+                    Arc::new(move |pcm, _, _, _| {
+                        failed.store(true, Ordering::SeqCst);
+                        match kind {
+                            OutputFailure::NoDevice => {
+                                Err(crate::player::output::OutputError::NoDevice)
+                            }
+                            OutputFailure::UnsupportedFormat => {
+                                Err(crate::player::output::OutputError::UnsupportedFormat)
+                            }
+                            OutputFailure::Device | OutputFailure::Stalled => {
+                                Ok(Box::new(FailingSink {
+                                    kind,
+                                    rate: pcm.summary.sample_rate,
+                                    channels: pcm.summary.channels,
+                                })
+                                    as Box<dyn playback::AudioSink + Send>)
+                            }
+                        }
+                    })
+                },
+            );
+            service.select(&p, p.ends_at).unwrap();
+            let opens = matches!(
+                kind,
+                OutputFailure::NoDevice | OutputFailure::UnsupportedFormat
+            );
+            let mut seen = None;
+            let mut last_notice = None;
+            let started = Instant::now();
+            while seen.is_none() {
+                let update = service.poll();
+                if update.notice.is_some() {
+                    last_notice = update.notice.clone();
+                }
+                let ready = if opens {
+                    update.output_failure == Some(kind)
+                } else {
+                    update.stopped && update.output_failure == Some(kind)
+                };
+                if ready {
+                    seen = Some(update);
+                    break;
+                }
+                if started.elapsed() >= Duration::from_secs(3) {
+                    panic!("no output failure for {kind:?}; last notice: {last_notice:?}");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let update = seen.unwrap();
+            assert_eq!(update.output_failure, Some(kind));
+            assert!(update.stop_reason.is_none());
+            if opens {
+                assert!(!update.stopped, "{kind:?} keeps the current session");
+                assert!(
+                    update
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("現在の状態を維持")),
+                    "{kind:?} notice: {:?}",
+                    update.notice
+                );
+            } else {
+                assert!(update.stopped, "{kind:?}");
+                assert!(update.ended, "{kind:?}");
+            }
+            let requests_at_stop = requests.load(Ordering::SeqCst);
+            let follow_ups_at_stop = after_error.load(Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(40));
+            let _ = service.poll();
+            assert_eq!(after_error.load(Ordering::SeqCst), 0, "{kind:?}");
+            assert_eq!(follow_ups_at_stop, 0, "{kind:?}");
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                requests_at_stop,
+                "{kind:?}"
+            );
+            assert_eq!(requests_at_stop, 1, "{kind:?}");
+            service.stop();
+        }
     }
     #[test]
     fn rejected_volume_commands_never_change_the_value_used_by_the_next_session() {

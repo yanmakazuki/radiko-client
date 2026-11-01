@@ -63,7 +63,12 @@ struct Completed {
     id: u64,
     result: Result<Ready, PlaybackError>,
 }
-type Reporter = dyn FnMut(String, Option<super::playback::NoticeKind>, Option<&'static str>) + Send;
+type Reporter = dyn FnMut(
+        String,
+        Option<super::playback::NoticeKind>,
+        Option<&'static str>,
+        Option<super::playback::OutputFailure>,
+    ) + Send;
 pub struct Controller {
     commands: Receiver<Command>,
     preparation_worker: Option<thread::JoinHandle<()>>,
@@ -87,10 +92,14 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
-        let mut controller =
-            Self::with_reporter(commands, stop, factory, |message, _kind, _prefix| {
+        let mut controller = Self::with_reporter(
+            commands,
+            stop,
+            factory,
+            |message, _kind, _prefix, _output| {
                 crate::stderr::write_line(format_args!("{message}"));
-            });
+            },
+        );
         controller.notification_interval = Duration::from_secs(5);
         controller
     }
@@ -102,10 +111,14 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
-        let mut controller =
-            Self::with_cancellable_reporter(commands, stop, factory, |message, _kind, _prefix| {
+        let mut controller = Self::with_cancellable_reporter(
+            commands,
+            stop,
+            factory,
+            |message, _kind, _prefix, _output| {
                 crate::stderr::write_line(format_args!("{message}"));
-            });
+            },
+        );
         controller.notification_interval = Duration::from_secs(5);
         controller
     }
@@ -115,8 +128,12 @@ impl Controller {
         factory: impl Fn(PlaybackRequest) -> Result<Box<dyn SegmentSource>, PlaybackError>
         + Send
         + 'static,
-        reporter: impl FnMut(String, Option<crate::player::playback::NoticeKind>, Option<&'static str>)
-        + Send
+        reporter: impl FnMut(
+            String,
+            Option<crate::player::playback::NoticeKind>,
+            Option<&'static str>,
+            Option<crate::player::playback::OutputFailure>,
+        ) + Send
         + 'static,
     ) -> Self {
         Self::with_cancellable_reporter(
@@ -132,8 +149,12 @@ impl Controller {
         factory: impl Fn(PlaybackRequest, StopToken) -> Result<Box<dyn SegmentSource>, PlaybackError>
         + Send
         + 'static,
-        reporter: impl FnMut(String, Option<crate::player::playback::NoticeKind>, Option<&'static str>)
-        + Send
+        reporter: impl FnMut(
+            String,
+            Option<crate::player::playback::NoticeKind>,
+            Option<&'static str>,
+            Option<crate::player::playback::OutputFailure>,
+        ) + Send
         + 'static,
     ) -> Self {
         let latest = Arc::new(Mutex::new(None::<Job>));
@@ -215,13 +236,15 @@ impl Controller {
         }
     }
     pub(super) fn report(&mut self, message: String) {
-        (self.reporter)(message, None, None);
+        (self.reporter)(message, None, None, None);
     }
     /// CLI text stays `{prefix}: {error}`. The kind and prefix let the TUI replace that error.
+    /// The kind and output failure come from the error value.
     pub(super) fn report_failure(&mut self, prefix: &'static str, error: &PlaybackError) {
-        let kind = crate::player::playback::notice_kind(error);
+        let kind = crate::player::playback::continuing_notice_kind(error);
         let shown_prefix = kind.map(|_| prefix);
-        (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix);
+        let output = crate::player::playback::output_failure(error);
+        (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix, output);
     }
     pub(super) fn poll(&mut self, info: &StreamInfo, current: Duration) -> Option<Ready> {
         // 結果より先に操作を処理し、配送済みの古い準備結果も採用しない。
@@ -341,6 +364,7 @@ impl Controller {
                     self.pending_target = None;
                     (self.reporter)(
                         "再生準備に失敗しました（現在の状態を維持）".into(),
+                        None,
                         None,
                         None,
                     );
