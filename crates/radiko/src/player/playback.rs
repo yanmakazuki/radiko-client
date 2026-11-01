@@ -1210,6 +1210,7 @@ fn play_loop_clocked<S: AudioSink>(
             });
         }
         if let Some(control) = controls.as_mut() {
+            control.note_playback_active(output.is_some());
             let position = output
                 .as_ref()
                 .map(|o| {
@@ -3322,56 +3323,75 @@ mod tests {
         assert!(!format!("{expired}").contains("再生は続いています"));
     }
     #[test]
-    fn preparation_failure_reports_the_continuing_kind_and_the_cli_text() {
+    fn idle_preparation_failure_reports_the_stop_kind_not_the_continuing_sentence() {
         use super::super::seek::{Command, Controller, PlaybackRequest};
-        let (tx, rx) = mpsc::channel();
-        let (found, received) = mpsc::channel();
-        let mut idle = info(1000);
-        idle.starts_at -= chrono::Duration::hours(1);
-        idle.ends_at -= chrono::Duration::hours(1);
-        let stop = StopToken::default();
-        let mut controller = Controller::with_reporter(
-            rx,
-            stop.clone(),
-            |_| {
-                Err(PlaybackError::Source(ProbeError::At(
-                    "HLS音声取得",
-                    Box::new(ProbeError::AuthExpired),
-                )))
-            },
-            move |message, kind, prefix, _output| {
-                if kind == Some(NoticeKind::AuthExpiredWhilePlaying) {
-                    found.send((message, prefix)).unwrap();
+        for reconnect in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let (found, received) = mpsc::channel();
+            let mut idle = info(1000);
+            idle.starts_at -= chrono::Duration::hours(1);
+            idle.ends_at -= chrono::Duration::hours(1);
+            let stop = StopToken::default();
+            let mut controller = Controller::with_reporter(
+                rx,
+                stop.clone(),
+                move |_| {
+                    Err(if reconnect {
+                        PlaybackError::ReconnectGaveUp
+                    } else {
+                        PlaybackError::Source(ProbeError::At(
+                            "HLS音声取得",
+                            Box::new(ProbeError::AuthExpired),
+                        ))
+                    })
+                },
+                move |message, kind, prefix, _output| {
+                    if message.contains("再生準備失敗") {
+                        found.send((message, kind, prefix)).unwrap();
+                    }
+                },
+            );
+            tx.send(Command::Select(PlaybackRequest {
+                station: idle.station.clone(),
+                mode: idle.mode,
+                cursor: idle.starts_at,
+                position: Duration::ZERO,
+            }))
+            .unwrap();
+            let quit = tx.clone();
+            let handle = thread::spawn(move || {
+                let (message, kind, prefix) =
+                    received.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
+                assert!(message.contains("再生を停止しました"), "{message}");
+                assert!(!message.contains("再生は続いています"), "{message}");
+                if reconnect {
+                    assert_eq!(kind, None);
+                    assert_eq!(prefix, None);
+                    assert!(message.contains(
+                        "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください"
+                    ));
+                } else {
+                    assert_eq!(kind, Some(NoticeKind::AuthExpired));
+                    assert_eq!(prefix, Some("再生準備失敗（現在の状態を維持）"));
+                    assert!(message.contains(
+                        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
+                    ));
                 }
-            },
-        );
-        tx.send(Command::Select(PlaybackRequest {
-            station: idle.station.clone(),
-            mode: idle.mode,
-            cursor: idle.starts_at,
-            position: Duration::ZERO,
-        }))
-        .unwrap();
-        let quit = tx.clone();
-        let handle = thread::spawn(move || {
-            let (message, prefix) = received.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert_eq!(prefix, Some("再生準備失敗（現在の状態を維持）"));
-            assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
-            assert!(message.contains("再生を停止しました"));
-            assert!(!message.contains("再生は続いています"));
-            quit.send(Command::Stop).unwrap();
-        });
-        let report = play_loop::<Sink>(
-            Initial::<Source>::Idle(idle),
-            None,
-            stop,
-            |_| panic!("idle is not active playback"),
-            |_, _, _, _| panic!("failed preparation must never open output"),
-            Some(&mut controller),
-        )
-        .unwrap();
-        assert_eq!(report.reason, EndReason::Cancelled);
-        handle.join().unwrap();
+                quit.send(Command::Stop).unwrap();
+            });
+            let report = play_loop::<Sink>(
+                Initial::<Source>::Idle(idle),
+                None,
+                stop,
+                |_| panic!("idle is not active playback"),
+                |_, _, _, _| panic!("failed preparation must never open output"),
+                Some(&mut controller),
+            )
+            .unwrap();
+            assert_eq!(report.reason, EndReason::Cancelled);
+            handle.join().unwrap();
+        }
     }
 
     const WINDOW_LOST: &str =

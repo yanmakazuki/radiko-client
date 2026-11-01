@@ -309,7 +309,22 @@ impl Screen {
             }
         }
         if let Some(notice) = update.notice {
-            self.playback_notice = match update.notice_kind {
+            // A prep failure before any output uses the same kind as a stop. The
+            // 「再生は続いています」 sentence is only for a snapshot that is still playing.
+            let kind = match update.notice_kind {
+                Some(radiko::app::playback::NoticeKind::AuthExpiredWhilePlaying)
+                    if self.app.playback.is_none() =>
+                {
+                    Some(radiko::app::playback::NoticeKind::AuthExpired)
+                }
+                Some(radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying)
+                    if self.app.playback.is_none() =>
+                {
+                    None
+                }
+                other => other,
+            };
+            self.playback_notice = match kind {
                 Some(kind) => match update.notice_prefix {
                     Some(prefix) => {
                         format!("{prefix}: {}", super::messages::playback_notice(kind))

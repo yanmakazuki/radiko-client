@@ -83,6 +83,8 @@ pub struct Controller {
     pub(super) changed: bool,
     pub(super) paused: bool,
     pub(super) volume: u32,
+    /// Set by the play loop from whether an output is open. Preparation before that is not playback.
+    playback_active: bool,
 }
 impl Controller {
     pub fn new(
@@ -225,6 +227,7 @@ impl Controller {
             changed: true,
             paused: false,
             volume: 25,
+            playback_active: false,
         }
     }
     /// Call only from the owning background control thread, after output has been stopped.
@@ -238,10 +241,18 @@ impl Controller {
     pub(super) fn report(&mut self, message: String) {
         (self.reporter)(message, None, None, None);
     }
+    /// The play loop sets this from the open output. Idle preparation is not playback.
+    pub(super) fn note_playback_active(&mut self, active: bool) {
+        self.playback_active = active;
+    }
     /// CLI text stays `{prefix}: {error}`. The kind and prefix let the TUI replace that error.
-    /// The kind and output failure come from the error value.
+    /// The continuing sentence is only for a failure while output is already open.
     pub(super) fn report_failure(&mut self, prefix: &'static str, error: &PlaybackError) {
-        let kind = crate::player::playback::continuing_notice_kind(error);
+        let kind = if self.playback_active {
+            crate::player::playback::continuing_notice_kind(error)
+        } else {
+            crate::player::playback::notice_kind(error)
+        };
         let shown_prefix = kind.map(|_| prefix);
         let output = crate::player::playback::output_failure(error);
         (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix, output);

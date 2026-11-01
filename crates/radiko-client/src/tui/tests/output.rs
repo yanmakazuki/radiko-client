@@ -74,7 +74,24 @@ fn show_output_stop(screen: &mut Screen, error: &PlaybackError) {
 }
 
 fn guide_lines(kind: radiko::app::playback::OutputFailure) -> &'static [&'static str] {
-    super::super::OutputGuide::from_update(kind).lines()
+    match kind {
+        radiko::app::playback::OutputFailure::NoDevice => &[
+            "出力先がありません。OSのサウンド設定を確認し、Enterで再生し直してください",
+            "自動再開はしません",
+        ],
+        radiko::app::playback::OutputFailure::UnsupportedFormat => &[
+            "対応形式外です。OSの出力設定を確認し、Enterで再生し直してください",
+            "自動再開はしません",
+        ],
+        radiko::app::playback::OutputFailure::Device => &[
+            "出力機器を確認してください。OSの出力先を見て、Enterで再生し直してください",
+            "自動再開はしません",
+        ],
+        radiko::app::playback::OutputFailure::Stalled => &[
+            "スリープ復帰・機器変更後は出力先を確認し、Enterで再生し直してください",
+            "自動再開はしません",
+        ],
+    }
 }
 
 #[test]
@@ -124,14 +141,17 @@ fn output_guides_render_exactly_at_80_and_160_from_the_error_type() {
         );
         assert!(screen.stop_cause.is_none());
         assert!(screen.playback_action.is_none());
-        assert_exact_rows(&mut screen, guide_lines(kind));
-        let shown = content_rows(&mut screen, 80, 24).join("\n");
-        assert!(shown.contains("Enterで再生し直してください"), "{shown}");
-        assert!(shown.contains("確認"), "{shown}");
-        assert!(
-            shown.contains(super::super::messages::OUTPUT_NO_RETRY),
-            "{shown}"
-        );
+        let expected = guide_lines(kind);
+        assert_exact_rows(&mut screen, expected);
+        for (width, height) in [(80u16, 24u16), (160, 40)] {
+            let shown = content_rows(&mut screen, width, height).join("\n");
+            for line in expected {
+                assert!(
+                    shown.contains(line),
+                    "{width}x{height} missing {line}\n{shown}"
+                );
+            }
+        }
     }
 }
 
@@ -405,6 +425,71 @@ fn continued_playback_does_not_say_that_playback_stopped() {
         super::super::messages::AUTH_EXPIRED_STOP
     );
     assert!(stopped.playback_notice.contains("再生を停止しました"));
+}
+
+#[test]
+fn preparation_failure_with_nothing_playing_uses_the_stop_sentence() {
+    let auth_stop = "認証期限切れのため再生を停止しました。a で再確認 / I で再ログイン";
+    let reconnect_stop =
+        "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください";
+    let cases = [
+        (
+            radiko::app::playback::NoticeKind::AuthExpiredWhilePlaying,
+            "再生準備失敗（現在の状態を維持）",
+            format!(
+                "再生準備失敗（現在の状態を維持）: {}",
+                radiko::api::stream::ProbeError::AuthExpired
+            ),
+            format!("再生準備失敗（現在の状態を維持）: {auth_stop}"),
+            auth_stop,
+        ),
+        (
+            radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying,
+            "再生準備失敗（現在の状態を維持）",
+            format!(
+                "再生準備失敗（現在の状態を維持）: {}",
+                radiko::player::playback::PlaybackError::ReconnectGaveUp
+            ),
+            format!("再生準備失敗（現在の状態を維持）: {reconnect_stop}"),
+            reconnect_stop,
+        ),
+    ];
+    for (kind, prefix, cli, expected, stop_sentence) in cases {
+        let mut fresh = screen();
+        fresh.apply_playback(radiko::app::playback::Update {
+            notice: Some(cli.clone()),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(fresh.playback_notice, expected);
+        assert!(!fresh.playback_notice.contains("再生は続いています"));
+        assert!(fresh.playback_notice.contains(stop_sentence));
+        let narrow = content_rows(&mut fresh, 80, 24).join("\n");
+        assert!(narrow.contains("再生中: なし"), "{narrow}");
+        assert!(narrow.contains("再生を停止しました"), "{narrow}");
+        assert!(!narrow.contains("再生は続いています"), "{narrow}");
+
+        let mut after_stop = screen();
+        after_stop.app.playback = Some(playing_snapshot());
+        after_stop.apply_playback(radiko::app::playback::Update {
+            ended: true,
+            notice: Some("停止しました".into()),
+            ..radiko::app::playback::Update::default()
+        });
+        assert!(after_stop.app.playback.is_none());
+        after_stop.apply_playback(radiko::app::playback::Update {
+            notice: Some(cli),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(after_stop.playback_notice, expected);
+        assert!(!after_stop.playback_notice.contains("再生は続いています"));
+        let again = content_rows(&mut after_stop, 80, 24).join("\n");
+        assert!(again.contains("再生中: なし"), "{again}");
+        assert!(!again.contains("再生は続いています"), "{again}");
+    }
 }
 
 #[test]
