@@ -242,3 +242,47 @@ fn auth_expired_tui_notice_survives_a_later_reconnect_snapshot() {
         Some(super::super::StopCause::AuthExpired)
     );
 }
+
+fn visible_lines(screen: &mut Screen, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, screen, Utc::now().fixed_offset()))
+        .unwrap();
+    let area = terminal.backend().buffer().area;
+    let columns = usize::from(area.width);
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .chunks(columns)
+        .map(|row| {
+            let mut line = String::new();
+            let mut x = 0;
+            while x < row.len() {
+                let symbol = row[x].symbol();
+                line.push_str(symbol);
+                x += ratatui::text::Span::raw(symbol).width().max(1);
+            }
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn login_failure_rechecks_before_login_and_keeps_a_visible_at_80_columns() {
+    let error = radiko::api::auth::AuthError::InvalidCredentials;
+    let sentence = format!("{error} / a で再確認 / I で再ログイン");
+    let mut screen = screen();
+    screen.app.authentication.status = radiko::app::auth::Status::LoginFailed(error);
+    let wide = visible_lines(&mut screen, 180, 40).join("\n");
+    assert!(wide.contains(&sentence), "{wide}");
+    let narrow = visible_lines(&mut screen, 80, 24);
+    let detail = narrow
+        .iter()
+        .find(|line| line.contains("ログインに失敗しました"))
+        .unwrap_or_else(|| panic!("login failure was clipped:\n{}", narrow.join("\n")));
+    assert!(
+        detail.contains("a で再確認") || detail.contains(" / a"),
+        "a is not visible at 80 columns: {detail}"
+    );
+}
