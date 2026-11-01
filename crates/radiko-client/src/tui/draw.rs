@@ -208,7 +208,15 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
 fn auth_header_line(screen: &Screen) -> String {
     let summary = screen.app.authentication.status.summary();
     if screen.stop_cause == Some(super::StopCause::AuthExpired) {
-        format!("{summary} / 再生側で認証失敗 / a 再確認")
+        let hint = if matches!(
+            screen.app.authentication.status,
+            radiko::app::auth::Status::SignedOut
+        ) {
+            "I で再ログイン"
+        } else {
+            "a 再確認"
+        };
+        format!("{summary} / 再生側で認証失敗 / {hint}")
     } else if screen.playback_notice.contains("配信認証を更新") {
         format!("{summary} / 配信認証を更新して継続")
     } else {
@@ -249,7 +257,7 @@ fn draw_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, a
             filter.unclassified_personality()
         ),
         auth_header_line(screen),
-        screen.app.authentication.status.detail()
+        super::messages::auth_detail(&screen.app.authentication.status)
     );
     frame.render_widget(
         Paragraph::new(header).block(
@@ -395,7 +403,11 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
         .unwrap_or_else(|| {
             screen
                 .stop_cause
-                .map(|cause| cause.player_line().to_owned())
+                .map(|cause| {
+                    cause
+                        .player_line(&screen.app.authentication.status)
+                        .to_owned()
+                })
                 .unwrap_or_else(|| format!("再生中: なし / 音量{}%", screen.volume))
         });
     let controls = screen.control_hint();

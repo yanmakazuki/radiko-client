@@ -291,7 +291,15 @@ impl Screen {
             }
         }
         if let Some(notice) = update.notice {
-            self.playback_notice = notice;
+            self.playback_notice = match update.notice_kind {
+                Some(kind) => match update.notice_prefix {
+                    Some(prefix) => {
+                        format!("{prefix}: {}", super::messages::playback_notice(kind))
+                    }
+                    None => super::messages::playback_notice(kind),
+                },
+                None => notice,
+            };
             if self.playback_stopped || self.playback_ended {
                 self.notice_hold = super::NoticeHold::Other;
                 self.notice_hold_until = None;

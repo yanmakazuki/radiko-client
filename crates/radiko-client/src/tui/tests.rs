@@ -5,6 +5,7 @@ mod chapters;
 mod editing;
 mod keys;
 mod status;
+mod wording;
 
 fn screen() -> Screen {
     let now = radiko::api::stream::parse_time("20261015060000").unwrap();
