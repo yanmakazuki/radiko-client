@@ -3510,6 +3510,8 @@ mod tests {
         enum Mismatch {
             Request,
             Slot,
+            ScheduleStart,
+            IdleScheduleStart,
             UserPosition,
             IdleRequest,
         }
@@ -3549,10 +3551,13 @@ mod tests {
         for case in [
             Mismatch::Request,
             Mismatch::Slot,
+            Mismatch::ScheduleStart,
+            Mismatch::IdleScheduleStart,
             Mismatch::UserPosition,
             Mismatch::IdleRequest,
         ] {
-            let while_playing = !matches!(case, Mismatch::IdleRequest);
+            let while_playing =
+                !matches!(case, Mismatch::IdleRequest | Mismatch::IdleScheduleStart);
             let mut playing = info(3_600_000);
             playing.starts_at -= chrono::Duration::hours(2);
             playing.ends_at -= chrono::Duration::hours(2);
@@ -3566,7 +3571,34 @@ mod tests {
                 stop.clone(),
                 move |request| match case {
                     Mismatch::UserPosition => {
-                        Err(PlaybackError::Source(ProbeError::InvalidPosition))
+                        let Err(error) = crate::api::stream::playback::prepare_at_controlled(
+                            "TBS",
+                            ProbeMode::Live,
+                            request.cursor,
+                            &crate::session::MemberSession::new("synthetic-member".into()).unwrap(),
+                            &crate::session::Membership {
+                                area_free: Some(true),
+                                time_free_30: Some(true),
+                            },
+                            Duration::from_secs(1),
+                            std::sync::Arc::new(|| false),
+                        ) else {
+                            panic!("live playback with a position is InvalidPosition");
+                        };
+                        assert!(
+                            matches!(error, ProbeError::InvalidPosition),
+                            "the live position check must be the real InvalidPosition"
+                        );
+                        Err(PlaybackError::Source(error))
+                    }
+                    Mismatch::ScheduleStart | Mismatch::IdleScheduleStart => {
+                        let mut selected = template.clone();
+                        selected.station = request.station.clone();
+                        selected.mode = request.mode;
+                        selected.position = request.position;
+                        selected.starts_at = request.cursor - chrono::Duration::hours(1);
+                        selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                        Ok(Box::new(Quiet { info: selected }) as Box<dyn SegmentSource>)
                     }
                     Mismatch::Request | Mismatch::IdleRequest => {
                         let mut selected = template.clone();
@@ -3610,10 +3642,15 @@ mod tests {
                 Initial::Idle(playing.clone())
             };
             if !while_playing {
+                let cursor = if matches!(case, Mismatch::IdleScheduleStart) {
+                    playing.starts_at + chrono::Duration::hours(1)
+                } else {
+                    playing.starts_at
+                };
                 tx.send(Command::Select(PlaybackRequest {
                     station: playing.station.clone(),
                     mode: playing.mode,
-                    cursor: playing.starts_at,
+                    cursor,
                     position: Duration::ZERO,
                 }))
                 .unwrap();
@@ -3656,7 +3693,7 @@ mod tests {
             );
             assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
             match case {
-                Mismatch::Request | Mismatch::Slot => {
+                Mismatch::Request | Mismatch::Slot | Mismatch::ScheduleStart => {
                     assert_eq!(
                         kind,
                         Some(NoticeKind::StreamFailedWhilePlaying),
@@ -3671,7 +3708,7 @@ mod tests {
                         "a user position error must show 「指定した位置は番組の範囲外です。再生は続いています」"
                     );
                 }
-                Mismatch::IdleRequest => {
+                Mismatch::IdleRequest | Mismatch::IdleScheduleStart => {
                     assert_eq!(kind, None);
                     assert!(!message.contains("再生は続いています"));
                     assert!(!message.contains("指定した位置は番組の範囲外です"));

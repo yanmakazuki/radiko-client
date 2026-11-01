@@ -200,7 +200,12 @@ impl Controller {
                         // request, without the user naming a position. Keep
                         // `InvalidPosition` for Display and CLI. The flag tells the
                         // TUI this is not a user position error.
-                        if !job.request.matches(info) || !same_slot {
+                        // `starts_at != cursor` is the schedule slot versus the
+                        // stream slot. The cursor can sit inside an earlier slot.
+                        if !job.request.matches(info)
+                            || !same_slot
+                            || info.starts_at != job.request.cursor
+                        {
                             (
                                 Err(PlaybackError::Source(
                                     crate::api::stream::ProbeError::InvalidPosition,

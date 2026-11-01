@@ -215,12 +215,8 @@ impl Service {
                 Arc::new(move || stop.is_cancelled()),
             )
             .map_err(playback::PlaybackError::Source)?;
-            // UI selection identifies a slot, not merely a timestamp contained in another slot.
-            if source.info().starts_at != target.cursor {
-                return Err(playback::PlaybackError::Source(
-                    crate::api::stream::ProbeError::InvalidPosition,
-                ));
-            }
+            // A stream slot that merely contains the schedule start is rejected
+            // in seek, where it is a mismatch rather than a user position.
             Ok(Box::new(source))
         })
     }
