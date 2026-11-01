@@ -3393,6 +3393,118 @@ mod tests {
             handle.join().unwrap();
         }
     }
+    /// Plays one stream, then fails preparation of a second one. Returns the notice kind.
+    /// A wrong `playback_active` flag fails the assertion; a missing report fails the timeout.
+    fn preparation_kind_while_output_is_open(reconnect: bool) -> Option<NoticeKind> {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        let mut playing = info(3_600_000);
+        playing.starts_at -= chrono::Duration::hours(2);
+        playing.ends_at -= chrono::Duration::hours(2);
+        let cursor = playing.starts_at + chrono::Duration::hours(1);
+        let (tx, rx) = mpsc::channel();
+        let (found, received) = mpsc::channel();
+        let stop = StopToken::default();
+        let mut controller = Controller::with_reporter(
+            rx,
+            stop.clone(),
+            move |_| {
+                Err(if reconnect {
+                    PlaybackError::ReconnectGaveUp
+                } else {
+                    PlaybackError::Source(ProbeError::AuthExpired)
+                })
+            },
+            move |message, kind, _prefix, _output| {
+                if message.contains("再生準備失敗") {
+                    let _ = found.send(kind);
+                }
+            },
+        );
+        let mut requested = false;
+        let send = tx.clone();
+        let quit = tx.clone();
+        let handle = thread::spawn(move || {
+            let got = received.recv_timeout(Duration::from_secs(3));
+            let _ = quit.send(Command::Stop);
+            got.unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for the second stream's preparation failure while the first stream was still playing"
+                )
+            })
+        });
+        let report = play_loop(
+            Initial::Source(Holding {
+                info: playing,
+                bytes: Some(packet(24_000).repeat(8)),
+            }),
+            None,
+            stop,
+            |snapshot| {
+                if !requested
+                    && snapshot
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.frames > 0)
+                {
+                    requested = true;
+                    send.send(Command::Select(PlaybackRequest {
+                        station: "OBS".into(),
+                        mode: ProbeMode::TimeFree,
+                        cursor,
+                        position: Duration::ZERO,
+                    }))
+                    .unwrap();
+                }
+            },
+            sink,
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        assert!(
+            report.output.is_some(),
+            "the first stream's output was not open"
+        );
+        handle.join().unwrap()
+    }
+    #[test]
+    fn active_playback_reports_auth_expired_while_playing_when_the_next_prep_fails() {
+        assert_eq!(
+            preparation_kind_while_output_is_open(false),
+            Some(NoticeKind::AuthExpiredWhilePlaying),
+            "playback_active did not select the continuing auth kind"
+        );
+    }
+    #[test]
+    fn active_playback_reports_reconnect_limit_while_playing_when_the_next_prep_fails() {
+        assert_eq!(
+            preparation_kind_while_output_is_open(true),
+            Some(NoticeKind::ReconnectLimitWhilePlaying),
+            "playback_active did not select the continuing reconnect kind"
+        );
+    }
 
     const WINDOW_LOST: &str =
         "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
