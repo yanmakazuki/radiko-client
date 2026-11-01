@@ -1104,15 +1104,136 @@ fn the_same_stop_sentence_without_stopped_does_not_record_a_stop_cause() {
 }
 #[test]
 fn auth_expired_player_line_matches_the_stop_sentence_exactly() {
+    let signed_in = AuthStatus::Verified(radiko::session::Membership {
+        area_free: Some(true),
+        time_free_30: Some(false),
+    });
     assert_eq!(
-        StopCause::AuthExpired.player_line(),
+        StopCause::AuthExpired.player_line(&signed_in),
         "停止中：認証期限切れ（a で再確認）"
+    );
+    assert_eq!(
+        StopCause::AuthExpired.player_line(&AuthStatus::SignedOut),
+        "停止中：認証期限切れ（I で再ログイン）"
+    );
+    assert_eq!(
+        StopCause::ReconnectLimit.player_line(&AuthStatus::SignedOut),
+        "停止中：再接続できませんでした（番組を選び直してください）"
     );
 }
 #[test]
 fn reconnect_limit_player_line_matches_the_stop_sentence_exactly() {
     assert_eq!(
-        StopCause::ReconnectLimit.player_line(),
+        StopCause::ReconnectLimit.player_line(&AuthStatus::NotChecked),
         "停止中：再接続できませんでした（番組を選び直してください）"
     );
+}
+#[test]
+fn logout_after_auth_expiry_changes_only_the_guidance_and_escape_keeps_the_line() {
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("logout line must not fetch") });
+    let before = "停止中：認証期限切れ（a で再確認）";
+    let after = "停止中：認証期限切れ（I で再ログイン）";
+    let mut screen = super::screen();
+    screen.app.authentication.status = AuthStatus::Verified(radiko::session::Membership {
+        area_free: Some(true),
+        time_free_30: Some(false),
+    });
+    stop_with(
+        &mut screen,
+        super::super::messages::AUTH_EXPIRED_STOP,
+        Some(playback::StopReason::AuthExpired),
+    );
+    assert_eq!(screen.stop_cause, Some(StopCause::AuthExpired));
+    assert_eq!(
+        StopCause::AuthExpired.player_line(&screen.app.authentication.status),
+        before
+    );
+    let shown = drawn(&mut screen);
+    assert!(shown.contains(&before.replace(' ', "")), "{shown}");
+    assert!(shown.contains("再生側で認証失敗"), "{shown}");
+    assert!(shown.contains("a再確認"), "{shown}");
+
+    let id = screen.app.authentication.begin_logout().unwrap();
+    screen.apply_authentication(radiko::app::auth::Event {
+        id,
+        status: AuthStatus::SignedOut,
+    });
+    assert_eq!(screen.stop_cause, Some(StopCause::AuthExpired));
+    assert!(screen.playback_stopped);
+    assert_eq!(
+        StopCause::AuthExpired.player_line(&screen.app.authentication.status),
+        after
+    );
+    let logged_out = drawn(&mut screen);
+    assert!(logged_out.contains(&after.replace(' ', "")), "{logged_out}");
+    assert!(
+        !logged_out.contains(&before.replace(' ', "")),
+        "{logged_out}"
+    );
+    assert!(logged_out.contains("再生側で認証失敗"), "{logged_out}");
+    assert!(logged_out.contains("Iで再ログイン"), "{logged_out}");
+
+    assert!(!press(
+        &mut screen,
+        &mut search,
+        KeyCode::Esc,
+        KeyModifiers::NONE
+    ));
+    assert!(screen.playback_notice.is_empty());
+    assert_eq!(screen.stop_cause, Some(StopCause::AuthExpired));
+    let dismissed = drawn(&mut screen);
+    assert!(dismissed.contains(&after.replace(' ', "")), "{dismissed}");
+    assert!(!dismissed.contains("aで再確認"), "{dismissed}");
+    assert!(!dismissed.contains("a再確認"), "{dismissed}");
+    assert!(dismissed.contains("再生側で認証失敗"), "{dismissed}");
+    assert!(dismissed.contains("Iで再ログイン"), "{dismissed}");
+
+    let id = screen.app.authentication.begin_login().unwrap();
+    screen.apply_authentication(radiko::app::auth::Event {
+        id,
+        status: AuthStatus::Verified(radiko::session::Membership {
+            area_free: None,
+            time_free_30: None,
+        }),
+    });
+    assert!(screen.stop_cause.is_none());
+    assert!(!drawn(&mut screen).contains("停止中："));
+
+    let mut reconnect = super::screen();
+    stop_with(
+        &mut reconnect,
+        "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください",
+        Some(playback::StopReason::ReconnectLimit),
+    );
+    let id = reconnect.app.authentication.begin_logout().unwrap();
+    reconnect.apply_authentication(radiko::app::auth::Event {
+        id,
+        status: AuthStatus::SignedOut,
+    });
+    assert_eq!(
+        StopCause::ReconnectLimit.player_line(&reconnect.app.authentication.status),
+        "停止中：再接続できませんでした（番組を選び直してください）"
+    );
+    let reconnect_text = drawn(&mut reconnect);
+    assert!(
+        reconnect_text.contains("停止中：再接続できませんでした（番組を選び直してください）"),
+        "{reconnect_text}"
+    );
+    assert!(
+        !reconnect_text.contains("Iで再ログイン"),
+        "{reconnect_text}"
+    );
+
+    let mut restarted = super::screen();
+    restarted.app.authentication.status = AuthStatus::SignedOut;
+    restarted.stop_cause = Some(StopCause::AuthExpired);
+    restarted.playback_stopped = true;
+    restarted.apply_playback(playback::Update {
+        new_session: true,
+        snapshot: Some(timefree_snapshot()),
+        ..playback::Update::default()
+    });
+    assert!(restarted.stop_cause.is_none());
+    assert!(!drawn(&mut restarted).contains("停止中："));
 }

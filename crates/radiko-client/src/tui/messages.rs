@@ -2,7 +2,7 @@
 use radiko::app::{auth::Status as AuthStatus, playback::NoticeKind};
 
 pub(super) const NOT_LOGGED_IN: &str = "未ログインです。I でログイン";
-pub(super) const SESSION_EXPIRED: &str = "セッション失効。I で再ログイン / a で再確認";
+pub(super) const SESSION_EXPIRED: &str = "セッション失効。a で再確認 / I で再ログイン";
 pub(super) const AUTH_EXPIRED_STOP: &str =
     "認証期限切れのため再生を停止しました。a で再確認 / I で再ログイン";
 pub(super) const STREAM_AUTHENTICATION: &str =
@@ -34,5 +34,5 @@ pub(super) fn auth_detail(status: &AuthStatus) -> String {
 }
 
 fn storage_failure(error: &impl std::fmt::Display) -> String {
-    format!("{error} / I で再ログイン / a で再確認")
+    format!("{error} / a で再確認 / I で再ログイン")
 }

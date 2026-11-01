@@ -72,7 +72,7 @@ fn tui_auth_screens_use_keys_instead_of_cli_commands() {
         radiko::app::auth::Status::StorageFailed(radiko::storage::StorageError::Invalid);
     let corrupt_text = buffer(&mut corrupt);
     assert!(
-        corrupt_text.contains("セッションファイルが破損しています / I で再ログイン / a で再確認"),
+        corrupt_text.contains("セッションファイルが破損しています / a で再確認 / I で再ログイン"),
         "{corrupt_text}"
     );
     assert_no_cli_commands(&corrupt_text);
@@ -136,7 +136,7 @@ fn tui_auth_screens_use_keys_instead_of_cli_commands() {
         Some(super::super::StopCause::AuthExpired)
     );
     assert_eq!(
-        super::super::StopCause::AuthExpired.player_line(),
+        super::super::StopCause::AuthExpired.player_line(&stopped.app.authentication.status),
         "停止中：認証期限切れ（a で再確認）"
     );
     let stopped_text = buffer(&mut stopped);

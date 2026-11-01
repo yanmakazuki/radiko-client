@@ -160,8 +160,12 @@ impl StopCause {
             radiko::app::playback::StopReason::ReconnectLimit => Self::ReconnectLimit,
         }
     }
-    fn player_line(self) -> &'static str {
+    /// Guidance depends on logout state. The stop reason itself stays `AuthExpired`.
+    fn player_line(self, status: &AuthStatus) -> &'static str {
         match self {
+            Self::AuthExpired if matches!(status, AuthStatus::SignedOut) => {
+                "停止中：認証期限切れ（I で再ログイン）"
+            }
             Self::AuthExpired => "停止中：認証期限切れ（a で再確認）",
             Self::ReconnectLimit => "停止中：再接続できませんでした（番組を選び直してください）",
         }
