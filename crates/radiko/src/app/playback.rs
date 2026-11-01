@@ -70,6 +70,7 @@ pub enum StopReason {
     AuthExpired,
     ReconnectLimit,
 }
+pub use crate::player::playback::{NoticeKind, notice_kind};
 /// `Some` only for an auth-expiry or reconnect-limit failure. Other errors, including
 /// window loss and a normal program end, are `None`.
 pub fn stop_reason(error: &playback::PlaybackError) -> Option<StopReason> {
@@ -101,6 +102,11 @@ pub struct Update {
     pub stopped: bool,
     /// Set only together with [`Self::stopped`], from [`stop_reason`].
     pub stop_reason: Option<StopReason>,
+    /// Set from [`notice_kind`] when `notice` is a playback failure. The TUI rewords from this.
+    pub notice_kind: Option<NoticeKind>,
+    /// When set with [`Self::notice_kind`], the TUI keeps this prefix and replaces only the error.
+    /// `None` replaces the whole notice. Not inferred from the notice text.
+    pub notice_prefix: Option<&'static str>,
     pub ended: bool,
     pub final_diagnostics: Option<String>,
 }
@@ -337,9 +343,11 @@ impl Service {
                     rx,
                     shutdown.clone(),
                     move |request, stop| factory(request, stop),
-                    move |notice| {
+                    move |notice, kind, prefix| {
                         if let Ok(mut update) = notices.lock() {
                             update.notice = Some(notice);
+                            update.notice_kind = kind;
+                            update.notice_prefix = prefix;
                         }
                     },
                 );
@@ -378,6 +386,8 @@ impl Service {
                     // Preserve an undelivered snapshot so the UI can retain diagnostics on failure.
                     update.stopped = result.is_err();
                     update.stop_reason = result.as_ref().err().and_then(stop_reason);
+                    update.notice_kind = result.as_ref().err().and_then(notice_kind);
+                    update.notice_prefix = None;
                     update.notice = Some(match &result {
                         Ok(report) => match report.reason {
                             playback::EndReason::ProgramEnd => "番組終了".into(),
@@ -536,6 +546,55 @@ mod tests {
             None
         );
         assert_eq!(stop_reason(&playback::PlaybackError::LoginRequired), None);
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::LoginRequired),
+            Some(NoticeKind::LoginRequired)
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Auth(
+                crate::api::auth::AuthError::SessionExpired
+            )),
+            Some(NoticeKind::SessionExpired)
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Auth(
+                crate::api::auth::AuthError::Network
+            )),
+            None
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Source(ProbeError::Authentication)),
+            Some(NoticeKind::StreamAuthentication)
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Source(ProbeError::At(
+                "HLS音声取得",
+                Box::new(ProbeError::Authentication),
+            ))),
+            Some(NoticeKind::StreamAuthentication)
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Source(ProbeError::AuthExpired)),
+            Some(NoticeKind::AuthExpired)
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Source(ProbeError::OutsideArea)),
+            Some(NoticeKind::OutsideArea)
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Source(
+                ProbeError::ContractRequired
+            )),
+            None
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Source(ProbeError::Denied)),
+            None
+        );
+        assert_eq!(
+            notice_kind(&playback::PlaybackError::Source(ProbeError::WindowLost)),
+            None
+        );
         let update = Update {
             stopped: false,
             notice: Some(expired.to_string()),
@@ -754,10 +813,23 @@ mod tests {
         let p = program();
         service.select(&p, p.ends_at).unwrap();
         until(|| {
-            service
-                .poll()
+            let update = service.poll();
+            if update
                 .notice
-                .is_some_and(|n| n.contains("未ログイン"))
+                .as_deref()
+                .is_some_and(|notice| notice.contains("未ログイン"))
+            {
+                assert_eq!(update.notice_kind, Some(NoticeKind::LoginRequired));
+                assert!(
+                    update
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("loginでログイン"))
+                );
+                true
+            } else {
+                false
+            }
         });
         assert!(!directory.path().join("session.json").exists());
         let file = directory.path().join("session.json");

@@ -652,7 +652,7 @@ fn escape_dismisses_stop_notices_without_resuming_or_clearing_the_stop() {
     let mut search =
         Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
     let sentences = [
-        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください",
+        super::super::messages::AUTH_EXPIRED_STOP,
         "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください",
     ];
     for sentence in sentences {
@@ -837,7 +837,7 @@ fn escape_does_not_replace_stop_reception_or_reconnect_with_the_quit_hint() {
     let reconnect = radiko::player::playback::reconnect_notice(Duration::from_secs(30));
     assert_eq!(reconnect, "再接続中…（30秒）");
     let protected = [
-        "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください",
+        super::super::messages::AUTH_EXPIRED_STOP,
         "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください",
         radiko::player::playback::RECEPTION_NOTICE,
         reconnect.as_str(),
@@ -899,10 +899,15 @@ fn drawn(screen: &mut Screen) -> String {
         .replace(' ', "")
 }
 fn stop_with(screen: &mut Screen, notice: &str, reason: Option<playback::StopReason>) {
+    let notice_kind = match reason {
+        Some(playback::StopReason::AuthExpired) => Some(playback::NoticeKind::AuthExpired),
+        _ => None,
+    };
     screen.apply_playback(playback::Update {
         stopped: true,
         ended: true,
         stop_reason: reason,
+        notice_kind,
         notice: Some(notice.to_owned()),
         ..playback::Update::default()
     });
@@ -936,7 +941,14 @@ fn stopped_auth_and_reconnect_lines_stay_after_escape_until_playback_or_auth_suc
         });
         stop_with(&mut screen, notice, reason);
         let before = drawn(&mut screen);
-        assert!(before.contains(&notice.replace(' ', "")), "{before}");
+        let shown = if reason == Some(playback::StopReason::AuthExpired) {
+            super::super::messages::AUTH_EXPIRED_STOP
+        } else {
+            notice
+        };
+        assert!(before.contains(&shown.replace(' ', "")), "{before}");
+        assert!(!before.contains("loginで"), "{before}");
+        assert!(!before.contains("sessionで"), "{before}");
         assert!(before.contains(line), "{before}");
         if auth_hint {
             assert!(before.contains("再生側で認証失敗"), "{before}");

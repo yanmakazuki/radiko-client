@@ -63,10 +63,11 @@ struct Completed {
     id: u64,
     result: Result<Ready, PlaybackError>,
 }
+type Reporter = dyn FnMut(String, Option<super::playback::NoticeKind>, Option<&'static str>) + Send;
 pub struct Controller {
     commands: Receiver<Command>,
     preparation_worker: Option<thread::JoinHandle<()>>,
-    reporter: Box<dyn FnMut(String) + Send>,
+    reporter: Box<Reporter>,
     pub(super) notification_interval: Duration,
     latest: Arc<Mutex<Option<Job>>>,
     results: Receiver<Completed>,
@@ -86,9 +87,10 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
-        let mut controller = Self::with_reporter(commands, stop, factory, |message| {
-            crate::stderr::write_line(format_args!("{message}"));
-        });
+        let mut controller =
+            Self::with_reporter(commands, stop, factory, |message, _kind, _prefix| {
+                crate::stderr::write_line(format_args!("{message}"));
+            });
         controller.notification_interval = Duration::from_secs(5);
         controller
     }
@@ -100,9 +102,10 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
-        let mut controller = Self::with_cancellable_reporter(commands, stop, factory, |message| {
-            crate::stderr::write_line(format_args!("{message}"));
-        });
+        let mut controller =
+            Self::with_cancellable_reporter(commands, stop, factory, |message, _kind, _prefix| {
+                crate::stderr::write_line(format_args!("{message}"));
+            });
         controller.notification_interval = Duration::from_secs(5);
         controller
     }
@@ -112,7 +115,9 @@ impl Controller {
         factory: impl Fn(PlaybackRequest) -> Result<Box<dyn SegmentSource>, PlaybackError>
         + Send
         + 'static,
-        reporter: impl FnMut(String) + Send + 'static,
+        reporter: impl FnMut(String, Option<crate::player::playback::NoticeKind>, Option<&'static str>)
+        + Send
+        + 'static,
     ) -> Self {
         Self::with_cancellable_reporter(
             commands,
@@ -127,7 +132,9 @@ impl Controller {
         factory: impl Fn(PlaybackRequest, StopToken) -> Result<Box<dyn SegmentSource>, PlaybackError>
         + Send
         + 'static,
-        reporter: impl FnMut(String) + Send + 'static,
+        reporter: impl FnMut(String, Option<crate::player::playback::NoticeKind>, Option<&'static str>)
+        + Send
+        + 'static,
     ) -> Self {
         let latest = Arc::new(Mutex::new(None::<Job>));
         let generation = Arc::new(AtomicU64::new(0));
@@ -208,7 +215,13 @@ impl Controller {
         }
     }
     pub(super) fn report(&mut self, message: String) {
-        (self.reporter)(message);
+        (self.reporter)(message, None, None);
+    }
+    /// CLI text stays `{prefix}: {error}`. The kind and prefix let the TUI replace that error.
+    pub(super) fn report_failure(&mut self, prefix: &'static str, error: &PlaybackError) {
+        let kind = crate::player::playback::notice_kind(error);
+        let shown_prefix = kind.map(|_| prefix);
+        (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix);
     }
     pub(super) fn poll(&mut self, info: &StreamInfo, current: Duration) -> Option<Ready> {
         // 結果より先に操作を処理し、配送済みの古い準備結果も採用しない。
@@ -326,7 +339,11 @@ impl Controller {
                         pending.cancel();
                     }
                     self.pending_target = None;
-                    (self.reporter)("再生準備に失敗しました（現在の状態を維持）".into());
+                    (self.reporter)(
+                        "再生準備に失敗しました（現在の状態を維持）".into(),
+                        None,
+                        None,
+                    );
                     continue;
                 }
             }
@@ -357,7 +374,9 @@ impl Controller {
                     self.pending = None;
                     return Some(ready);
                 }
-                Err(error) => self.report(format!("再生準備失敗（現在の状態を維持）: {error}")),
+                Err(error) => {
+                    self.report_failure("再生準備失敗（現在の状態を維持）", &error);
+                }
             }
             self.pending = None;
         }

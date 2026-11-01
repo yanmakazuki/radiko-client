@@ -52,6 +52,9 @@ pub enum ProbeError {
     StillOnAir,
     Expired,
     ContractRequired,
+    /// The station is absent from the listener's area list and area-free is explicitly inactive.
+    /// CLI text matches [`Self::ContractRequired`]. The TUI tells these apart by the variant.
+    OutsideArea,
     AvailabilityUnknown,
     Unavailable,
     InvalidPlaylist,
@@ -91,9 +94,7 @@ impl fmt::Display for ProbeError {
             Self::Upcoming => f.write_str("放送前のため配信取得できません"),
             Self::StillOnAir => f.write_str("放送中のためタイムフリーの検証対象外です"),
             Self::Expired => f.write_str("タイムフリーの候補期限を過ぎています"),
-            Self::ContractRequired => f.write_str(
-                "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）",
-            ),
+            Self::ContractRequired | Self::OutsideArea => f.write_str(Self::CONTRACT_REQUIRED),
             Self::AvailabilityUnknown => {
                 f.write_str("番組の配信条件が未確認のため取得を中止しました")
             }
@@ -113,6 +114,8 @@ impl ProbeError {
         "通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください";
     pub(crate) const AUTH_EXPIRED: &'static str =
         "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください";
+    pub(crate) const CONTRACT_REQUIRED: &'static str =
+        "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）";
     fn at(self, stage: &'static str) -> Self {
         Self::At(stage, Box::new(self))
     }
@@ -332,8 +335,8 @@ fn prepare_with(
     let auth = authenticate(http, session).map_err(|e| e.at("配信認証"))?;
     let outside_area =
         !local_station(http, &auth.area, station).map_err(|e| e.at("地域の局一覧取得"))?;
-    if outside_area && membership.area_free != Some(true) {
-        return Err(ProbeError::ContractRequired);
+    if let Some(error) = area_contract(outside_area, membership.area_free) {
+        return Err(error);
     }
     if mode == ProbeMode::TimeFree {
         availability(&program, now, outside_area)?;
@@ -622,6 +625,21 @@ fn eligible(
         return Err(ProbeError::ContractRequired);
     }
     Ok(())
+}
+
+/// Area-free failure after the listener area is known.
+/// `OutsideArea` only when the station is missing from that area's list and area-free is `Some(false)`.
+/// An unknown area-free flag stays [`ProbeError::ContractRequired`]: the area may be known,
+/// but 「未加入」 is not. In-area playback does not fail here.
+fn area_contract(outside_area: bool, area_free: Option<bool>) -> Option<ProbeError> {
+    if !outside_area || area_free == Some(true) {
+        return None;
+    }
+    if area_free == Some(false) {
+        Some(ProbeError::OutsideArea)
+    } else {
+        Some(ProbeError::ContractRequired)
+    }
 }
 
 fn availability(
@@ -983,8 +1001,8 @@ mod tests {
             ProbeError::Upcoming => "放送前のため配信取得できません".into(),
             ProbeError::StillOnAir => "放送中のためタイムフリーの検証対象外です".into(),
             ProbeError::Expired => "タイムフリーの候補期限を過ぎています".into(),
-            ProbeError::ContractRequired => {
-                "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）".into()
+            ProbeError::ContractRequired | ProbeError::OutsideArea => {
+                ProbeError::CONTRACT_REQUIRED.into()
             }
             ProbeError::AvailabilityUnknown => "番組の配信条件が未確認のため取得を中止しました".into(),
             ProbeError::Unavailable => "番組情報でタイムフリー配信対象外とされています".into(),
@@ -1023,6 +1041,7 @@ mod tests {
             ProbeError::StillOnAir,
             ProbeError::Expired,
             ProbeError::ContractRequired,
+            ProbeError::OutsideArea,
             ProbeError::AvailabilityUnknown,
             ProbeError::Unavailable,
             ProbeError::InvalidPlaylist,
@@ -1356,6 +1375,33 @@ mod tests {
             area_free: Some(false),
             time_free_30: Some(true),
         };
+        let error = probe_with(
+            &mock,
+            "TBS",
+            ProbeMode::Live,
+            now,
+            now,
+            &member(),
+            &membership,
+        )
+        .unwrap_err();
+        assert_eq!(error, ProbeError::OutsideArea);
+        assert_eq!(error.to_string(), ProbeError::ContractRequired.to_string());
+        assert_eq!(mock.seen.borrow().len(), 4);
+        assert_eq!(mock.seen.borrow()[2].path(), "/v2/api/auth2");
+        assert_eq!(mock.seen.borrow()[3].path(), "/v3/station/list/JP13.xml");
+    }
+
+    #[test]
+    fn outside_area_with_unknown_area_free_stays_the_generic_contract_error() {
+        let mock = flow();
+        mock.steps.borrow_mut()[3].bytes =
+            b"<stations><station><id>FMT</id></station></stations>".to_vec();
+        let now = dt("2026-10-15T12:00:00+09:00");
+        let membership = Membership {
+            area_free: None,
+            time_free_30: Some(true),
+        };
         assert_eq!(
             probe_with(
                 &mock,
@@ -1369,7 +1415,49 @@ mod tests {
             .unwrap_err(),
             ProbeError::ContractRequired
         );
-        assert_eq!(mock.seen.borrow().len(), 4);
+        assert_eq!(mock.seen.borrow()[2].path(), "/v2/api/auth2");
+        assert_eq!(mock.seen.borrow()[3].path(), "/v3/station/list/JP13.xml");
+    }
+
+    #[test]
+    fn in_area_timefree_without_thirty_day_contract_does_not_read_the_area_list() {
+        let mock = flow();
+        mock.steps.borrow_mut()[0].bytes =
+            program_json("2026-10-01T11:00:00+09:00", "2026-10-01T12:00:00+09:00", 0);
+        let membership = Membership {
+            area_free: Some(false),
+            time_free_30: Some(false),
+        };
+        assert_eq!(
+            probe_with(
+                &mock,
+                "TBS",
+                ProbeMode::TimeFree,
+                dt("2026-10-01T11:00:00+09:00"),
+                dt("2026-10-15T12:00:00+09:00"),
+                &member(),
+                &membership
+            )
+            .unwrap_err(),
+            ProbeError::ContractRequired
+        );
+        assert_eq!(mock.seen.borrow().len(), 1);
+        assert_eq!(mock.seen.borrow()[0].path(), "/v1/programs/list");
+    }
+
+    #[test]
+    fn area_contract_uses_the_listener_area_list_and_an_explicit_unsubscribed_flag() {
+        assert_eq!(
+            area_contract(true, Some(false)),
+            Some(ProbeError::OutsideArea)
+        );
+        assert_eq!(
+            area_contract(true, None),
+            Some(ProbeError::ContractRequired)
+        );
+        assert_eq!(area_contract(true, Some(true)), None);
+        assert_eq!(area_contract(false, Some(false)), None);
+        assert_eq!(area_contract(false, None), None);
     }
 
     #[test]

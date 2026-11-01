@@ -27,6 +27,7 @@ mod failures;
 mod filters;
 mod help;
 mod login;
+mod messages;
 mod named;
 mod offline;
 mod picker;

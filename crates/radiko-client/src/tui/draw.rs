@@ -249,7 +249,7 @@ fn draw_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, a
             filter.unclassified_personality()
         ),
         auth_header_line(screen),
-        screen.app.authentication.status.detail()
+        super::messages::auth_detail(&screen.app.authentication.status)
     );
     frame.render_widget(
         Paragraph::new(header).block(

@@ -53,6 +53,37 @@ impl fmt::Display for PlaybackError {
 }
 impl std::error::Error for PlaybackError {}
 
+/// Playback failures whose TUI sentence differs from [`failure_notice`] and from `Display`.
+/// Chosen from the error value. Absent means the TUI shows the supplied notice unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    LoginRequired,
+    SessionExpired,
+    StreamAuthentication,
+    AuthExpired,
+    OutsideArea,
+}
+/// `Some` when the TUI must replace the CLI sentence for this error.
+pub fn notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
+    match error {
+        PlaybackError::LoginRequired => Some(NoticeKind::LoginRequired),
+        PlaybackError::Auth(crate::api::auth::AuthError::SessionExpired) => {
+            Some(NoticeKind::SessionExpired)
+        }
+        PlaybackError::Source(error) => probe_notice_kind(error),
+        _ => None,
+    }
+}
+fn probe_notice_kind(error: &ProbeError) -> Option<NoticeKind> {
+    match error {
+        ProbeError::At(_, inner) => probe_notice_kind(inner),
+        ProbeError::Authentication => Some(NoticeKind::StreamAuthentication),
+        ProbeError::AuthExpired => Some(NoticeKind::AuthExpired),
+        ProbeError::OutsideArea => Some(NoticeKind::OutsideArea),
+        _ => None,
+    }
+}
+
 /// TUI notice for a playback failure.
 /// Window loss, the reconnect limit, and auth expiry are the confirmed sentence alone.
 /// Every other failure keeps the `再生停止:` prefix and the Display chain.
@@ -130,6 +161,7 @@ fn confirmed_probe(error: &ProbeError) -> Option<&'static str> {
         | ProbeError::StillOnAir
         | ProbeError::Expired
         | ProbeError::ContractRequired
+        | ProbeError::OutsideArea
         | ProbeError::AvailabilityUnknown
         | ProbeError::Unavailable
         | ProbeError::InvalidPlaylist
@@ -1067,7 +1099,7 @@ fn play_loop_clocked<S: AudioSink>(
                     .map_err(PlaybackError::Output)
                 }) {
                     Err(error) => {
-                        control.report(format!("再生切替失敗（現在の状態を維持）: {error}"))
+                        control.report_failure("再生切替失敗（現在の状態を維持）", &error);
                     }
                     Ok((sink, limit, why)) => {
                         control.paused = false;
@@ -2276,7 +2308,7 @@ mod tests {
             rx,
             stop.clone(),
             |_| Err(PlaybackError::LoginRequired),
-            move |message| {
+            move |message, _kind, _prefix| {
                 if message.contains("未ログイン") {
                     notice.send(message).unwrap();
                 }
@@ -2333,7 +2365,7 @@ mod tests {
                     events: VecDeque::from([event(bytes.clone(), false), Ok(Next::End)]),
                 }))
             },
-            |_| {},
+            |_, _, _| {},
         );
         let report = play_loop(
             Initial::<Source>::Idle(expected.clone()),
@@ -3045,7 +3077,7 @@ mod tests {
             rx,
             stop.clone(),
             |_| panic!("no prepare"),
-            |_| {},
+            |_, _, _| {},
         );
         let signal = stop.clone();
         let commands = tx.clone();
@@ -3158,6 +3190,7 @@ mod tests {
             ProbeError::StillOnAir => "StillOnAir",
             ProbeError::Expired => "Expired",
             ProbeError::ContractRequired => "ContractRequired",
+            ProbeError::OutsideArea => "OutsideArea",
             ProbeError::AvailabilityUnknown => "AvailabilityUnknown",
             ProbeError::Unavailable => "Unavailable",
             ProbeError::InvalidPlaylist => "InvalidPlaylist",
@@ -3234,6 +3267,10 @@ mod tests {
             "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）",
         );
         plain_source(
+            ProbeError::OutsideArea,
+            "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）",
+        );
+        plain_source(
             ProbeError::AvailabilityUnknown,
             "番組の配信条件が未確認のため取得を中止しました",
         );
@@ -3252,7 +3289,7 @@ mod tests {
         assert!(seen.insert("WindowLost"));
         assert!(seen.insert("AuthExpired"));
         assert!(seen.insert("ReconnectGaveUp"));
-        assert_eq!(seen.len(), 26, "one row per ProbeError leaf, saw {seen:?}");
+        assert_eq!(seen.len(), 27, "one row per ProbeError leaf, saw {seen:?}");
         assert_confirmed(
             PlaybackError::Source(ProbeError::WindowLost),
             WINDOW_LOST,

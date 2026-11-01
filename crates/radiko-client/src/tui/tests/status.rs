@@ -80,9 +80,14 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     screen.apply_playback(radiko::app::playback::Update {
         stopped: true,
         stop_reason: Some(radiko::app::playback::StopReason::AuthExpired),
+        notice_kind: Some(radiko::app::playback::NoticeKind::AuthExpired),
         notice: Some(expired),
         ..radiko::app::playback::Update::default()
     });
+    assert_eq!(
+        screen.playback_notice,
+        super::super::messages::AUTH_EXPIRED_STOP
+    );
     let now = Utc::now().fixed_offset();
     let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
     let text = |terminal: &Terminal<TestBackend>| {
@@ -105,6 +110,15 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     assert!(shown.contains("再生側で認証失敗"), "{shown}");
     assert!(shown.contains("a再確認"), "{shown}");
     assert!(shown.contains("認証期限切れ"), "{shown}");
+    assert!(
+        shown.contains(&super::super::messages::AUTH_EXPIRED_STOP.replace(' ', "")),
+        "{shown}"
+    );
+    assert!(!shown.contains("loginで"), "{shown}");
+    assert!(
+        shown.contains("停止中：認証期限切れ（aで再確認）"),
+        "{shown}"
+    );
     assert!(shown.contains("ログイン確認済み"), "{shown}");
     let info = radiko::api::stream::playback::StreamInfo {
         title: Some("枠".into()),
@@ -177,6 +191,7 @@ fn playback_auth_failure_and_renewal_show_in_the_header() {
     screen.apply_playback(radiko::app::playback::Update {
         stopped: true,
         stop_reason: Some(radiko::app::playback::StopReason::AuthExpired),
+        notice_kind: Some(radiko::app::playback::NoticeKind::AuthExpired),
         notice: Some(expired),
         ..radiko::app::playback::Update::default()
     });
