@@ -4,6 +4,7 @@ use ratatui::{Terminal, backend::TestBackend};
 mod chapters;
 mod editing;
 mod keys;
+mod output;
 mod status;
 mod wording;
 

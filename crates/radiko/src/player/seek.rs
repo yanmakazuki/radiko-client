@@ -63,7 +63,12 @@ struct Completed {
     id: u64,
     result: Result<Ready, PlaybackError>,
 }
-type Reporter = dyn FnMut(String, Option<super::playback::NoticeKind>, Option<&'static str>) + Send;
+type Reporter = dyn FnMut(
+        String,
+        Option<super::playback::NoticeKind>,
+        Option<&'static str>,
+        Option<super::playback::OutputFailure>,
+    ) + Send;
 pub struct Controller {
     commands: Receiver<Command>,
     preparation_worker: Option<thread::JoinHandle<()>>,
@@ -78,6 +83,8 @@ pub struct Controller {
     pub(super) changed: bool,
     pub(super) paused: bool,
     pub(super) volume: u32,
+    /// Set by the play loop from whether an output is open. Preparation before that is not playback.
+    playback_active: bool,
 }
 impl Controller {
     pub fn new(
@@ -87,10 +94,14 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
-        let mut controller =
-            Self::with_reporter(commands, stop, factory, |message, _kind, _prefix| {
+        let mut controller = Self::with_reporter(
+            commands,
+            stop,
+            factory,
+            |message, _kind, _prefix, _output| {
                 crate::stderr::write_line(format_args!("{message}"));
-            });
+            },
+        );
         controller.notification_interval = Duration::from_secs(5);
         controller
     }
@@ -102,10 +113,14 @@ impl Controller {
         + Send
         + 'static,
     ) -> Self {
-        let mut controller =
-            Self::with_cancellable_reporter(commands, stop, factory, |message, _kind, _prefix| {
+        let mut controller = Self::with_cancellable_reporter(
+            commands,
+            stop,
+            factory,
+            |message, _kind, _prefix, _output| {
                 crate::stderr::write_line(format_args!("{message}"));
-            });
+            },
+        );
         controller.notification_interval = Duration::from_secs(5);
         controller
     }
@@ -115,8 +130,12 @@ impl Controller {
         factory: impl Fn(PlaybackRequest) -> Result<Box<dyn SegmentSource>, PlaybackError>
         + Send
         + 'static,
-        reporter: impl FnMut(String, Option<crate::player::playback::NoticeKind>, Option<&'static str>)
-        + Send
+        reporter: impl FnMut(
+            String,
+            Option<crate::player::playback::NoticeKind>,
+            Option<&'static str>,
+            Option<crate::player::playback::OutputFailure>,
+        ) + Send
         + 'static,
     ) -> Self {
         Self::with_cancellable_reporter(
@@ -132,8 +151,12 @@ impl Controller {
         factory: impl Fn(PlaybackRequest, StopToken) -> Result<Box<dyn SegmentSource>, PlaybackError>
         + Send
         + 'static,
-        reporter: impl FnMut(String, Option<crate::player::playback::NoticeKind>, Option<&'static str>)
-        + Send
+        reporter: impl FnMut(
+            String,
+            Option<crate::player::playback::NoticeKind>,
+            Option<&'static str>,
+            Option<crate::player::playback::OutputFailure>,
+        ) + Send
         + 'static,
     ) -> Self {
         let latest = Arc::new(Mutex::new(None::<Job>));
@@ -204,6 +227,7 @@ impl Controller {
             changed: true,
             paused: false,
             volume: 25,
+            playback_active: false,
         }
     }
     /// Call only from the owning background control thread, after output has been stopped.
@@ -215,13 +239,23 @@ impl Controller {
         }
     }
     pub(super) fn report(&mut self, message: String) {
-        (self.reporter)(message, None, None);
+        (self.reporter)(message, None, None, None);
+    }
+    /// The play loop sets this from the open output. Idle preparation is not playback.
+    pub(super) fn note_playback_active(&mut self, active: bool) {
+        self.playback_active = active;
     }
     /// CLI text stays `{prefix}: {error}`. The kind and prefix let the TUI replace that error.
+    /// The continuing sentence is only for a failure while output is already open.
     pub(super) fn report_failure(&mut self, prefix: &'static str, error: &PlaybackError) {
-        let kind = crate::player::playback::notice_kind(error);
+        let kind = if self.playback_active {
+            crate::player::playback::continuing_notice_kind(error)
+        } else {
+            crate::player::playback::notice_kind(error)
+        };
         let shown_prefix = kind.map(|_| prefix);
-        (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix);
+        let output = crate::player::playback::output_failure(error);
+        (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix, output);
     }
     pub(super) fn poll(&mut self, info: &StreamInfo, current: Duration) -> Option<Ready> {
         // 結果より先に操作を処理し、配送済みの古い準備結果も採用しない。
@@ -341,6 +375,7 @@ impl Controller {
                     self.pending_target = None;
                     (self.reporter)(
                         "再生準備に失敗しました（現在の状態を維持）".into(),
+                        None,
                         None,
                         None,
                     );

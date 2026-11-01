@@ -401,14 +401,15 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
             )
         })
         .unwrap_or_else(|| {
-            screen
-                .stop_cause
-                .map(|cause| {
-                    cause
-                        .player_line(&screen.app.authentication.status)
-                        .to_owned()
-                })
-                .unwrap_or_else(|| format!("再生中: なし / 音量{}%", screen.volume))
+            if let Some(cause) = screen.stop_cause {
+                cause
+                    .player_line(&screen.app.authentication.status)
+                    .to_owned()
+            } else if let Some(guide) = screen.output_guide {
+                guide.lines().join("\n")
+            } else {
+                format!("再生中: なし / 音量{}%", screen.volume)
+            }
         });
     let controls = screen.control_hint();
     let pipeline = screen

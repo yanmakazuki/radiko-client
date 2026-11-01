@@ -35,6 +35,7 @@ impl Screen {
             notice_clock: None,
             playback_stopped: false,
             stop_cause: None,
+            output_guide: None,
             playback_ended: false,
             seen_reauthentications: 0,
             seen_skipped_segments: 0,
@@ -154,6 +155,7 @@ impl Screen {
             self.notice_hold_until = None;
             self.playback_stopped = false;
             self.stop_cause = None;
+            self.output_guide = None;
             self.playback_ended = false;
             self.seen_reauthentications = 0;
             self.seen_skipped_segments = 0;
@@ -161,10 +163,19 @@ impl Screen {
         }
         if update.stopped {
             self.playback_stopped = true;
-            if let Some(reason) = update.stop_reason {
-                self.stop_cause = Some(super::StopCause::from_update(reason));
+            match (update.stop_reason, update.output_failure) {
+                (Some(reason), _) => {
+                    self.stop_cause = Some(super::StopCause::from_update(reason));
+                    self.output_guide = None;
+                }
+                (None, Some(kind)) => {
+                    self.stop_cause = None;
+                    self.output_guide = Some(super::OutputGuide::from_update(kind));
+                }
+                (None, None) => {}
             }
         }
+        let output_failure = update.output_failure;
         if update.ended {
             self.playback_ended = true;
         }
@@ -220,6 +231,13 @@ impl Screen {
             self.app.playback = None;
         } else if let Some(snapshot) = update.snapshot {
             self.app.playback = Some(snapshot);
+        }
+        if !update.stopped
+            && output_failure.is_some()
+            && self.stop_cause.is_none()
+            && self.app.playback.is_none()
+        {
+            self.output_guide = output_failure.map(super::OutputGuide::from_update);
         }
         if let Some(count) = renewed {
             self.seen_reauthentications = count;
@@ -291,7 +309,22 @@ impl Screen {
             }
         }
         if let Some(notice) = update.notice {
-            self.playback_notice = match update.notice_kind {
+            // A prep failure before any output uses the same kind as a stop. The
+            // 「再生は続いています」 sentence is only for a snapshot that is still playing.
+            let kind = match update.notice_kind {
+                Some(radiko::app::playback::NoticeKind::AuthExpiredWhilePlaying)
+                    if self.app.playback.is_none() =>
+                {
+                    Some(radiko::app::playback::NoticeKind::AuthExpired)
+                }
+                Some(
+                    radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying
+                    | radiko::app::playback::NoticeKind::DeadlineWhilePlaying
+                    | radiko::app::playback::NoticeKind::ProbeTimeoutWhilePlaying,
+                ) if self.app.playback.is_none() => None,
+                other => other,
+            };
+            self.playback_notice = match kind {
                 Some(kind) => match update.notice_prefix {
                     Some(prefix) => {
                         format!("{prefix}: {}", super::messages::playback_notice(kind))
@@ -335,12 +368,14 @@ impl Screen {
         !self.playback_notice.is_empty()
             || !self.app.notification.is_empty()
             || !self.preferences_notice.is_empty()
+            || self.output_guide.is_some()
     }
     /// 通常画面の Esc。再生・一時停止・選択・条件と停止フラグは残す。
     fn dismiss_notices(&mut self) {
         self.playback_notice.clear();
         self.app.notification.clear();
         self.preferences_notice.clear();
+        self.output_guide = None;
         if matches!(
             self.notice_hold,
             super::NoticeHold::Action | super::NoticeHold::CatchUp | super::NoticeHold::AuthRenewal

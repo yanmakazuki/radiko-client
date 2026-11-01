@@ -171,6 +171,33 @@ impl StopCause {
         }
     }
 }
+/// Device-recovery text for the player column. Chosen from [`radiko::app::playback::OutputFailure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputGuide {
+    NoDevice,
+    UnsupportedFormat,
+    Device,
+    Stalled,
+}
+impl OutputGuide {
+    fn from_update(kind: radiko::app::playback::OutputFailure) -> Self {
+        use radiko::app::playback::OutputFailure;
+        match kind {
+            OutputFailure::NoDevice => Self::NoDevice,
+            OutputFailure::UnsupportedFormat => Self::UnsupportedFormat,
+            OutputFailure::Device => Self::Device,
+            OutputFailure::Stalled => Self::Stalled,
+        }
+    }
+    fn lines(self) -> &'static [&'static str] {
+        match self {
+            Self::NoDevice => &[messages::OUTPUT_NO_DEVICE, messages::OUTPUT_NO_RETRY],
+            Self::UnsupportedFormat => &[messages::OUTPUT_UNSUPPORTED, messages::OUTPUT_NO_RETRY],
+            Self::Device => &[messages::OUTPUT_DEVICE, messages::OUTPUT_NO_RETRY],
+            Self::Stalled => &[messages::OUTPUT_STALLED, messages::OUTPUT_NO_RETRY],
+        }
+    }
+}
 /// Why `playback_notice` is set. Gap text is cleared from this, not from the wording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoticeHold {
@@ -220,6 +247,9 @@ struct Screen {
     playback_stopped: bool,
     /// Auth expiry or reconnect limit, kept after the notice text is dismissed.
     stop_cause: Option<StopCause>,
+    /// Output-device recovery. Cleared by the next playback session or Esc.
+    /// Hidden while [`Self::stop_cause`] is set.
+    output_guide: Option<OutputGuide>,
     /// The control session ended (program end, stop, or failure). Gap notices stay off.
     playback_ended: bool,
     seen_reauthentications: u64,
