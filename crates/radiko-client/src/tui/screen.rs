@@ -317,11 +317,11 @@ impl Screen {
                 {
                     Some(radiko::app::playback::NoticeKind::AuthExpired)
                 }
-                Some(radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying)
-                    if self.app.playback.is_none() =>
-                {
-                    None
-                }
+                Some(
+                    radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying
+                    | radiko::app::playback::NoticeKind::DeadlineWhilePlaying
+                    | radiko::app::playback::NoticeKind::ProbeTimeoutWhilePlaying,
+                ) if self.app.playback.is_none() => None,
                 other => other,
             };
             self.playback_notice = match kind {

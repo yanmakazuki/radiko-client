@@ -9,6 +9,8 @@ pub(super) const AUTH_EXPIRED_CONTINUES: &str =
     "認証期限切れです。再生は続いています。a で再確認 / I で再ログイン";
 pub(super) const RECONNECT_CONTINUES: &str =
     "再接続の上限です。再生は続いています。番組を選び直してください";
+pub(super) const DEADLINE_CONTINUES: &str = "番組は終了しています。再生は続いています";
+pub(super) const PROBE_TIMEOUT_CONTINUES: &str = "切り替えられませんでした。再生は続いています";
 pub(super) const STREAM_AUTHENTICATION: &str =
     "配信認証が拒否されました。a で再確認 / I で再ログイン";
 pub(super) const OUTSIDE_AREA: &str = "この局は現在地のエリア外です（エリアフリー未加入）";
@@ -30,6 +32,8 @@ pub(super) fn playback_notice(kind: NoticeKind) -> String {
         NoticeKind::AuthExpired => AUTH_EXPIRED_STOP.to_owned(),
         NoticeKind::AuthExpiredWhilePlaying => AUTH_EXPIRED_CONTINUES.to_owned(),
         NoticeKind::ReconnectLimitWhilePlaying => RECONNECT_CONTINUES.to_owned(),
+        NoticeKind::DeadlineWhilePlaying => DEADLINE_CONTINUES.to_owned(),
+        NoticeKind::ProbeTimeoutWhilePlaying => PROBE_TIMEOUT_CONTINUES.to_owned(),
         NoticeKind::OutsideArea => OUTSIDE_AREA.to_owned(),
     }
 }

@@ -100,6 +100,10 @@ pub enum NoticeKind {
     AuthExpiredWhilePlaying,
     /// Preparation or switching failed, and the current playback is still running.
     ReconnectLimitWhilePlaying,
+    /// Switching to an ended slot failed, and the current playback is still running.
+    DeadlineWhilePlaying,
+    /// A switch-time output probe timed out, and the current playback is still running.
+    ProbeTimeoutWhilePlaying,
     OutsideArea,
 }
 /// `Some` when the TUI must replace the CLI sentence for this error.
@@ -114,7 +118,7 @@ pub fn notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
     }
 }
 /// Kind for a failure that leaves the current playback running.
-/// Auth expiry and the reconnect limit do not use their stop sentences here.
+/// These errors do not use their stop sentences while output is already open.
 pub fn continuing_notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
     if auth_expired_error(error) {
         return Some(NoticeKind::AuthExpiredWhilePlaying);
@@ -122,7 +126,13 @@ pub fn continuing_notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
     if reconnect_limit_error(error) {
         return Some(NoticeKind::ReconnectLimitWhilePlaying);
     }
-    notice_kind(error)
+    match error {
+        PlaybackError::Output(OutputError::Deadline) => Some(NoticeKind::DeadlineWhilePlaying),
+        PlaybackError::Output(OutputError::ProbeTimeout) => {
+            Some(NoticeKind::ProbeTimeoutWhilePlaying)
+        }
+        _ => notice_kind(error),
+    }
 }
 fn auth_expired_error(error: &PlaybackError) -> bool {
     match error {
@@ -3503,6 +3513,167 @@ mod tests {
             preparation_kind_while_output_is_open(true),
             Some(NoticeKind::ReconnectLimitWhilePlaying),
             "playback_active did not select the continuing reconnect kind"
+        );
+    }
+    /// Second-stream `create` fails. Only the expected kind unblocks the wait.
+    /// The opposite `playback_active` result times out instead of hanging.
+    fn wait_for_switch_failure(deadline: bool, while_playing: bool) -> String {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        let expected_kind = if deadline {
+            NoticeKind::DeadlineWhilePlaying
+        } else {
+            NoticeKind::ProbeTimeoutWhilePlaying
+        };
+        let stop_sentence = if deadline {
+            "再生切替失敗（現在の状態を維持）: 番組終了：放送終了日時に達したため音声を停止しました"
+        } else {
+            "再生切替失敗（現在の状態を維持）: 無音出力診断の実時間上限を超えたため停止しました"
+        };
+        let mut playing = info(3_600_000);
+        playing.starts_at -= chrono::Duration::hours(2);
+        playing.ends_at -= chrono::Duration::hours(2);
+        let cursor = playing.starts_at + chrono::Duration::hours(1);
+        let mut next = playing.clone();
+        next.station = "OBS".into();
+        next.starts_at = cursor;
+        next.ends_at = cursor + chrono::Duration::milliseconds(200);
+        let (tx, rx) = mpsc::channel();
+        let (found, received) = mpsc::channel();
+        let stop = StopToken::default();
+        let bytes = packet(24_000).repeat(16);
+        let mut controller = Controller::with_reporter(
+            rx,
+            stop.clone(),
+            move |_| {
+                Ok(Box::new(Source {
+                    info: next.clone(),
+                    events: VecDeque::from([event(bytes.clone(), false)]),
+                }) as Box<dyn SegmentSource>)
+            },
+            move |message, kind, _prefix, _output| {
+                let matched = if while_playing {
+                    message.contains("再生切替失敗") && kind == Some(expected_kind)
+                } else {
+                    message == stop_sentence && kind.is_none()
+                };
+                if matched {
+                    let _ = found.send(message);
+                }
+            },
+        );
+        if !while_playing {
+            tx.send(Command::Select(PlaybackRequest {
+                station: "OBS".into(),
+                mode: ProbeMode::TimeFree,
+                cursor,
+                position: Duration::ZERO,
+            }))
+            .unwrap();
+        }
+        let mut requested = false;
+        let send = tx.clone();
+        let quit = tx.clone();
+        let handle = thread::spawn(move || {
+            let got = received.recv_timeout(Duration::from_secs(3));
+            let _ = quit.send(Command::Stop);
+            got.unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for the {expected_kind:?} switch failure (while_playing={while_playing}); an inverted playback-active check does not report that kind"
+                )
+            })
+        });
+        let opens = AtomicUsize::new(0);
+        let initial = if while_playing {
+            Initial::Source(Box::new(Holding {
+                info: playing.clone(),
+                bytes: Some(packet(24_000).repeat(8)),
+            }) as Box<dyn SegmentSource>)
+        } else {
+            Initial::Idle(playing)
+        };
+        let report = play_loop(
+            initial,
+            None,
+            stop,
+            |snapshot| {
+                if while_playing
+                    && !requested
+                    && snapshot
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.frames > 0)
+                {
+                    requested = true;
+                    send.send(Command::Select(PlaybackRequest {
+                        station: "OBS".into(),
+                        mode: ProbeMode::TimeFree,
+                        cursor,
+                        position: Duration::ZERO,
+                    }))
+                    .unwrap();
+                }
+            },
+            move |pcm, maximum, remaining, token| {
+                let first = opens.fetch_add(1, Ordering::SeqCst) == 0;
+                if while_playing && first {
+                    sink(pcm, maximum, remaining, token)
+                } else {
+                    Err(if deadline {
+                        OutputError::Deadline
+                    } else {
+                        OutputError::ProbeTimeout
+                    })
+                }
+            },
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        handle.join().unwrap()
+    }
+    #[test]
+    fn deadline_switch_while_playing_reports_the_continuing_kind() {
+        wait_for_switch_failure(true, true);
+    }
+    #[test]
+    fn probe_timeout_switch_while_playing_reports_the_continuing_kind() {
+        wait_for_switch_failure(false, true);
+    }
+    #[test]
+    fn deadline_switch_with_nothing_playing_keeps_the_stop_sentence() {
+        assert_eq!(
+            wait_for_switch_failure(true, false),
+            "再生切替失敗（現在の状態を維持）: 番組終了：放送終了日時に達したため音声を停止しました"
+        );
+    }
+    #[test]
+    fn probe_timeout_switch_with_nothing_playing_keeps_the_stop_sentence() {
+        assert_eq!(
+            wait_for_switch_failure(false, false),
+            "再生切替失敗（現在の状態を維持）: 無音出力診断の実時間上限を超えたため停止しました"
         );
     }
 
