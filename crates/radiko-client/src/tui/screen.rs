@@ -320,7 +320,10 @@ impl Screen {
                 Some(
                     radiko::app::playback::NoticeKind::ReconnectLimitWhilePlaying
                     | radiko::app::playback::NoticeKind::DeadlineWhilePlaying
-                    | radiko::app::playback::NoticeKind::ProbeTimeoutWhilePlaying,
+                    | radiko::app::playback::NoticeKind::ProbeTimeoutWhilePlaying
+                    | radiko::app::playback::NoticeKind::SourceStalledWhilePlaying
+                    | radiko::app::playback::NoticeKind::EarlyEndWhilePlaying
+                    | radiko::app::playback::NoticeKind::StreamFailedWhilePlaying,
                 ) if self.app.playback.is_none() => None,
                 other => other,
             };

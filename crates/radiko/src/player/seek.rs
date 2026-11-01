@@ -85,6 +85,8 @@ pub struct Controller {
     pub(super) volume: u32,
     /// Set by the play loop from whether an output is open. Preparation before that is not playback.
     playback_active: bool,
+    #[cfg(test)]
+    prepare_stall_ms: Arc<AtomicU64>,
 }
 impl Controller {
     pub fn new(
@@ -162,7 +164,11 @@ impl Controller {
         let latest = Arc::new(Mutex::new(None::<Job>));
         let generation = Arc::new(AtomicU64::new(0));
         let (tx, results) = mpsc::sync_channel(1);
-        let (mailbox, ids, shutdown) = (latest.clone(), generation.clone(), stop.clone());
+        let stall_ms = Arc::new(AtomicU64::new(30_000));
+        #[cfg(test)]
+        let prepare_stall_ms = stall_ms.clone();
+        let (mailbox, ids, shutdown, stall_ms) =
+            (latest.clone(), generation.clone(), stop.clone(), stall_ms);
         let preparation_worker = thread::spawn(move || {
             while !shutdown.is_cancelled() {
                 let job = match mailbox.lock() {
@@ -192,8 +198,12 @@ impl Controller {
                     if job.stop.is_cancelled() {
                         return Err(PlaybackError::Worker);
                     }
-                    prepare_ready(source, job.stop.clone())
+                    let stall = Duration::from_millis(stall_ms.load(Ordering::Acquire));
+                    prepare_ready(source, job.stop.clone(), stall)
                 });
+                // `prepare_ready` drops its worker on failure. That drop cancels a
+                // child token, not `job.stop`. A cancelled `job.stop` is a user
+                // cancel (another selection, pause, or stop) and is not reported.
                 if job.id != ids.load(Ordering::Acquire) || job.stop.is_cancelled() {
                     continue;
                 }
@@ -228,7 +238,15 @@ impl Controller {
             paused: false,
             volume: 25,
             playback_active: false,
+            #[cfg(test)]
+            prepare_stall_ms,
         }
+    }
+    /// Shortens only the silence limit inside `prepare_ready`. Production stays at 30 seconds.
+    #[cfg(test)]
+    pub(crate) fn set_prepare_stall(&self, stall: Duration) {
+        let millis = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX);
+        self.prepare_stall_ms.store(millis, Ordering::Release);
     }
     /// Call only from the owning background control thread, after output has been stopped.
     /// Prevents a replacement session from accumulating workers blocked in old HTTP requests.

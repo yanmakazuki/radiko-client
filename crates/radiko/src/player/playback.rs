@@ -104,6 +104,12 @@ pub enum NoticeKind {
     DeadlineWhilePlaying,
     /// A switch-time output probe timed out, and the current playback is still running.
     ProbeTimeoutWhilePlaying,
+    /// The next stream produced no segment before the prepare limit, and playback continues.
+    SourceStalledWhilePlaying,
+    /// The next stream ended before its audio was ready, and playback continues.
+    EarlyEndWhilePlaying,
+    /// The next stream's worker failed, and playback continues.
+    StreamFailedWhilePlaying,
     OutsideArea,
 }
 /// `Some` when the TUI must replace the CLI sentence for this error.
@@ -131,7 +137,20 @@ pub fn continuing_notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
         PlaybackError::Output(OutputError::ProbeTimeout) => {
             Some(NoticeKind::ProbeTimeoutWhilePlaying)
         }
-        _ => notice_kind(error),
+        PlaybackError::SourceStalled => Some(NoticeKind::SourceStalledWhilePlaying),
+        PlaybackError::EarlyEnd => Some(NoticeKind::EarlyEndWhilePlaying),
+        PlaybackError::Decode(_) | PlaybackError::Worker => {
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        }
+        PlaybackError::Source(error) => match probe_notice_kind(error) {
+            Some(kind) => Some(kind),
+            None => Some(NoticeKind::StreamFailedWhilePlaying),
+        },
+        PlaybackError::Storage(_)
+        | PlaybackError::LoginRequired
+        | PlaybackError::Auth(_)
+        | PlaybackError::Output(_)
+        | PlaybackError::ReconnectGaveUp => notice_kind(error),
     }
 }
 fn auth_expired_error(error: &PlaybackError) -> bool {
@@ -779,9 +798,14 @@ pub(super) struct Ready {
 pub(super) fn prepare_ready(
     source: Box<dyn SegmentSource>,
     stop: StopToken,
+    stall_after: Duration,
 ) -> Result<Ready, PlaybackError> {
     let info = source.info().clone();
-    let (worker, rx) = worker(source, stop.clone());
+    // The worker token is a child of the caller's token. Dropping the worker
+    // cancels only that child so the decode thread exits. It does not mark the
+    // caller's token cancelled, which the preparation loop uses for a real
+    // user cancel (another selection, pause, or stop).
+    let (worker, rx) = worker(source, stop.child());
     let began = Instant::now();
     let mut primed: Option<DecodedPcm> = None;
     let mut segments = 0;
@@ -789,7 +813,7 @@ pub(super) fn prepare_ready(
         if stop.is_cancelled() {
             return Err(PlaybackError::Worker);
         }
-        if began.elapsed() > Duration::from_secs(30) {
+        if began.elapsed() > stall_after {
             return Err(PlaybackError::SourceStalled);
         }
         match rx.recv_timeout(Duration::from_millis(10)) {
@@ -3326,7 +3350,39 @@ mod tests {
             continuing_notice_kind(&PlaybackError::Output(OutputError::NoDevice)),
             None
         );
+        assert_eq!(notice_kind(&PlaybackError::SourceStalled), None);
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::SourceStalled),
+            Some(NoticeKind::SourceStalledWhilePlaying)
+        );
+        assert_eq!(notice_kind(&PlaybackError::EarlyEnd), None);
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::EarlyEnd),
+            Some(NoticeKind::EarlyEndWhilePlaying)
+        );
+        let failed = PlaybackError::Source(ProbeError::Network);
+        assert_eq!(notice_kind(&failed), None);
+        assert_eq!(
+            continuing_notice_kind(&failed),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
         assert!(expired.to_string().contains("再生を停止しました"));
+        assert!(
+            PlaybackError::SourceStalled
+                .to_string()
+                .contains("停止しました")
+        );
+        assert!(
+            !PlaybackError::SourceStalled
+                .to_string()
+                .contains("再生は続いています")
+        );
+        assert!(
+            !PlaybackError::EarlyEnd
+                .to_string()
+                .contains("再生は続いています")
+        );
+        assert!(!failed.to_string().contains("再生は続いています"));
         assert!(failure_notice(&expired).contains("再生を停止しました"));
         assert!(reconnect.to_string().contains("再生を停止しました"));
         assert!(failure_notice(&reconnect).contains("再生を停止しました"));
@@ -3675,6 +3731,380 @@ mod tests {
             wait_for_switch_failure(false, false),
             "再生切替失敗（現在の状態を維持）: 無音出力診断の実時間上限を超えたため停止しました"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SecondPrepFault {
+        SourceStalled,
+        Failed,
+        EarlyEnd,
+    }
+    /// Second preparation fails after its worker has started.
+    /// A missing report fails the bounded wait. The stall limit is not the 30s production value.
+    fn wait_for_second_prep(
+        fault: SecondPrepFault,
+        while_playing: bool,
+    ) -> (String, Option<NoticeKind>) {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        struct Failing {
+            info: StreamInfo,
+            fault: SecondPrepFault,
+        }
+        impl SegmentSource for Failing {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                match self.fault {
+                    SecondPrepFault::Failed => Err(ProbeError::Network),
+                    SecondPrepFault::EarlyEnd => Ok(Next::End),
+                    SecondPrepFault::SourceStalled => Ok(Next::Pending(Duration::from_millis(1))),
+                }
+            }
+        }
+        let stop_sentence = match fault {
+            SecondPrepFault::SourceStalled => {
+                "再生準備失敗（現在の状態を維持）: 30秒間新しいセグメントを確認できないため停止しました"
+            }
+            SecondPrepFault::Failed => {
+                "再生準備失敗（現在の状態を維持）: 配信取得: 配信の検証中に通信に失敗しました"
+            }
+            SecondPrepFault::EarlyEnd => {
+                "再生準備失敗（現在の状態を維持）: 放送枠末尾より前に配信が終了しました"
+            }
+        };
+        let expected_kind = match fault {
+            SecondPrepFault::SourceStalled => NoticeKind::SourceStalledWhilePlaying,
+            SecondPrepFault::Failed => NoticeKind::StreamFailedWhilePlaying,
+            SecondPrepFault::EarlyEnd => NoticeKind::EarlyEndWhilePlaying,
+        };
+        let mut playing = info(3_600_000);
+        playing.starts_at -= chrono::Duration::hours(2);
+        playing.ends_at -= chrono::Duration::hours(2);
+        let cursor = playing.starts_at + chrono::Duration::hours(1);
+        let template = playing.clone();
+        let (tx, rx) = mpsc::channel();
+        let (found, received) = mpsc::channel();
+        let stop = StopToken::default();
+        let mut controller = Controller::with_reporter(
+            rx,
+            stop.clone(),
+            move |request| {
+                let mut selected = template.clone();
+                selected.station = request.station.clone();
+                selected.starts_at = request.cursor;
+                selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                selected.position = request.position;
+                Ok(Box::new(Failing {
+                    info: selected,
+                    fault,
+                }) as Box<dyn SegmentSource>)
+            },
+            move |message, kind, _prefix, _output| {
+                let matched = if while_playing {
+                    message.starts_with("再生準備失敗（現在の状態を維持）: ")
+                        && kind == Some(expected_kind)
+                } else {
+                    message == stop_sentence && kind.is_none()
+                };
+                if matched {
+                    let _ = found.send((message, kind));
+                }
+            },
+        );
+        if matches!(fault, SecondPrepFault::SourceStalled) {
+            controller.set_prepare_stall(Duration::from_millis(15));
+        }
+        let request = PlaybackRequest {
+            station: "OBS".into(),
+            mode: ProbeMode::TimeFree,
+            cursor,
+            position: Duration::ZERO,
+        };
+        if !while_playing {
+            tx.send(Command::Select(request.clone())).unwrap();
+        }
+        let mut requested = false;
+        let send = tx.clone();
+        let quit = tx.clone();
+        let handle = thread::spawn(move || {
+            let got = received.recv_timeout(Duration::from_secs(3));
+            let _ = quit.send(Command::Stop);
+            got.unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for the {fault:?} preparation failure (while_playing={while_playing}); a dropped post-start error does not report that kind"
+                )
+            })
+        });
+        let initial = if while_playing {
+            Initial::Source(Box::new(Holding {
+                info: playing.clone(),
+                bytes: Some(packet(24_000).repeat(8)),
+            }) as Box<dyn SegmentSource>)
+        } else {
+            Initial::Idle(playing)
+        };
+        let report = play_loop(
+            initial,
+            None,
+            stop,
+            |snapshot| {
+                if while_playing
+                    && !requested
+                    && snapshot
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.frames > 0)
+                {
+                    requested = true;
+                    send.send(Command::Select(request.clone())).unwrap();
+                }
+            },
+            sink,
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        if while_playing {
+            assert!(
+                report.output.is_some(),
+                "the first stream's output was not open"
+            );
+        }
+        handle.join().unwrap()
+    }
+    #[test]
+    fn active_playback_reports_source_stalled_while_the_next_prep_is_running() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::SourceStalled, true);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 30秒間新しいセグメントを確認できないため停止しました"
+        );
+        assert_eq!(kind, Some(NoticeKind::SourceStalledWhilePlaying));
+    }
+    #[test]
+    fn active_playback_reports_worker_failure_while_the_next_prep_is_running() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::Failed, true);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 配信取得: 配信の検証中に通信に失敗しました"
+        );
+        assert_eq!(kind, Some(NoticeKind::StreamFailedWhilePlaying));
+    }
+    #[test]
+    fn active_playback_reports_early_end_while_the_next_prep_is_running() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::EarlyEnd, true);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 放送枠末尾より前に配信が終了しました"
+        );
+        assert_eq!(kind, Some(NoticeKind::EarlyEndWhilePlaying));
+    }
+    #[test]
+    fn idle_source_stalled_prep_keeps_the_stop_sentence() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::SourceStalled, false);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 30秒間新しいセグメントを確認できないため停止しました"
+        );
+        assert_eq!(kind, None);
+        assert!(message.contains("停止しました"));
+        assert!(!message.contains("再生は続いています"));
+    }
+    #[test]
+    fn idle_worker_failure_prep_keeps_the_stop_sentence() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::Failed, false);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 配信取得: 配信の検証中に通信に失敗しました"
+        );
+        assert_eq!(kind, None);
+        assert!(!message.contains("再生は続いています"));
+    }
+    #[test]
+    fn idle_early_end_prep_keeps_the_stop_sentence() {
+        let (message, kind) = wait_for_second_prep(SecondPrepFault::EarlyEnd, false);
+        assert_eq!(
+            message,
+            "再生準備失敗（現在の状態を維持）: 放送枠末尾より前に配信が終了しました"
+        );
+        assert_eq!(kind, None);
+        assert!(!message.contains("再生は続いています"));
+    }
+    #[test]
+    fn replacing_the_next_prep_after_its_worker_starts_reports_nothing() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        struct WaitForCancel {
+            info: StreamInfo,
+            stop: StopToken,
+            entered: mpsc::Sender<()>,
+            announced: bool,
+        }
+        impl SegmentSource for WaitForCancel {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                if !self.announced {
+                    self.announced = true;
+                    let _ = self.entered.send(());
+                }
+                let began = Instant::now();
+                while !self.stop.is_cancelled() {
+                    if began.elapsed() > Duration::from_secs(2) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(ProbeError::Network)
+            }
+        }
+        let mut playing = info(3_600_000);
+        playing.starts_at -= chrono::Duration::hours(2);
+        playing.ends_at -= chrono::Duration::hours(2);
+        let cursor = playing.starts_at + chrono::Duration::hours(1);
+        let template = playing.clone();
+        let (tx, rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let (switched_tx, switched_rx) = mpsc::channel();
+        let stop = StopToken::default();
+        let audio = packet(24_000).repeat(80);
+        let mut controller = Controller::with_cancellable_reporter(
+            rx,
+            stop.clone(),
+            move |request, job_stop| {
+                let mut selected = template.clone();
+                selected.station = request.station.clone();
+                selected.starts_at = request.cursor;
+                selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                selected.position = request.position;
+                if request.station == "OBS" {
+                    Ok(Box::new(WaitForCancel {
+                        info: selected,
+                        stop: job_stop,
+                        entered: entered_tx.clone(),
+                        announced: false,
+                    }) as Box<dyn SegmentSource>)
+                } else {
+                    Ok(Box::new(Holding {
+                        info: selected,
+                        bytes: Some(audio.clone()),
+                    }) as Box<dyn SegmentSource>)
+                }
+            },
+            move |message, kind, _prefix, _output| {
+                if message.starts_with("再生準備失敗") {
+                    let _ = failed_tx.send((message, kind));
+                } else if message == "再生切替完了: QRR / TimeFree" {
+                    let _ = switched_tx.send(());
+                }
+            },
+        );
+        let mut requested = false;
+        let send = tx.clone();
+        let select_next = tx.clone();
+        let quit = tx.clone();
+        let handle = thread::spawn(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the second stream's worker did not start");
+            select_next
+                .send(Command::Select(PlaybackRequest {
+                    station: "QRR".into(),
+                    mode: ProbeMode::TimeFree,
+                    cursor,
+                    position: Duration::ZERO,
+                }))
+                .unwrap();
+            switched_rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for the replacement stream; a stuck prepare does not finish the switch"
+                )
+            });
+            match failed_rx.recv_timeout(Duration::from_millis(200)) {
+                Err(mpsc::RecvTimeoutError::Timeout)
+                | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Ok((message, kind)) => {
+                    panic!("user cancel reported {kind:?}: {message}")
+                }
+            }
+            let _ = quit.send(Command::Stop);
+        });
+        let report = play_loop(
+            Initial::Source(Box::new(Holding {
+                info: playing,
+                bytes: Some(packet(24_000).repeat(8)),
+            }) as Box<dyn SegmentSource>),
+            None,
+            stop,
+            |snapshot| {
+                if !requested
+                    && snapshot
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.frames > 0)
+                {
+                    requested = true;
+                    send.send(Command::Select(PlaybackRequest {
+                        station: "OBS".into(),
+                        mode: ProbeMode::TimeFree,
+                        cursor,
+                        position: Duration::ZERO,
+                    }))
+                    .unwrap();
+                }
+            },
+            sink,
+            Some(&mut controller),
+        )
+        .unwrap();
+        assert_eq!(report.reason, EndReason::Cancelled);
+        handle.join().unwrap();
     }
 
     const WINDOW_LOST: &str =

@@ -507,6 +507,8 @@ fn help_quotes_the_output_guide_sentences() {
     assert!(help.contains("再生が続いているあいだは「再生を停止しました」を出しません。"));
     assert!(help.contains("番組は終了しています。再生は続いています"));
     assert!(help.contains("切り替えられませんでした。再生は続いています"));
+    assert!(help.contains("新しいセグメントを確認できません。再生は続いています"));
+    assert!(help.contains("配信が途中で終わりました。再生は続いています"));
 }
 
 #[test]
@@ -554,6 +556,64 @@ fn deadline_and_probe_timeout_switch_text_follows_whether_playback_continues() {
         });
         assert_eq!(idle.playback_notice, raw);
         assert!(idle.app.playback.is_none());
+        let narrow = content_rows(&mut idle, 80, 24).join("\n");
+        assert!(narrow.contains("再生中: なし"), "{narrow}");
+        assert!(!narrow.contains(continues), "{narrow}");
+    }
+}
+
+#[test]
+fn prep_failure_while_playing_replaces_the_stop_sentence() {
+    let prefix = "再生準備失敗（現在の状態を維持）";
+    let cases = [
+        (
+            radiko::app::playback::NoticeKind::SourceStalledWhilePlaying,
+            "30秒間新しいセグメントを確認できないため停止しました",
+            "新しいセグメントを確認できません。再生は続いています",
+        ),
+        (
+            radiko::app::playback::NoticeKind::EarlyEndWhilePlaying,
+            "放送枠末尾より前に配信が終了しました",
+            "配信が途中で終わりました。再生は続いています",
+        ),
+        (
+            radiko::app::playback::NoticeKind::StreamFailedWhilePlaying,
+            "配信取得: 配信の検証中に通信に失敗しました",
+            "切り替えられませんでした。再生は続いています",
+        ),
+    ];
+    for (kind, stop_body, continues) in cases {
+        let raw = format!("{prefix}: {stop_body}");
+        let continued = format!("{prefix}: {continues}");
+        let mut playing = super::screen();
+        playing.app.playback = Some(playing_snapshot());
+        playing.apply_playback(radiko::app::playback::Update {
+            snapshot: Some(playing_snapshot()),
+            notice: Some(raw.clone()),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(playing.playback_notice, continued);
+        assert!(
+            !playing.playback_notice.contains("停止しました"),
+            "{continued}"
+        );
+        let shown = content_rows(&mut playing, 160, 40).join("\n");
+        assert!(shown.contains("再生中:"), "{shown}");
+        assert!(shown.contains(continues), "{shown}");
+        assert!(!shown.contains("停止しました"), "{shown}");
+
+        let mut idle = super::screen();
+        idle.apply_playback(radiko::app::playback::Update {
+            notice: Some(raw.clone()),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(idle.playback_notice, raw);
+        assert!(idle.app.playback.is_none());
+        assert!(!idle.playback_notice.contains("再生は続いています"));
         let narrow = content_rows(&mut idle, 80, 24).join("\n");
         assert!(narrow.contains("再生中: なし"), "{narrow}");
         assert!(!narrow.contains(continues), "{narrow}");
