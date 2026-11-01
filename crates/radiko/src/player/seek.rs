@@ -93,6 +93,9 @@ pub struct Controller {
     /// only contains that instant is another slot. CLI cursors are the
     /// requested time, so this stays off for the CLI controller.
     compare_schedule_start: Arc<AtomicBool>,
+    /// Last completed job's slot-mismatch bit. Tests read it after the play loop returns.
+    #[cfg(test)]
+    last_slot_mismatch: AtomicBool,
     #[cfg(test)]
     prepare_stall_ms: Arc<AtomicU64>,
 }
@@ -273,8 +276,15 @@ impl Controller {
             playback_active: false,
             compare_schedule_start,
             #[cfg(test)]
+            last_slot_mismatch: AtomicBool::new(false),
+            #[cfg(test)]
             prepare_stall_ms,
         }
+    }
+    /// Whether the latest completed preparation was an internal slot mismatch.
+    #[cfg(test)]
+    pub(crate) fn last_slot_mismatch(&self) -> bool {
+        self.last_slot_mismatch.load(Ordering::Acquire)
     }
     /// The TUI identifies a slot by its schedule start. Enable the
     /// `starts_at != cursor` mismatch check. The CLI controller leaves this off.
@@ -472,10 +482,16 @@ impl Controller {
             self.pending_target = None;
             match completed.result {
                 Ok(ready) => {
+                    #[cfg(test)]
+                    self.last_slot_mismatch
+                        .store(completed.slot_mismatch, Ordering::Release);
                     self.pending = None;
                     return Some(ready);
                 }
                 Err(error) => {
+                    #[cfg(test)]
+                    self.last_slot_mismatch
+                        .store(completed.slot_mismatch, Ordering::Release);
                     let kind_override = (completed.slot_mismatch && self.playback_active)
                         .then_some(crate::player::playback::NoticeKind::StreamFailedWhilePlaying);
                     self.report_failure_with(

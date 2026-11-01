@@ -21,7 +21,7 @@
 
 TestBackend の 80×24 と 160×40 で、再生中の各文を行全体の完全一致で確かめた。接頭辞を戻すと 80×24 の完全一致は失敗する。デコードとワーカーの対応を外すと、その二つのテストが失敗する。`InvalidPosition` と `Http` を汎用の文へ戻すと、それぞれの種類のテストが失敗する。
 
-準備結果が要求と一致しない経路と、今の枠と一致しない経路は、再生中に汎用の文になる。`factory` が `InvalidPosition` を返すのは、利用者が指定した位置が枠の外のときである。そのときは位置の文のままである。不一致の経路を `InvalidPosition` の種類へ戻すと、そのテストが失敗する。`Display` と CLI の文は変えていない。番組表の開始と配信の開始が違うときは、TUI だけが再生中に汎用の文にする。CLI の Controller は、要求した時刻が枠の途中でも、その比較をしない。その比較を CLI にも戻すと、live と timefree の途中時刻の選択は準備へ進まず、そのテストが失敗する。要求の不一致、枠の不一致、開始の不一致のどれかを外すと、不一致の配信がデコードされ、そのテストが失敗する。
+準備結果が要求と一致しない経路と、今の枠と一致しない経路は、再生中に汎用の文になる。`factory` が `InvalidPosition` を返すのは、利用者が指定した位置が枠の外のときである。そのときは位置の文のままである。不一致の経路を `InvalidPosition` の種類へ戻すと、そのテストが失敗する。`Display` と CLI の文は変えていない。番組表の開始と配信の開始が違うときは、TUI だけが再生中に汎用の文にする。CLI の Controller は、要求した時刻が枠の途中でも、その比較をしない。その比較を CLI にも戻すと、live と timefree の途中時刻の選択は準備へ進まず、そのテストが失敗する。要求の不一致、枠の不一致、開始の不一致のどれかを外すと、先に種類の検証が失敗する。期待は `slot_mismatch` が立った `StreamFailedWhilePlaying` である。デコード回数の検証はそのあとである。
 
 確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 458 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 test` も同じオプションで 458 件成功、失敗 0、ignored 2 件である。radiko への通信と実機の再生はない。macOS はこの環境では実行していない。
 

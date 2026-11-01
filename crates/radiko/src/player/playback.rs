@@ -3641,15 +3641,19 @@ mod tests {
                         selected.starts_at = request.cursor;
                         selected.position = request.position;
                         selected.ends_at = request.cursor + chrono::Duration::hours(3);
+                        // The seek sits 10s into the slot. One short segment ends before
+                        // that point, so preparation would wait out the stall. Keep enough
+                        // audio that a removed `same_slot` check reaches the kind report.
                         Ok(Box::new(Quiet {
                             info: selected,
                             polls: polls_for_source.clone(),
-                            audio: Some(audio.clone()),
+                            audio: Some(audio.repeat(8)),
                         }) as Box<dyn SegmentSource>)
                     }
                 },
                 move |message, kind, _prefix, _output| {
-                    if message.starts_with("再生準備失敗") {
+                    if message.starts_with("再生準備失敗") || message.starts_with("再生切替完了")
+                    {
                         let _ = found.send((message, kind));
                     }
                 },
@@ -3658,18 +3662,9 @@ mod tests {
             let mut requested = false;
             let send = tx.clone();
             let quit = tx.clone();
-            let seen_polls = polls.clone();
             let handle = thread::spawn(move || {
                 let began = Instant::now();
-                let (message, kind) = loop {
-                    if seen_polls.load(Ordering::SeqCst) > 0 {
-                        let _ = quit.send(Command::Stop);
-                        assert_eq!(
-                            seen_polls.load(Ordering::SeqCst),
-                            0,
-                            "{case:?} mismatched source was decoded; expected StreamFailedWhilePlaying 「切り替えられませんでした。再生は続いています」 and rejection before decode"
-                        );
-                    }
+                let report = loop {
                     if let Ok(report) = received.try_recv() {
                         break report;
                     }
@@ -3680,7 +3675,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(2));
                 };
                 let _ = quit.send(Command::Stop);
-                (message, kind)
+                report
             });
             let initial = if while_playing {
                 Initial::Source(Box::new(Holding {
@@ -3736,29 +3731,48 @@ mod tests {
             .unwrap();
             assert_eq!(report.reason, EndReason::Cancelled);
             let (message, kind) = handle.join().unwrap();
-            assert!(
-                message.contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
-                "Display and CLI text must stay the InvalidPosition sentence: {message}"
-            );
-            assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
             match case {
                 Mismatch::Request | Mismatch::Slot | Mismatch::ScheduleStart => {
                     assert_eq!(
-                        kind,
-                        Some(NoticeKind::StreamFailedWhilePlaying),
-                        "internal mismatch must show 「切り替えられませんでした。再生は続いています」, not 「指定した位置は番組の範囲外です。再生は続いています」. report={message}"
+                        (kind, controller.last_slot_mismatch()),
+                        (Some(NoticeKind::StreamFailedWhilePlaying), true),
+                        "{case:?} must report StreamFailedWhilePlaying from the slot-mismatch path (slot_mismatch set), 「切り替えられませんでした。再生は続いています」. report={message}"
                     );
+                    assert_eq!(
+                        polls.load(Ordering::SeqCst),
+                        0,
+                        "{case:?} mismatched source was decoded"
+                    );
+                    assert!(
+                        message
+                            .contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+                        "Display and CLI text must stay the InvalidPosition sentence: {message}"
+                    );
+                    assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
                     assert_ne!(kind, Some(NoticeKind::InvalidPositionWhilePlaying));
                 }
                 Mismatch::UserPosition => {
                     assert_eq!(
-                        kind,
-                        Some(NoticeKind::InvalidPositionWhilePlaying),
-                        "a user position error must show 「指定した位置は番組の範囲外です。再生は続いています」"
+                        (kind, controller.last_slot_mismatch()),
+                        (Some(NoticeKind::InvalidPositionWhilePlaying), false),
+                        "a user position error must show 「指定した位置は番組の範囲外です。再生は続いています」. report={message}"
                     );
+                    assert!(
+                        message
+                            .contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+                        "Display and CLI text must stay the InvalidPosition sentence: {message}"
+                    );
+                    assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
                 }
                 Mismatch::IdleRequest | Mismatch::IdleScheduleStart => {
                     assert_eq!(kind, None);
+                    assert!(controller.last_slot_mismatch());
+                    assert!(
+                        message
+                            .contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+                        "Display and CLI text must stay the InvalidPosition sentence: {message}"
+                    );
+                    assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
                     assert!(!message.contains("再生は続いています"));
                     assert!(!message.contains("指定した位置は番組の範囲外です"));
                 }
