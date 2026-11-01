@@ -4,9 +4,9 @@
 
 ## 2026年11月1日：ログイン失敗と終了後の案内は a を先にする
 
-TUI のログイン失敗は「{エラー} / a で再確認 / I で再ログイン」である。80 桁の画面でも `a` が見える。TUI を抜けたあとの標準エラーで、未ログインは「a 再確認 / Iでログインしてください」、セッション失効は「a 再確認 / Iで再ログインしてください」である。句の中身は変えず、順番だけ入れ替えている。`login` や `session` というコマンド名は足していない。CLI の `login` と `session` の出力は変えていない。`tui.rs` の「sessionで保存状態を確認してください」も変えていない。
+TUI のログイン失敗は「{エラー} / a で再確認 / I で再ログイン」である。80 桁の画面でも `a` が見える。TUI を抜けたあとの標準エラーで、未ログインは「a で再確認 / I でログインしてください」、セッション失効は「a で再確認 / I で再ログインしてください」である。句の中身は変えず、順番だけ入れ替えている。`login` や `session` というコマンド名は足していない。CLI の `login` と `session` の出力は変えていない。`tui.rs` の「sessionで保存状態を確認してください」も変えていない。
 
-確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 424 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 424 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 426 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 426 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
 
 ## 2026年11月1日：TUI の認証案内を I と a にする
 

@@ -124,7 +124,6 @@ impl Drop for OutputRelease {
         self.0.store(true, Ordering::Release);
     }
 }
-#[cfg(test)]
 type TestSink = Arc<
     dyn Fn(
             &crate::player::aac::DecodedPcm,
@@ -142,7 +141,6 @@ pub struct Service {
     mailbox: Arc<Mutex<Update>>,
     running: Option<Running>,
     volume: u32,
-    #[cfg(test)]
     test_sink: Option<TestSink>,
 }
 /// This preflight does not establish listening permission. The stream resolver checks it again.
@@ -245,11 +243,9 @@ impl Service {
             mailbox: Arc::new(Mutex::new(Update::default())),
             running: None,
             volume: 25,
-            #[cfg(test)]
             test_sink: None,
         }
     }
-    #[cfg(test)]
     fn with_test_sink(
         factory: impl Fn(
             PlaybackRequest,
@@ -334,7 +330,6 @@ impl Service {
                     ..Update::default()
                 };
             }
-            #[cfg(test)]
             let test_sink = self.test_sink.clone();
             let output_released = Arc::new(AtomicBool::new(false));
             let released_flag = output_released.clone();
@@ -358,7 +353,6 @@ impl Service {
                         update.snapshot = Some(snapshot);
                     }
                 };
-                #[cfg(test)]
                 let result = if let Some(create) = test_sink {
                     playback::play_idle_with(
                         idle,
@@ -372,8 +366,6 @@ impl Service {
                 } else {
                     playback::play_session(idle, shutdown, &mut controls, report)
                 };
-                #[cfg(not(test))]
-                let result = playback::play_session(idle, shutdown, &mut controls, report);
                 drop(released);
                 if let Ok(mut update) = finished.lock() {
                     update.ended = true;
@@ -483,6 +475,119 @@ impl Service {
         }
         update
     }
+    /// One in-memory session that ends in auth expiry. Tests follow this update into the TUI.
+    pub fn auth_expired_final_update(program: &Program, now: DateTime<FixedOffset>) -> Update {
+        let info = StreamInfo {
+            title: Some(program.title.clone()),
+            station: program.key.station_id.clone(),
+            mode: ProbeMode::TimeFree,
+            starts_at: program.key.starts_at,
+            ends_at: program.key.starts_at + chrono::Duration::milliseconds(200),
+            position: Duration::ZERO,
+        };
+        let bytes = short_adts();
+        let mut service = Self::with_test_sink(
+            move |_, _| {
+                Ok(Box::new(AuthExpiredAfterAudio {
+                    info: info.clone(),
+                    bytes: Some(bytes.clone()),
+                }))
+            },
+            Arc::new(|pcm, _, _, _| {
+                Ok(Box::new(MemorySink {
+                    rate: pcm.summary.sample_rate,
+                    channels: pcm.summary.channels,
+                }))
+            }),
+        );
+        service
+            .select(program, now)
+            .expect("the slot can be selected");
+        let started = Instant::now();
+        loop {
+            let update = service.poll();
+            if update.stopped && update.ended && update.notice.is_some() {
+                return update;
+            }
+            if started.elapsed() > Duration::from_secs(3) {
+                panic!("auth expired playback did not finish");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+struct AuthExpiredAfterAudio {
+    info: StreamInfo,
+    bytes: Option<Vec<u8>>,
+}
+impl SegmentSource for AuthExpiredAfterAudio {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+    fn poll_segment(
+        &mut self,
+    ) -> Result<crate::api::stream::playback::Next, crate::api::stream::ProbeError> {
+        if let Some(bytes) = self.bytes.take() {
+            return Ok(crate::api::stream::playback::Next::Segment(
+                crate::api::stream::playback::Segment {
+                    initialization: None,
+                    duration: None,
+                    bytes,
+                    codec: Some("mp4a.40.2".into()),
+                    discontinuity: false,
+                    starts_at: Some(self.info.starts_at),
+                },
+            ));
+        }
+        Err(crate::api::stream::ProbeError::AuthExpired)
+    }
+}
+struct MemorySink {
+    rate: u32,
+    channels: u16,
+}
+impl playback::AudioSink for MemorySink {
+    fn enqueue(
+        &mut self,
+        pcm: &crate::player::aac::DecodedPcm,
+        cursor: &mut usize,
+    ) -> Result<bool, crate::player::output::OutputError> {
+        *cursor = pcm.samples.len();
+        Ok(true)
+    }
+    fn accepted(&self) -> u64 {
+        0
+    }
+    fn summary(&self) -> crate::player::output::OutputSummary {
+        crate::player::output::OutputSummary {
+            frames: 0,
+            underrun_frames: 0,
+            sample_rate: self.rate,
+            channels: self.channels,
+            sample_format: crate::player::output::OutputSampleFormat::F32,
+        }
+    }
+    fn poll(&mut self) -> Result<bool, crate::player::output::OutputError> {
+        Ok(false)
+    }
+    fn finish(&mut self) {}
+}
+fn short_adts() -> Vec<u8> {
+    use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, write_adts_header};
+    let mut encoder = AacEncoder::new(AacEncoderConfig::default());
+    let samples: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.1).sin() * 0.1).collect();
+    encoder.push_pcm(&samples, 1, 24_000).unwrap();
+    encoder.finish();
+    let packet = encoder.next_packet().unwrap();
+    let mut bytes = write_adts_header(&AdtsHeader {
+        object_type: 2,
+        sample_rate: 24_000,
+        channels: 1,
+        frame_length: packet.data.len() + 7,
+        header_len: 7,
+    });
+    bytes.extend(packet.data);
+    bytes.repeat(8)
 }
 impl Drop for Service {
     fn drop(&mut self) {

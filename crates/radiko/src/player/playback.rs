@@ -844,9 +844,7 @@ pub fn play_session(
     )
 }
 /// Test sessions use a stand-in device. Production playback stays on `play_session`.
-#[cfg(test)]
 pub(crate) struct BoxedSink(pub Box<dyn AudioSink + Send>);
-#[cfg(test)]
 impl AudioSink for BoxedSink {
     fn configure(&self, paused: bool, volume: u32) {
         self.0.configure(paused, volume);
@@ -873,7 +871,6 @@ impl AudioSink for BoxedSink {
         self.0.queued_frames()
     }
 }
-#[cfg(test)]
 pub(crate) fn play_idle_with<S: AudioSink>(
     idle: StreamInfo,
     stop: StopToken,

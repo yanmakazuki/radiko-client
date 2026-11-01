@@ -224,6 +224,73 @@ fn playback_wording_follows_the_error_kind_and_not_the_notice_text() {
 }
 
 #[test]
+fn final_auth_expired_result_is_the_tui_stop_sentence() {
+    let program = radiko::api::catalog::parse_programs(
+        include_bytes!("../../../../../tests/fixtures/schedule.xml"),
+        "TBS",
+        radiko::api::catalog::parse_day("20261015").unwrap(),
+    )
+    .unwrap()
+    .programs
+    .remove(0);
+    let update =
+        radiko::app::playback::Service::auth_expired_final_update(&program, program.ends_at);
+    let mut screen = screen();
+    screen.apply_playback(update);
+    assert_eq!(
+        screen.playback_notice,
+        "認証期限切れのため再生を停止しました。a で再確認 / I で再ログイン"
+    );
+}
+
+#[test]
+fn paired_key_guidance_matches_the_literals_with_recheck_before_login() {
+    assert_eq!(
+        super::super::messages::SESSION_EXPIRED,
+        "セッション失効。a で再確認 / I で再ログイン"
+    );
+    assert_eq!(
+        super::super::messages::AUTH_EXPIRED_STOP,
+        "認証期限切れのため再生を停止しました。a で再確認 / I で再ログイン"
+    );
+    assert_eq!(
+        super::super::messages::STREAM_AUTHENTICATION,
+        "配信認証が拒否されました。a で再確認 / I で再ログイン"
+    );
+    let help = super::super::help::KEYS;
+    let help_line = |prefix: &str| {
+        help.lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing help line: {prefix}"))
+    };
+    assert_eq!(
+        help_line("未ログインは"),
+        "未ログインは「未ログインです。I でログイン」。二つのキーを並べる案内は「a で再確認 / I で再ログイン」の順です。"
+    );
+    assert_eq!(
+        help_line("セッション失効は"),
+        "セッション失効は「セッション失効。a で再確認 / I で再ログイン」。"
+    );
+    assert_eq!(
+        help_line("認証期限切れで止めた通知は"),
+        "認証期限切れで止めた通知は「認証期限切れのため再生を停止しました。a で再確認 / I で再ログイン」。"
+    );
+    assert_eq!(
+        radiko::app::auth::Status::LoginFailed(radiko::api::auth::AuthError::InvalidCredentials)
+            .detail(),
+        "ログインに失敗しました。メールアドレスとパスワードを確認してください / a で再確認 / I で再ログイン"
+    );
+    assert_eq!(
+        radiko::app::auth::Status::SignedOut.detail(),
+        "a で再確認 / I でログインしてください"
+    );
+    assert_eq!(
+        radiko::app::auth::Status::Expired.detail(),
+        "a で再確認 / I で再ログインしてください"
+    );
+}
+
+#[test]
 fn auth_expired_tui_notice_survives_a_later_reconnect_snapshot() {
     let mut screen = screen();
     show_failure(

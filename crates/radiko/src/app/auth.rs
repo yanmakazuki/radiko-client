@@ -69,13 +69,13 @@ impl Status {
                 "ログアウト処理が異常終了しました / O 再試行 / a 保存状態を確認".into()
             }
             Self::LogoutFailed(error) => format!("{error} / O 再試行 / a 保存状態を確認"),
-            Self::SignedOut => "a 再確認 / Iでログインしてください".into(),
+            Self::SignedOut => "a で再確認 / I でログインしてください".into(),
             Self::Verified(membership) => format!(
                 "エリアフリー: {} / 30日: {} / 再生可否は番組ごとに確認 / a 再確認 / O ログアウト",
                 flag(membership.area_free),
                 flag(membership.time_free_30)
             ),
-            Self::Expired => "a 再確認 / Iで再ログインしてください".into(),
+            Self::Expired => "a で再確認 / I で再ログインしてください".into(),
             Self::StorageFailed(error) => format!("{error} / loginで再ログイン / a 再確認"),
             Self::CheckFailed(error) => format!("{error} / a 再確認"),
             Self::WorkerFailed => "認証確認処理が異常終了しました / a 再確認".into(),
@@ -737,10 +737,10 @@ mod tests {
         }
         let expired = check_saved(&store, &flag, |_| Err(AuthError::SessionExpired));
         assert_eq!(expired, Status::Expired);
-        assert_eq!(expired.detail(), "a 再確認 / Iで再ログインしてください");
+        assert_eq!(expired.detail(), "a で再確認 / I で再ログインしてください");
         assert_eq!(
             Status::SignedOut.detail(),
-            "a 再確認 / Iでログインしてください"
+            "a で再確認 / I でログインしてください"
         );
         let unknown = check_saved(&store, &flag, |_| Err(AuthError::Network));
         assert_eq!(unknown, Status::CheckFailed(AuthError::Network));
