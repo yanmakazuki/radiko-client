@@ -207,7 +207,7 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
 }
 fn auth_header_line(screen: &Screen) -> String {
     let summary = screen.app.authentication.status.summary();
-    if screen.playback_notice.contains("認証期限切れ") {
+    if screen.stop_cause == Some(super::StopCause::AuthExpired) {
         format!("{summary} / 再生側で認証失敗 / a 再確認")
     } else if screen.playback_notice.contains("配信認証を更新") {
         format!("{summary} / 配信認証を更新して継続")
@@ -392,7 +392,12 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
                     .unwrap_or_else(|| "番組内位置未確認".into())
             )
         })
-        .unwrap_or_else(|| format!("再生中: なし / 音量{}%", screen.volume));
+        .unwrap_or_else(|| {
+            screen
+                .stop_cause
+                .map(|cause| cause.player_line().to_owned())
+                .unwrap_or_else(|| format!("再生中: なし / 音量{}%", screen.volume))
+        });
     let controls = screen.control_hint();
     let pipeline = screen
         .app

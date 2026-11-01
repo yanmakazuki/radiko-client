@@ -1,9 +1,16 @@
 //! 検索とライブ／タイムフリー再生のTUI。描画処理は状態を参照するだけで、通信や再生を実行しない。
 macro_rules! quit_key_wording {
     () => {
-        "通常画面のq / Esc、またはCtrl+Cで終了"
+        "通常画面のq、またはCtrl+Cで終了"
     };
 }
+macro_rules! dismiss_notice_wording {
+    () => {
+        "通常画面のEscは出ている通知を消す。このEscでは終了案内を出さない。通知がなければ「終了は q（または Ctrl+C）」を出し、もう一度Escで消す。停止文・受信待ち・再接続中は案内に替えない"
+    };
+}
+/// 通知がない通常画面の Esc。終了はしない。
+pub(super) const QUIT_HINT: &str = "終了は q（または Ctrl+C）";
 macro_rules! logout_key_wording {
     () => {
         "ログアウトはyで確定、n / Esc / qで取消"
@@ -76,6 +83,9 @@ use std::{
 /// 番組一覧の終了キー。画面内ヘルプと `tui --help` は同じ句を使う。
 #[cfg(test)]
 const QUIT_KEY_WORDING: &str = quit_key_wording!();
+/// 通常画面の Esc。終了句とは別に、画面内ヘルプと `tui --help` で同じ句を使う。
+#[cfg(test)]
+const DISMISS_NOTICE_WORDING: &str = dismiss_notice_wording!();
 /// ログアウト確認。どのダイアログでも `q` は閉じるだけで、ここでは取消でありログアウトしない。
 #[cfg(test)]
 const LOGOUT_KEY_WORDING: &str = logout_key_wording!();
@@ -84,6 +94,8 @@ const DIALOG_CLOSE_HINT: &str = dialog_close_hint!();
 const USAGE: &str = concat!(
     "tui [programsと同じ局・地域・期間・絞り込み]\n/ キーワード編集 / f 全条件編集 / b 名前付き条件 / Enter 検索確定 / Esc 編集取消 / j k・上下 選択 / PageUp・PageDown ページ / Home・End 先頭・末尾 / e 取得状況 / r 再取得 / ",
     quit_key_wording!(),
+    "。",
+    dismiss_notice_wording!(),
     "\nEnter TF再生 / v ライブ画面 / l ライブ / g 秒数指定 / Space 一時停止・再開 / s 停止 / 左右 15秒シーク / + - 音量\n引数省略は前回条件を当日1日に復元。再生は保存済みログインを使用。起動時にセッションを確認し、aで再確認。I ログイン / O ",
     logout_key_wording!(),
     "。c チャプター閲覧 / 一覧のr 再取得・Esc 詳細へ。ライブ画面のEnterはライブ再生、vで戻ります。チャプターのEnterは原点を照合できた枠のみ指定位置から再生します。"
@@ -134,6 +146,26 @@ enum PlaybackAction {
 /// outage has passed 30 seconds. Confirmed stop messages are not on this timer.
 const NOTICE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A stop whose reason stays on the player line after Esc dismisses the notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopCause {
+    AuthExpired,
+    ReconnectLimit,
+}
+impl StopCause {
+    fn from_update(reason: radiko::app::playback::StopReason) -> Self {
+        match reason {
+            radiko::app::playback::StopReason::AuthExpired => Self::AuthExpired,
+            radiko::app::playback::StopReason::ReconnectLimit => Self::ReconnectLimit,
+        }
+    }
+    fn player_line(self) -> &'static str {
+        match self {
+            Self::AuthExpired => "停止中：認証期限切れ（a で再確認）",
+            Self::ReconnectLimit => "停止中：再接続できませんでした（番組を選び直してください）",
+        }
+    }
+}
 /// Why `playback_notice` is set. Gap text is cleared from this, not from the wording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoticeHold {
@@ -181,6 +213,8 @@ struct Screen {
     notice_clock: Option<std::time::Instant>,
     /// Set from a failed playback update. Not inferred from the notice text.
     playback_stopped: bool,
+    /// Auth expiry or reconnect limit, kept after the notice text is dismissed.
+    stop_cause: Option<StopCause>,
     /// The control session ended (program end, stop, or failure). Gap notices stay off.
     playback_ended: bool,
     seen_reauthentications: u64,
@@ -245,13 +279,13 @@ async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(
     }
     screen.dispatch_named(jobs.named);
     if let Some(event) = jobs.login.poll().await {
-        screen.app.authentication.apply(event);
+        screen.apply_authentication(event);
     }
     if let Some(event) = jobs.logout.poll().await {
-        screen.app.authentication.apply(event);
+        screen.apply_authentication(event);
     }
     if let Some(event) = jobs.authentication.poll().await {
-        screen.app.authentication.apply(event);
+        screen.apply_authentication(event);
     }
     for event in jobs.search.poll().await {
         screen.apply(event);
@@ -449,7 +483,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                         event.status.summary(),
                         event.status.detail()
                     ));
-                    screen.app.authentication.apply(event);
+                    screen.apply_authentication(event);
                 }
                 if logout.busy() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -464,7 +498,7 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
                         event.status.summary(),
                         event.status.detail()
                     ));
-                    screen.app.authentication.apply(event);
+                    screen.apply_authentication(event);
                 }
                 if login_service.busy() {
                     tokio::time::sleep(Duration::from_millis(5)).await;

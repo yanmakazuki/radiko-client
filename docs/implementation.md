@@ -4,6 +4,50 @@
 
 いまの仕様は [機能設計](design.md)、コードの分かれ方は [アーキテクチャ](architecture.md)、確認範囲の要約は [検証範囲](validation.md) です。このファイルの古い節にある「未実装」「未接続」は、その日の状態です。別の日付や別のビルドの成功は足し合わせません。取得できたこと、PCM を作れたこと、音声コールバックへ渡したフレーム数は、聴こえたことや全局への対応とは別です。
 
+## 2026年10月31日：停止中のプレイヤー行を文面の完全一致で確かめる
+
+`StopCause::player_line` を `assert_eq!` でそのまま比べる。認証期限切れは「停止中：認証期限切れ（a で再確認）」、再接続上限は「停止中：再接続できませんでした（番組を選び直してください）」である。空白を除く描画比較は使っていない。製品の表示は変えていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 416 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 416 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+
+## 2026年10月31日：停止理由は再生エラーの型から渡す
+
+認証期限切れと再接続上限の停止理由は、通知文面との一致では決めない。`app::playback` が再生結果のエラー型から `StopReason` を作り、`Update.stop_reason` で TUI に渡す。TUI は `stopped` のときだけその理由を立てる。停止ではない更新に同じ文面や理由値があっても、プレイヤー行の「停止中：」は出ない。表示と、新しい再生・再確認・再ログインで消える条件は変えていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 414 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 414 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+
+## 2026年10月31日：認証期限切れと再接続上限の停止表示は Esc のあとも残る
+
+停止理由は通知文とは別の状態である。認証期限切れと再接続上限だけを区別する。プレイヤー行は「停止中：認証期限切れ（a で再確認）」または「停止中：再接続できませんでした（番組を選び直してください）」である。認証行の「再生側で認証失敗 / a 再確認」も、通知文ではなく認証期限切れの状態から出す。Esc は停止文だけを消し、この行と認証ヒントは残す。通知が空なら終了案内を出してよいが、停止表示は上書きしない。新しい再生を始めると消える。`a` の再確認か再ログインが成功したときも消え、失敗したときは残る。窓落ちと番組終了の表示は変えていない。停止フラグと再生の動きは変えていない。検索失敗の通知が Esc で消える扱いは変えていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 412 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 412 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+
+## 2026年10月31日：終了案内は受信待ちと再接続中を5秒隠さない
+
+終了案内「終了は q（または Ctrl+C）」は `show_notice` を使わない。`playback_notice` にその文を入れ、`notice_hold` は `Other`、`notice_hold_until` はなしである。5秒保持がないので、案内の直後の再生更新で「受信待ち…」と「再接続中…（N秒）」がすぐ出る。認証期限切れと再接続上限は、停止文とは別に停止理由を状態として持ち、プレイヤー行に「停止中：認証期限切れ（a で再確認）」または「停止中：再接続できませんでした（番組を選び直してください）」を残す。Esc で文を消してもこの行は残る。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 411 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 411 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+
+## 2026年10月31日：通知がない通常画面の Esc は終了案内を出す
+
+番組一覧とライブ一覧で通知がないときの Esc は「終了は q（または Ctrl+C）」を出す。もう一度 Esc でその案内だけを消す。どちらも `Ok(false)` で、再生・一時停止・選択・条件は変えない。出ている通知を消す Esc では案内を出さない。停止文、受信待ち、再接続中も消すだけで、案内には替えない。
+
+認証期限切れと再接続上限の停止文を Esc で消しても、プレイヤー行の「停止中：」とその再開方法は残る。認証行の「再生側で認証失敗 / a 再確認」も停止状態から出す。窓落ちや番組終了は、これまでどおり「再生中: なし / 音量N%」と停止文であり、「停止中：」にはしない。出力カウンターの「停止時:」は理由ではない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 410 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 clippy` と同じオプションのテストも 410 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。radiko への通信と実機の再生はない。
+
+## 2026年10月31日：通常画面の Esc では終了しない
+
+番組一覧とライブ一覧の Esc は終了しない。`key()` は `Ok(false)` を返し、フッターの再生通知、検索の失敗、条件保存やオフラインの案内を消す。通知がなければ何もしない。再生中のスナップショット、一時停止、選択、確定済みの条件、音量、停止フラグは変えない。停止の操作は出さない。終了は `q` と Ctrl+C で、どちらも `Ok(true)` である。
+
+認証期限切れと再接続上限の停止文も、いま出ている通知なので Esc で消す。停止フラグは残す。そのあとの再接続中、追いつき、配信認証の更新は、これまでどおり停止フラグがあるあいだは置き換えない。再生は戻らない。「受信待ち…」と「再接続中…（N秒）」は、止まっていない再生で条件が続いていれば、次の再生スナップショットで再び出る。
+
+チャプター表示の Esc は詳細へ戻る。そのとき通知は消さない。もう一度 Esc を押しても終了せず、通常画面の通知だけを消す。操作一覧、取得状況、名前付き条件、条件編集、ログイン、秒指定の Esc は変えていない。ログアウト確認の `q` は取消のままである。
+
+画面内ヘルプ、`tui --help`、操作バー、README、設計の終了の説明は「通常画面のq、またはCtrl+Cで終了」に揃えた。Esc で終了するとは書かない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 408 件成功、失敗 0、ignored 2 件（`native_muted`）である。件数は各 `test result` 行の成功数を足した。`cargo +1.85.0 clippy` と同じオプションのテストも 408 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 58 件成功である。radiko への通信と実機の再生はない。実機の TUI で Esc を押した聴感は未確認である。
+
 ## 2026年10月31日：検証の要約と画面内ヘルプを現行の CI に合わせる
 
 画面内ヘルプの「Macの出力先を確認し、番組一覧で対象を選びEnterで再生し直してください。」を、「音声の出力先（OSのサウンド設定）を確認し、番組一覧で対象を選びEnterで再生し直してください。」に変えた。`tui --help` の文言は変えていない。
@@ -290,7 +334,7 @@ Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e
 
 再生中のプレイリスト、初期化情報、音声セグメントが HTTP 401 のとき、保存してある会員セッションで `authenticate` を1回やり直し、新しいトークンでその要求を1回取り直す。セグメントと初期化情報は、取り直す前にプレイリストも取り直し、通し番号は成功したバイト列のあとだけ進める。再認証が失敗したときと、取り直しも 401 のときは「認証期限切れ」で停止する。成功した再認証から20秒は、次の 401 で `authenticate` を呼ばず、持っているトークンで1回だけ取り直す。403 と 429 は再認証しない。HTTP 層の再試行対象は変えていない。
 
-TUI は、再認証が完了したとき認証行と再生通知に更新を出し、「認証期限切れ」で止まったとき認証行に「再生側で認証失敗 / a 再確認」を足す。通信診断に残すのは回数だけで、トークンは出さない。
+TUI は、再認証が完了したとき認証行と再生通知に更新を出し、「認証期限切れ」で止まったとき認証行に「再生側で認証失敗 / a 再確認」を足す。このヒントとプレイヤー行の「停止中：認証期限切れ（a で再確認）」は停止状態から出し、Esc で通知文を消しても残る。再接続上限は「停止中：再接続できませんでした（番組を選び直してください）」である。新しい再生、または `a` と再ログインの成功で消え、失敗では残る。通信診断に残すのは回数だけで、トークンは出さない。
 
 確認は Linux、Rust 1.99.1 である。`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features` は 318 件成功した。ignored 4 件（ローカル待受の HTTP 2 件と、ミュート実機出力 2 件）はそのままである。モックの Fetch で、プレイリスト・セグメント・初期化情報の 401 のあと1回の再認証で継続すること、2回目の 401 と再認証失敗が通し番号を進めずに「認証期限切れ」になること、429・403・503 が再認証しないこと、再認証中の取り消しが次の取得へ進まないこと、20秒以内は再認証しないことを確認した。表示とエラー文字列にトークンは出ていない。Rust 1.85 では再ビルドしていない。radiko の実トークン期限切れ、日本からの接続、90分以上のライブでの復旧は確認していない。アカウントも実通信も使っていない。
 

@@ -34,6 +34,7 @@ impl Screen {
             notice_hold_until: None,
             notice_clock: None,
             playback_stopped: false,
+            stop_cause: None,
             playback_ended: false,
             seen_reauthentications: 0,
             seen_skipped_segments: 0,
@@ -152,6 +153,7 @@ impl Screen {
             self.notice_hold = super::NoticeHold::Other;
             self.notice_hold_until = None;
             self.playback_stopped = false;
+            self.stop_cause = None;
             self.playback_ended = false;
             self.seen_reauthentications = 0;
             self.seen_skipped_segments = 0;
@@ -159,6 +161,9 @@ impl Screen {
         }
         if update.stopped {
             self.playback_stopped = true;
+            if let Some(reason) = update.stop_reason {
+                self.stop_cause = Some(super::StopCause::from_update(reason));
+            }
         }
         if update.ended {
             self.playback_ended = true;
@@ -299,10 +304,42 @@ impl Screen {
         self.notice_hold = super::NoticeHold::Action;
         self.notice_hold_until = Some(now + super::NOTICE_HOLD);
     }
+    pub(super) fn apply_authentication(&mut self, event: radiko::app::auth::Event) {
+        let was_verified = matches!(
+            self.app.authentication.status,
+            radiko::app::auth::Status::Verified(_)
+        );
+        self.app.authentication.apply(event);
+        let verified = matches!(
+            self.app.authentication.status,
+            radiko::app::auth::Status::Verified(_)
+        );
+        if verified && !was_verified {
+            self.stop_cause = None;
+        }
+    }
     pub(super) fn show_notice(&mut self, notice: impl Into<String>) {
         let now = self.playback_now();
         self.playback_notice = notice.into();
         self.hold_action(now);
+    }
+    fn has_footer_notice(&self) -> bool {
+        !self.playback_notice.is_empty()
+            || !self.app.notification.is_empty()
+            || !self.preferences_notice.is_empty()
+    }
+    /// 通常画面の Esc。再生・一時停止・選択・条件と停止フラグは残す。
+    fn dismiss_notices(&mut self) {
+        self.playback_notice.clear();
+        self.app.notification.clear();
+        self.preferences_notice.clear();
+        if matches!(
+            self.notice_hold,
+            super::NoticeHold::Action | super::NoticeHold::CatchUp | super::NoticeHold::AuthRenewal
+        ) {
+            self.notice_hold = super::NoticeHold::Other;
+            self.notice_hold_until = None;
+        }
     }
     pub(super) fn rows(&self) -> &[usize] {
         if self.live_mode {
@@ -777,7 +814,20 @@ impl Screen {
     }
     fn key_browser(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('q') => return Ok(true),
+            // 通常画面の Esc は終了しない。出ている通知は消すだけ。無いときは終了案内を出す。
+            // 停止文・受信待ち・再接続中も通知なので消し、同じ Esc では案内に替えない。
+            KeyCode::Esc => {
+                if self.has_footer_notice() {
+                    self.dismiss_notices();
+                } else {
+                    // 5秒保持にすると、直後の受信待ち・再接続中・追いつきが隠れる。
+                    self.playback_notice = super::QUIT_HINT.into();
+                    self.notice_hold = super::NoticeHold::Other;
+                    self.notice_hold_until = None;
+                }
+                return Ok(false);
+            }
             KeyCode::Char('?') => {
                 self.help_open = true;
                 self.help_scroll = scroll::Scroll::default();
@@ -970,8 +1020,13 @@ impl Screen {
         } else {
             "Enter TF再生 / v ライブ画面 / l ライブ / f 条件 / b 保存条件 / c チャプター"
         };
+        let tail = if self.app.chapters.target.is_some() {
+            "q・Esc 詳細へ / Ctrl+C 終了"
+        } else {
+            "Esc 通知を消す・終了案内 / q・Ctrl+C 終了"
+        };
         format!(
-            "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / q・Esc・Ctrl+C 終了"
+            "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / {tail}"
         )
     }
 }
