@@ -3501,6 +3501,184 @@ mod tests {
         );
         assert_eq!(error.to_string(), "再生ワーカーが予期せず終了しました");
     }
+    /// Internal slot disagreement is not a position the user asked for.
+    /// Display stays `InvalidPosition`. The TUI kind does not.
+    #[test]
+    fn internal_slot_mismatch_while_playing_uses_the_generic_switch_sentence() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        #[derive(Clone, Copy, Debug)]
+        enum Mismatch {
+            Request,
+            Slot,
+            UserPosition,
+            IdleRequest,
+        }
+        struct Quiet {
+            info: StreamInfo,
+        }
+        impl SegmentSource for Quiet {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                panic!("a rejected source must not be decoded");
+            }
+        }
+        struct Holding {
+            info: StreamInfo,
+            bytes: Option<Vec<u8>>,
+        }
+        impl SegmentSource for Holding {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                Ok(match self.bytes.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        for case in [
+            Mismatch::Request,
+            Mismatch::Slot,
+            Mismatch::UserPosition,
+            Mismatch::IdleRequest,
+        ] {
+            let while_playing = !matches!(case, Mismatch::IdleRequest);
+            let mut playing = info(3_600_000);
+            playing.starts_at -= chrono::Duration::hours(2);
+            playing.ends_at -= chrono::Duration::hours(2);
+            let cursor = playing.starts_at + chrono::Duration::hours(1);
+            let template = playing.clone();
+            let (tx, rx) = mpsc::channel();
+            let (found, received) = mpsc::channel();
+            let stop = StopToken::default();
+            let mut controller = Controller::with_reporter(
+                rx,
+                stop.clone(),
+                move |request| match case {
+                    Mismatch::UserPosition => {
+                        Err(PlaybackError::Source(ProbeError::InvalidPosition))
+                    }
+                    Mismatch::Request | Mismatch::IdleRequest => {
+                        let mut selected = template.clone();
+                        selected.station = "ZZZ".into();
+                        Ok(Box::new(Quiet { info: selected }) as Box<dyn SegmentSource>)
+                    }
+                    Mismatch::Slot => {
+                        let mut selected = template.clone();
+                        selected.station = request.station.clone();
+                        selected.mode = request.mode;
+                        selected.starts_at = request.cursor;
+                        selected.position = request.position;
+                        selected.ends_at = request.cursor + chrono::Duration::hours(3);
+                        Ok(Box::new(Quiet { info: selected }) as Box<dyn SegmentSource>)
+                    }
+                },
+                move |message, kind, _prefix, _output| {
+                    if message.starts_with("再生準備失敗") {
+                        let _ = found.send((message, kind));
+                    }
+                },
+            );
+            let mut requested = false;
+            let send = tx.clone();
+            let quit = tx.clone();
+            let handle = thread::spawn(move || {
+                let (message, kind) = received
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_else(|_| {
+                        panic!("timed out waiting for the {case:?} preparation report")
+                    });
+                let _ = quit.send(Command::Stop);
+                (message, kind)
+            });
+            let initial = if while_playing {
+                Initial::Source(Box::new(Holding {
+                    info: playing.clone(),
+                    bytes: Some(packet(24_000).repeat(8)),
+                }) as Box<dyn SegmentSource>)
+            } else {
+                Initial::Idle(playing.clone())
+            };
+            if !while_playing {
+                tx.send(Command::Select(PlaybackRequest {
+                    station: playing.station.clone(),
+                    mode: playing.mode,
+                    cursor: playing.starts_at,
+                    position: Duration::ZERO,
+                }))
+                .unwrap();
+            }
+            let report = play_loop(
+                initial,
+                None,
+                stop,
+                |snapshot| {
+                    if while_playing
+                        && !requested
+                        && snapshot
+                            .output
+                            .as_ref()
+                            .is_some_and(|output| output.frames > 0)
+                    {
+                        requested = true;
+                        let command = if matches!(case, Mismatch::Slot) {
+                            Command::Seek(Duration::from_secs(10))
+                        } else {
+                            Command::Select(PlaybackRequest {
+                                station: "OBS".into(),
+                                mode: ProbeMode::TimeFree,
+                                cursor,
+                                position: Duration::ZERO,
+                            })
+                        };
+                        send.send(command).unwrap();
+                    }
+                },
+                sink,
+                Some(&mut controller),
+            )
+            .unwrap();
+            assert_eq!(report.reason, EndReason::Cancelled);
+            let (message, kind) = handle.join().unwrap();
+            assert!(
+                message.contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+                "Display and CLI text must stay the InvalidPosition sentence: {message}"
+            );
+            assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
+            match case {
+                Mismatch::Request | Mismatch::Slot => {
+                    assert_eq!(
+                        kind,
+                        Some(NoticeKind::StreamFailedWhilePlaying),
+                        "internal mismatch must show 「切り替えられませんでした。再生は続いています」, not 「指定した位置は番組の範囲外です。再生は続いています」. report={message}"
+                    );
+                    assert_ne!(kind, Some(NoticeKind::InvalidPositionWhilePlaying));
+                }
+                Mismatch::UserPosition => {
+                    assert_eq!(
+                        kind,
+                        Some(NoticeKind::InvalidPositionWhilePlaying),
+                        "a user position error must show 「指定した位置は番組の範囲外です。再生は続いています」"
+                    );
+                }
+                Mismatch::IdleRequest => {
+                    assert_eq!(kind, None);
+                    assert!(!message.contains("再生は続いています"));
+                    assert!(!message.contains("指定した位置は番組の範囲外です"));
+                }
+            }
+        }
+    }
     #[test]
     fn idle_preparation_failure_reports_the_stop_kind_not_the_continuing_sentence() {
         use super::super::seek::{Command, Controller, PlaybackRequest};

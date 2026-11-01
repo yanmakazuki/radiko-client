@@ -17,11 +17,13 @@
 - `InvalidPosition`：「指定した位置は番組の範囲外です。再生は続いています」
 - `Http`：「切り替え先の配信を取得できませんでした。再生は続いています」
 
-`InvalidPosition` と `Http` は、再生中に汎用の「切り替えられませんでした。再生は続いています」へまとめない。`At` の内側も同じ種類である。デコード失敗とワーカー終了は、短い理由がないので汎用の文のままである。何も再生していないときの `notice_kind` は、これまでどおり `None` である。
+利用者が指定した `InvalidPosition` と `Http` は、再生中に汎用の「切り替えられませんでした。再生は続いています」へまとめない。`At` の内側も同じ種類である。準備した配信が要求や今の枠と一致しない内部の不一致は位置の指定ではないので、再生中は汎用の文にする。そのエラーの `Display` と CLI の文は `InvalidPosition` のままである。デコード失敗とワーカー終了は、短い理由がないので汎用の文のままである。何も再生していないときの `notice_kind` は、これまでどおり `None` である。
 
 TestBackend の 80×24 と 160×40 で、再生中の各文を行全体の完全一致で確かめた。接頭辞を戻すと 80×24 の完全一致は失敗する。デコードとワーカーの対応を外すと、その二つのテストが失敗する。`InvalidPosition` と `Http` を汎用の文へ戻すと、それぞれの種類のテストが失敗する。
 
-確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 455 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 test` も同じオプションで 455 件成功、失敗 0、ignored 2 件である。radiko への通信と実機の再生はない。macOS はこの環境では実行していない。
+準備結果が要求と一致しない経路と、今の枠と一致しない経路は、再生中に汎用の文になる。利用者が `InvalidPosition` を返した準備は、位置の文のままである。不一致の経路を `InvalidPosition` の種類へ戻すと、そのテストが失敗する。`Display` と CLI の文は変えていない。
+
+確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features -- --test-threads=8` は 457 件成功、失敗 0、ignored 2 件である。`cargo +1.85.0 test` も同じオプションで 457 件成功、失敗 0、ignored 2 件である。radiko への通信と実機の再生はない。macOS はこの環境では実行していない。
 
 ## 2026年11月1日：再生中の次の準備失敗を捨てない
 

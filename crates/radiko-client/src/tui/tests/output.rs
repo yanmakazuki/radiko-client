@@ -617,6 +617,48 @@ fn prep_failure_while_playing_replaces_the_stop_sentence() {
     }
 }
 
+#[test]
+fn slot_mismatch_sentence_is_not_the_position_sentence() {
+    let generic = "切り替えられませんでした。再生は続いています";
+    let position = "指定した位置は番組の範囲外です。再生は続いています";
+    let mut mismatch = super::screen();
+    mismatch.app.playback = Some(playing_snapshot());
+    mismatch.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(playing_snapshot()),
+        notice: Some(
+            "再生準備失敗（現在の状態を維持）: 配信取得: シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+                .into(),
+        ),
+        notice_kind: Some(radiko::app::playback::NoticeKind::StreamFailedWhilePlaying),
+        notice_prefix: Some("再生準備失敗（現在の状態を維持）"),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(mismatch.playback_notice, generic);
+    assert!(
+        !mismatch
+            .playback_notice
+            .contains("指定した位置は番組の範囲外です")
+    );
+    assert_full_notice_row(&mut mismatch, 80, 24, generic);
+    assert_full_notice_row(&mut mismatch, 160, 40, generic);
+
+    let mut chosen = super::screen();
+    chosen.app.playback = Some(playing_snapshot());
+    chosen.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(playing_snapshot()),
+        notice: Some(
+            "再生準備失敗（現在の状態を維持）: 配信取得: シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+                .into(),
+        ),
+        notice_kind: Some(radiko::app::playback::NoticeKind::InvalidPositionWhilePlaying),
+        notice_prefix: Some("再生準備失敗（現在の状態を維持）"),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(chosen.playback_notice, position);
+    assert_full_notice_row(&mut chosen, 80, 24, position);
+    assert_full_notice_row(&mut chosen, 160, 40, position);
+}
+
 fn assert_full_notice_row(screen: &mut Screen, width: u16, height: u16, sentence: &str) {
     let rows = content_rows(screen, width, height);
     assert!(

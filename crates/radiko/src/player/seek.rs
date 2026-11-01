@@ -62,6 +62,10 @@ struct Job {
 struct Completed {
     id: u64,
     result: Result<Ready, PlaybackError>,
+    /// The prepared stream did not match the request or the current slot.
+    /// The error stays `InvalidPosition` so Display and CLI text stay the same.
+    /// While playback continues, the TUI must not call that a user position.
+    slot_mismatch: bool,
 }
 type Reporter = dyn FnMut(
         String,
@@ -182,32 +186,46 @@ impl Controller {
                 if job.stop.is_cancelled() {
                     continue;
                 }
-                let result = factory(job.request.clone(), job.stop.clone()).and_then(|source| {
-                    let info = source.info();
-                    let same_slot = job.expected.as_ref().is_none_or(|expected| {
-                        expected.station == info.station
-                            && expected.starts_at == info.starts_at
-                            && expected.ends_at == info.ends_at
-                            && expected.mode == info.mode
-                    });
-                    if !job.request.matches(info) || !same_slot {
-                        return Err(PlaybackError::Source(
-                            crate::api::stream::ProbeError::InvalidPosition,
-                        ));
+                let (result, slot_mismatch) = match factory(job.request.clone(), job.stop.clone()) {
+                    Err(error) => (Err(error), false),
+                    Ok(source) => {
+                        let info = source.info();
+                        let same_slot = job.expected.as_ref().is_none_or(|expected| {
+                            expected.station == info.station
+                                && expected.starts_at == info.starts_at
+                                && expected.ends_at == info.ends_at
+                                && expected.mode == info.mode
+                        });
+                        // A live slot can move, or the source can disagree with the
+                        // request, without the user naming a position. Keep
+                        // `InvalidPosition` for Display and CLI. The flag tells the
+                        // TUI this is not a user position error.
+                        if !job.request.matches(info) || !same_slot {
+                            (
+                                Err(PlaybackError::Source(
+                                    crate::api::stream::ProbeError::InvalidPosition,
+                                )),
+                                true,
+                            )
+                        } else if job.stop.is_cancelled() {
+                            (Err(PlaybackError::Worker), false)
+                        } else {
+                            let stall = Duration::from_millis(stall_ms.load(Ordering::Acquire));
+                            (prepare_ready(source, job.stop.clone(), stall), false)
+                        }
                     }
-                    if job.stop.is_cancelled() {
-                        return Err(PlaybackError::Worker);
-                    }
-                    let stall = Duration::from_millis(stall_ms.load(Ordering::Acquire));
-                    prepare_ready(source, job.stop.clone(), stall)
-                });
+                };
                 // `prepare_ready` drops its worker on failure. That drop cancels a
                 // child token, not `job.stop`. A cancelled `job.stop` is a user
                 // cancel (another selection, pause, or stop) and is not reported.
                 if job.id != ids.load(Ordering::Acquire) || job.stop.is_cancelled() {
                     continue;
                 }
-                let mut value = Completed { id: job.id, result };
+                let mut value = Completed {
+                    id: job.id,
+                    result,
+                    slot_mismatch,
+                };
                 loop {
                     if shutdown.is_cancelled() || job.id != ids.load(Ordering::Acquire) {
                         break;
@@ -266,11 +284,20 @@ impl Controller {
     /// CLI text stays `{prefix}: {error}`. The kind and prefix let the TUI replace that error.
     /// The continuing sentence is only for a failure while output is already open.
     pub(super) fn report_failure(&mut self, prefix: &'static str, error: &PlaybackError) {
-        let kind = if self.playback_active {
+        self.report_failure_with(prefix, error, None);
+    }
+    /// `kind_override` is the path decision. Display and the `{prefix}: {error}` CLI line stay.
+    fn report_failure_with(
+        &mut self,
+        prefix: &'static str,
+        error: &PlaybackError,
+        kind_override: Option<crate::player::playback::NoticeKind>,
+    ) {
+        let kind = kind_override.or(if self.playback_active {
             crate::player::playback::continuing_notice_kind(error)
         } else {
             crate::player::playback::notice_kind(error)
-        };
+        });
         let shown_prefix = kind.map(|_| prefix);
         let output = crate::player::playback::output_failure(error);
         (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix, output);
@@ -428,7 +455,13 @@ impl Controller {
                     return Some(ready);
                 }
                 Err(error) => {
-                    self.report_failure("再生準備失敗（現在の状態を維持）", &error);
+                    let kind_override = (completed.slot_mismatch && self.playback_active)
+                        .then_some(crate::player::playback::NoticeKind::StreamFailedWhilePlaying);
+                    self.report_failure_with(
+                        "再生準備失敗（現在の状態を維持）",
+                        &error,
+                        kind_override,
+                    );
                 }
             }
             self.pending = None;
