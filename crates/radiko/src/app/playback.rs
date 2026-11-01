@@ -1646,4 +1646,109 @@ mod tests {
             Some("通信が長く途切れたため、続きを再生できなくなりました。番組を選び直してください")
         );
     }
+    /// The TUI service opts into the schedule-start check. This test must not.
+    #[test]
+    fn service_schedule_start_mismatch_while_playing_reports_stream_failed_kind() {
+        use crate::api::stream::playback::{Next, Segment};
+        use std::sync::atomic::AtomicUsize;
+        struct Scheduled {
+            info: StreamInfo,
+            audio: Option<Vec<u8>>,
+            polls: Arc<AtomicUsize>,
+        }
+        impl SegmentSource for Scheduled {
+            fn info(&self) -> &StreamInfo {
+                &self.info
+            }
+            fn poll_segment(&mut self) -> Result<Next, crate::api::stream::ProbeError> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                Ok(match self.audio.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: Some("mp4a.40.2".into()),
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mismatched_polls = Arc::new(AtomicUsize::new(0));
+        let polls_for_source = mismatched_polls.clone();
+        let opened = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let bytes = adts_frames();
+        let mut service = Service::with_factory(move |request| {
+            let mut info = StreamInfo {
+                title: None,
+                station: request.station.clone(),
+                mode: request.mode,
+                starts_at: request.cursor,
+                ends_at: request.cursor + chrono::Duration::milliseconds(200),
+                position: request.position,
+            };
+            let audio = bytes.clone();
+            if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                info.starts_at = request.cursor - chrono::Duration::milliseconds(100);
+                info.ends_at = request.cursor + chrono::Duration::milliseconds(100);
+                return Ok(Box::new(Scheduled {
+                    info,
+                    audio: Some(audio),
+                    polls: polls_for_source.clone(),
+                }) as Box<dyn SegmentSource>);
+            }
+            Ok(Box::new(Scheduled {
+                info,
+                audio: Some(audio),
+                polls: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn SegmentSource>)
+        });
+        service.test_sink = Some(flag_sink(opened.clone(), closed.clone()));
+        let p = program();
+        service.select(&p, p.ends_at).unwrap();
+        until(|| {
+            service.poll().snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.frames > 0)
+            })
+        });
+        service.select(&p, p.ends_at).unwrap();
+        let started = Instant::now();
+        let (notice, kind) = loop {
+            let update = service.poll();
+            if let Some(notice) = update.notice {
+                if notice.starts_with("再生準備失敗") || notice.starts_with("再生切替完了")
+                {
+                    break (notice, update.notice_kind);
+                }
+            }
+            if started.elapsed() > Duration::from_secs(3) {
+                service.stop();
+                panic!("timed out waiting for the schedule-start report");
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            kind,
+            Some(NoticeKind::StreamFailedWhilePlaying),
+            "schedule-start mismatch while playing must be StreamFailedWhilePlaying from the slot-mismatch path (slot_mismatch set). report={notice}"
+        );
+        assert_eq!(
+            mismatched_polls.load(Ordering::SeqCst),
+            0,
+            "schedule-start source was decoded"
+        );
+        assert!(
+            notice.contains("シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"),
+            "Display and CLI text must stay the InvalidPosition sentence: {notice}"
+        );
+        assert!(notice.starts_with("再生準備失敗（現在の状態を維持）: "));
+        assert!(!closed.load(Ordering::Acquire));
+        service.stop();
+    }
 }
