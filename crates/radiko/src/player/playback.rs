@@ -3506,6 +3506,7 @@ mod tests {
     #[test]
     fn internal_slot_mismatch_while_playing_uses_the_generic_switch_sentence() {
         use super::super::seek::{Command, Controller, PlaybackRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         #[derive(Clone, Copy, Debug)]
         enum Mismatch {
             Request,
@@ -3517,13 +3518,26 @@ mod tests {
         }
         struct Quiet {
             info: StreamInfo,
+            polls: Arc<AtomicUsize>,
+            audio: Option<Vec<u8>>,
         }
         impl SegmentSource for Quiet {
             fn info(&self) -> &StreamInfo {
                 &self.info
             }
             fn poll_segment(&mut self) -> Result<Next, ProbeError> {
-                panic!("a rejected source must not be decoded");
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                Ok(match self.audio.take() {
+                    Some(bytes) => Next::Segment(Segment {
+                        initialization: None,
+                        duration: None,
+                        bytes,
+                        codec: None,
+                        discontinuity: false,
+                        starts_at: Some(self.info.starts_at),
+                    }),
+                    None => Next::Pending(Duration::from_millis(20)),
+                })
             }
         }
         struct Holding {
@@ -3563,6 +3577,9 @@ mod tests {
             playing.ends_at -= chrono::Duration::hours(2);
             let cursor = playing.starts_at + chrono::Duration::hours(1);
             let template = playing.clone();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let polls_for_source = polls.clone();
+            let audio = packet(24_000).repeat(80);
             let (tx, rx) = mpsc::channel();
             let (found, received) = mpsc::channel();
             let stop = StopToken::default();
@@ -3598,12 +3615,24 @@ mod tests {
                         selected.position = request.position;
                         selected.starts_at = request.cursor - chrono::Duration::hours(1);
                         selected.ends_at = request.cursor + chrono::Duration::hours(1);
-                        Ok(Box::new(Quiet { info: selected }) as Box<dyn SegmentSource>)
+                        Ok(Box::new(Quiet {
+                            info: selected,
+                            polls: polls_for_source.clone(),
+                            audio: Some(audio.clone()),
+                        }) as Box<dyn SegmentSource>)
                     }
                     Mismatch::Request | Mismatch::IdleRequest => {
                         let mut selected = template.clone();
                         selected.station = "ZZZ".into();
-                        Ok(Box::new(Quiet { info: selected }) as Box<dyn SegmentSource>)
+                        selected.starts_at = request.cursor;
+                        selected.ends_at = request.cursor + chrono::Duration::hours(1);
+                        selected.position = request.position;
+                        selected.mode = request.mode;
+                        Ok(Box::new(Quiet {
+                            info: selected,
+                            polls: polls_for_source.clone(),
+                            audio: Some(audio.clone()),
+                        }) as Box<dyn SegmentSource>)
                     }
                     Mismatch::Slot => {
                         let mut selected = template.clone();
@@ -3612,7 +3641,11 @@ mod tests {
                         selected.starts_at = request.cursor;
                         selected.position = request.position;
                         selected.ends_at = request.cursor + chrono::Duration::hours(3);
-                        Ok(Box::new(Quiet { info: selected }) as Box<dyn SegmentSource>)
+                        Ok(Box::new(Quiet {
+                            info: selected,
+                            polls: polls_for_source.clone(),
+                            audio: Some(audio.clone()),
+                        }) as Box<dyn SegmentSource>)
                     }
                 },
                 move |message, kind, _prefix, _output| {
@@ -3621,15 +3654,31 @@ mod tests {
                     }
                 },
             );
+            controller.reject_contained_schedule_start();
             let mut requested = false;
             let send = tx.clone();
             let quit = tx.clone();
+            let seen_polls = polls.clone();
             let handle = thread::spawn(move || {
-                let (message, kind) = received
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap_or_else(|_| {
-                        panic!("timed out waiting for the {case:?} preparation report")
-                    });
+                let began = Instant::now();
+                let (message, kind) = loop {
+                    if seen_polls.load(Ordering::SeqCst) > 0 {
+                        let _ = quit.send(Command::Stop);
+                        assert_eq!(
+                            seen_polls.load(Ordering::SeqCst),
+                            0,
+                            "{case:?} mismatched source was decoded; expected StreamFailedWhilePlaying 「切り替えられませんでした。再生は続いています」 and rejection before decode"
+                        );
+                    }
+                    if let Ok(report) = received.try_recv() {
+                        break report;
+                    }
+                    if began.elapsed() > Duration::from_secs(3) {
+                        let _ = quit.send(Command::Stop);
+                        panic!("timed out waiting for the {case:?} preparation report");
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                };
                 let _ = quit.send(Command::Stop);
                 (message, kind)
             });
@@ -3714,6 +3763,147 @@ mod tests {
                     assert!(!message.contains("指定した位置は番組の範囲外です"));
                 }
             }
+        }
+    }
+    /// CLI `live` uses now as the cursor and `timefree` uses the requested
+    /// instant. Both can sit inside a slot whose start is earlier. The CLI
+    /// controller does not opt into the schedule-start check.
+    #[test]
+    fn cli_mid_slot_select_prepares_instead_of_rejecting_the_position() {
+        use super::super::seek::{Command, Controller, PlaybackRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for mode in [ProbeMode::Live, ProbeMode::TimeFree] {
+            let now = Utc::now().fixed_offset();
+            let cursor = if mode == ProbeMode::Live {
+                now
+            } else {
+                now - chrono::Duration::hours(2)
+            };
+            let mut playing = info(3_600_000);
+            playing.starts_at -= chrono::Duration::hours(4);
+            playing.ends_at -= chrono::Duration::hours(4);
+            let base = playing.clone();
+            let (tx, rx) = mpsc::channel();
+            let (found, received) = mpsc::channel();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let polls_for_source = polls.clone();
+            let audio = packet(24_000).repeat(80);
+            let stop = StopToken::default();
+            let mut controller = Controller::with_cancellable_reporter(
+                rx,
+                stop.clone(),
+                move |request, _| {
+                    let mut selected = base.clone();
+                    selected.station = request.station.clone();
+                    selected.mode = request.mode;
+                    selected.position = request.position;
+                    selected.starts_at = request.cursor - chrono::Duration::minutes(30);
+                    selected.ends_at = request.cursor + chrono::Duration::minutes(30);
+                    let polls = polls_for_source.clone();
+                    let audio = audio.clone();
+                    Ok(Box::new(HoldingOnce {
+                        info: selected,
+                        polls,
+                        audio: Some(audio),
+                    }) as Box<dyn SegmentSource>)
+                },
+                move |message, kind, _prefix, _output| {
+                    let _ = found.send((message, kind));
+                },
+            );
+            struct HoldingOnce {
+                info: StreamInfo,
+                polls: Arc<AtomicUsize>,
+                audio: Option<Vec<u8>>,
+            }
+            impl SegmentSource for HoldingOnce {
+                fn info(&self) -> &StreamInfo {
+                    &self.info
+                }
+                fn poll_segment(&mut self) -> Result<Next, ProbeError> {
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    Ok(match self.audio.take() {
+                        Some(bytes) => Next::Segment(Segment {
+                            initialization: None,
+                            duration: None,
+                            bytes,
+                            codec: None,
+                            discontinuity: false,
+                            starts_at: Some(self.info.starts_at),
+                        }),
+                        None => Next::Pending(Duration::from_millis(20)),
+                    })
+                }
+            }
+            let mut requested = false;
+            let send = tx.clone();
+            let quit = tx.clone();
+            let handle = thread::spawn(move || {
+                let began = Instant::now();
+                loop {
+                    if let Ok((message, kind)) = received.try_recv() {
+                        if message.starts_with("再生切替完了") {
+                            let _ = quit.send(Command::Stop);
+                            return Ok((message, kind));
+                        }
+                        if message.starts_with("再生準備失敗") {
+                            let _ = quit.send(Command::Stop);
+                            return Err((message, kind));
+                        }
+                    }
+                    if began.elapsed() > Duration::from_secs(3) {
+                        let _ = quit.send(Command::Stop);
+                        panic!(
+                            "{mode:?} mid-slot select did not reach preparation; CLI must not apply starts_at != cursor"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+            let report = play_loop(
+                Initial::Source(Box::new(HoldingOnce {
+                    info: playing.clone(),
+                    polls: Arc::new(AtomicUsize::new(0)),
+                    audio: Some(packet(24_000).repeat(8)),
+                }) as Box<dyn SegmentSource>),
+                None,
+                stop,
+                |snapshot| {
+                    if !requested
+                        && snapshot
+                            .output
+                            .as_ref()
+                            .is_some_and(|output| output.frames > 0)
+                    {
+                        requested = true;
+                        send.send(Command::Select(PlaybackRequest {
+                            station: "OBS".into(),
+                            mode,
+                            cursor,
+                            position: Duration::ZERO,
+                        }))
+                        .unwrap();
+                    }
+                },
+                sink,
+                Some(&mut controller),
+            )
+            .unwrap();
+            assert_eq!(report.reason, EndReason::Cancelled);
+            let switched = handle
+                .join()
+                .unwrap()
+                .expect("CLI select must prepare, not reject");
+            assert!(
+                switched.0.starts_with("再生切替完了: OBS"),
+                "{mode:?} did not proceed to playback: {}",
+                switched.0
+            );
+            assert!(
+                polls.load(Ordering::SeqCst) > 0,
+                "{mode:?} select never started preparation"
+            );
+            assert_ne!(switched.1, Some(NoticeKind::InvalidPositionWhilePlaying));
         }
     }
     #[test]

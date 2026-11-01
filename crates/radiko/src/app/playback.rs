@@ -346,6 +346,7 @@ impl Service {
                         }
                     },
                 );
+                controls.reject_contained_schedule_start();
                 // Dropped when playback returns, including unwind, and before preparation is joined.
                 let released = OutputRelease(released_flag);
                 let report = move |snapshot| {

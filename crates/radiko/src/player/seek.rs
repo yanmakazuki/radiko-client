@@ -11,7 +11,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, TrySendError},
     },
     thread,
@@ -89,6 +89,10 @@ pub struct Controller {
     pub(super) volume: u32,
     /// Set by the play loop from whether an output is open. Preparation before that is not playback.
     playback_active: bool,
+    /// TUI selections use the schedule slot start as `cursor`. A stream that
+    /// only contains that instant is another slot. CLI cursors are the
+    /// requested time, so this stays off for the CLI controller.
+    compare_schedule_start: Arc<AtomicBool>,
     #[cfg(test)]
     prepare_stall_ms: Arc<AtomicU64>,
 }
@@ -171,8 +175,14 @@ impl Controller {
         let stall_ms = Arc::new(AtomicU64::new(30_000));
         #[cfg(test)]
         let prepare_stall_ms = stall_ms.clone();
-        let (mailbox, ids, shutdown, stall_ms) =
-            (latest.clone(), generation.clone(), stop.clone(), stall_ms);
+        let compare_schedule_start = Arc::new(AtomicBool::new(false));
+        let (mailbox, ids, shutdown, stall_ms, compare_schedule_start_flag) = (
+            latest.clone(),
+            generation.clone(),
+            stop.clone(),
+            stall_ms,
+            compare_schedule_start.clone(),
+        );
         let preparation_worker = thread::spawn(move || {
             while !shutdown.is_cancelled() {
                 let job = match mailbox.lock() {
@@ -200,12 +210,12 @@ impl Controller {
                         // request, without the user naming a position. Keep
                         // `InvalidPosition` for Display and CLI. The flag tells the
                         // TUI this is not a user position error.
-                        // `starts_at != cursor` is the schedule slot versus the
-                        // stream slot. The cursor can sit inside an earlier slot.
-                        if !job.request.matches(info)
-                            || !same_slot
-                            || info.starts_at != job.request.cursor
-                        {
+                        // `starts_at != cursor` is the TUI schedule slot versus the
+                        // stream slot. CLI cursors are the requested time, so the
+                        // comparison runs only when the app service opts in.
+                        let schedule_start = compare_schedule_start_flag.load(Ordering::Acquire)
+                            && info.starts_at != job.request.cursor;
+                        if !job.request.matches(info) || !same_slot || schedule_start {
                             (
                                 Err(PlaybackError::Source(
                                     crate::api::stream::ProbeError::InvalidPosition,
@@ -261,9 +271,15 @@ impl Controller {
             paused: false,
             volume: 25,
             playback_active: false,
+            compare_schedule_start,
             #[cfg(test)]
             prepare_stall_ms,
         }
+    }
+    /// The TUI identifies a slot by its schedule start. Enable the
+    /// `starts_at != cursor` mismatch check. The CLI controller leaves this off.
+    pub(crate) fn reject_contained_schedule_start(&self) {
+        self.compare_schedule_start.store(true, Ordering::Release);
     }
     /// Shortens only the silence limit inside `prepare_ready`. Production stays at 30 seconds.
     #[cfg(test)]
