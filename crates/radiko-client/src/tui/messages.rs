@@ -15,6 +15,10 @@ pub(super) const SOURCE_STALLED_CONTINUES: &str =
     "切り替え先の音声が届きませんでした。再生は続いています";
 pub(super) const EARLY_END_CONTINUES: &str =
     "切り替え先の配信が途中で終わりました。再生は続いています";
+pub(super) const INVALID_POSITION_CONTINUES: &str =
+    "指定した位置は番組の範囲外です。再生は続いています";
+pub(super) const HTTP_CONTINUES: &str =
+    "切り替え先の配信を取得できませんでした。再生は続いています";
 pub(super) const STREAM_AUTHENTICATION: &str =
     "配信認証が拒否されました。a で再確認 / I で再ログイン";
 pub(super) const OUTSIDE_AREA: &str = "この局は現在地のエリア外です（エリアフリー未加入）";
@@ -42,6 +46,8 @@ pub(super) fn playback_notice(kind: NoticeKind) -> String {
         }
         NoticeKind::SourceStalledWhilePlaying => SOURCE_STALLED_CONTINUES.to_owned(),
         NoticeKind::EarlyEndWhilePlaying => EARLY_END_CONTINUES.to_owned(),
+        NoticeKind::InvalidPositionWhilePlaying => INVALID_POSITION_CONTINUES.to_owned(),
+        NoticeKind::HttpWhilePlaying => HTTP_CONTINUES.to_owned(),
         NoticeKind::OutsideArea => OUTSIDE_AREA.to_owned(),
     }
 }

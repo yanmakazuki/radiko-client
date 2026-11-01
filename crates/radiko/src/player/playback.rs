@@ -110,7 +110,29 @@ pub enum NoticeKind {
     EarlyEndWhilePlaying,
     /// The next stream's worker failed, and playback continues.
     StreamFailedWhilePlaying,
+    /// The requested position is outside the slot, and playback continues.
+    InvalidPositionWhilePlaying,
+    /// The next stream's HTTP fetch failed, and playback continues.
+    HttpWhilePlaying,
     OutsideArea,
+}
+impl NoticeKind {
+    /// A failure that leaves the current playback running.
+    /// The TUI shows this kind's sentence with no failure prefix.
+    pub fn while_playing(self) -> bool {
+        matches!(
+            self,
+            Self::AuthExpiredWhilePlaying
+                | Self::ReconnectLimitWhilePlaying
+                | Self::DeadlineWhilePlaying
+                | Self::ProbeTimeoutWhilePlaying
+                | Self::SourceStalledWhilePlaying
+                | Self::EarlyEndWhilePlaying
+                | Self::StreamFailedWhilePlaying
+                | Self::InvalidPositionWhilePlaying
+                | Self::HttpWhilePlaying
+        )
+    }
 }
 /// `Some` when the TUI must replace the CLI sentence for this error.
 pub fn notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
@@ -142,10 +164,7 @@ pub fn continuing_notice_kind(error: &PlaybackError) -> Option<NoticeKind> {
         PlaybackError::Decode(_) | PlaybackError::Worker => {
             Some(NoticeKind::StreamFailedWhilePlaying)
         }
-        PlaybackError::Source(error) => match probe_notice_kind(error) {
-            Some(kind) => Some(kind),
-            None => Some(NoticeKind::StreamFailedWhilePlaying),
-        },
+        PlaybackError::Source(error) => Some(continuing_source_kind(error)),
         PlaybackError::Storage(_)
         | PlaybackError::LoginRequired
         | PlaybackError::Auth(_)
@@ -244,6 +263,14 @@ fn probe_reconnect_limit(error: &ProbeError) -> bool {
         | ProbeError::NoEndpoint
         | ProbeError::WindowLost
         | ProbeError::AuthExpired => false,
+    }
+}
+fn continuing_source_kind(error: &ProbeError) -> NoticeKind {
+    match error {
+        ProbeError::At(_, inner) => continuing_source_kind(inner),
+        ProbeError::InvalidPosition => NoticeKind::InvalidPositionWhilePlaying,
+        ProbeError::Http(_) => NoticeKind::HttpWhilePlaying,
+        other => probe_notice_kind(other).unwrap_or(NoticeKind::StreamFailedWhilePlaying),
     }
 }
 fn probe_notice_kind(error: &ProbeError) -> Option<NoticeKind> {
@@ -3366,6 +3393,22 @@ mod tests {
             continuing_notice_kind(&failed),
             Some(NoticeKind::StreamFailedWhilePlaying)
         );
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::Source(ProbeError::InvalidPosition)),
+            Some(NoticeKind::InvalidPositionWhilePlaying)
+        );
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::Source(ProbeError::Http(503))),
+            Some(NoticeKind::HttpWhilePlaying)
+        );
+        assert_eq!(
+            notice_kind(&PlaybackError::Source(ProbeError::InvalidPosition)),
+            None
+        );
+        assert_eq!(
+            notice_kind(&PlaybackError::Source(ProbeError::Http(404))),
+            None
+        );
         assert!(expired.to_string().contains("再生を停止しました"));
         assert!(
             PlaybackError::SourceStalled
@@ -3387,6 +3430,76 @@ mod tests {
         assert!(reconnect.to_string().contains("再生を停止しました"));
         assert!(failure_notice(&reconnect).contains("再生を停止しました"));
         assert!(!format!("{expired}").contains("再生は続いています"));
+    }
+    #[test]
+    fn invalid_position_while_playing_keeps_its_own_kind() {
+        let bare = PlaybackError::Source(ProbeError::InvalidPosition);
+        let staged = PlaybackError::Source(ProbeError::At(
+            "シーク",
+            Box::new(ProbeError::InvalidPosition),
+        ));
+        for error in [&bare, &staged] {
+            assert_eq!(notice_kind(error), None);
+            assert_eq!(
+                continuing_notice_kind(error),
+                Some(NoticeKind::InvalidPositionWhilePlaying)
+            );
+        }
+        assert_eq!(
+            ProbeError::InvalidPosition.to_string(),
+            "シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+        );
+        assert!(
+            !ProbeError::InvalidPosition
+                .to_string()
+                .contains("再生は続いています")
+        );
+    }
+    #[test]
+    fn http_failure_while_playing_keeps_its_own_kind() {
+        let bare = PlaybackError::Source(ProbeError::Http(503));
+        let staged = PlaybackError::Source(ProbeError::At(
+            "HLS音声取得",
+            Box::new(ProbeError::Http(404)),
+        ));
+        for error in [&bare, &staged] {
+            assert_eq!(notice_kind(error), None);
+            assert_eq!(
+                continuing_notice_kind(error),
+                Some(NoticeKind::HttpWhilePlaying)
+            );
+        }
+        assert_eq!(
+            ProbeError::Http(503).to_string(),
+            "配信サーバーがHTTP 503を返しました"
+        );
+        assert_eq!(
+            continuing_notice_kind(&PlaybackError::Source(ProbeError::Network)),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
+    }
+    #[test]
+    fn decode_failure_while_playing_uses_the_generic_switch_kind() {
+        let error = PlaybackError::Decode(AacError::DecodeFailed);
+        assert_eq!(notice_kind(&error), None);
+        assert_eq!(
+            continuing_notice_kind(&error),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
+        assert_eq!(
+            error.to_string(),
+            "デコード: AACパケットのデコードに失敗しました"
+        );
+    }
+    #[test]
+    fn worker_failure_while_playing_uses_the_generic_switch_kind() {
+        let error = PlaybackError::Worker;
+        assert_eq!(notice_kind(&error), None);
+        assert_eq!(
+            continuing_notice_kind(&error),
+            Some(NoticeKind::StreamFailedWhilePlaying)
+        );
+        assert_eq!(error.to_string(), "再生ワーカーが予期せず終了しました");
     }
     #[test]
     fn idle_preparation_failure_reports_the_stop_kind_not_the_continuing_sentence() {
