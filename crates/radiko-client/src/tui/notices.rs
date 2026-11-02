@@ -50,23 +50,26 @@ pub(super) fn level_from_kind(kind: NoticeKind) -> NoticeLevel {
 
 /// Level for one playback notice.
 ///
-/// `stopped` is a failed session. `idle_failure` is a `*WhilePlaying` kind
-/// dropped because nothing is playing, so the stop sentence is shown.
-/// `output_failure` is an output-device failure. Continuing playback without
-/// those flags stays informational when the kind does not say otherwise.
+/// `stopped` is a failed session. `idle_failure` is any failure while nothing
+/// is playing, including a kind-less failure and idle `OutsideArea` /
+/// `LoginRequired`. `output_failure` is an output-device failure.
+/// A `*WhilePlaying` kind stays a warning: playback is still running.
 pub(super) fn playback_level(
     kind: Option<NoticeKind>,
     stopped: bool,
     idle_failure: bool,
     output_failure: bool,
 ) -> NoticeLevel {
+    if let Some(kind) = kind.filter(|kind| kind.while_playing()) {
+        return level_from_kind(kind);
+    }
+    // Idle failures must use `idle_failure`. `stopped` alone misses a
+    // preparation failure before playback has started.
+    if idle_failure || stopped || output_failure {
+        return NoticeLevel::Error;
+    }
     match kind {
-        // Continuing kinds take their level from the kind table, even if a
-        // later flag would otherwise call the session stopped.
-        Some(kind) if kind.while_playing() => level_from_kind(kind),
-        Some(_) if stopped => NoticeLevel::Error,
         Some(kind) => level_from_kind(kind),
-        None if stopped || idle_failure || output_failure => NoticeLevel::Error,
         None => NoticeLevel::Info,
     }
 }
@@ -109,4 +112,30 @@ pub(super) fn choose_notice<'a>(items: &[Candidate<'a>]) -> Option<(NoticeLevel,
         .filter(|item| !item.text.is_empty())
         .max_by_key(|item| (item.level.rank(), item.seq))
         .map(|item| (item.level, item.text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Candidate, NoticeLevel, choose_notice};
+
+    #[test]
+    fn same_level_keeps_the_newer_notice_even_when_it_is_listed_first() {
+        let chosen = choose_notice(&[
+            Candidate {
+                level: NoticeLevel::Warning,
+                seq: 5,
+                text: "新しい警告",
+            },
+            Candidate {
+                level: NoticeLevel::Warning,
+                seq: 1,
+                text: "古い警告",
+            },
+        ]);
+        assert_eq!(
+            chosen.map(|(_, text)| text),
+            Some("新しい警告"),
+            "equal severity must follow seq, not slice order"
+        );
+    }
 }

@@ -329,7 +329,10 @@ impl Controller {
         } else {
             crate::player::playback::notice_kind(error)
         });
-        let shown_prefix = kind.map(|_| prefix);
+        // The prefix is sent even when the kind is absent. The CLI line stays
+        // `{prefix}: {error}`. The TUI uses the prefix to treat an idle,
+        // kind-less failure as an error without reading the sentence.
+        let shown_prefix = Some(prefix);
         let output = crate::player::playback::output_failure(error);
         (self.reporter)(format!("{prefix}: {error}"), kind, shown_prefix, output);
     }

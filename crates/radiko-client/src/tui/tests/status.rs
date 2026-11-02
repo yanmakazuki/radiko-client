@@ -1240,7 +1240,7 @@ fn reception_and_reconnect_notices_stay_off_when_paused_stopped_starting_or_ende
                     shown,
                 );
                 assert_eq!(screen.playback_notice, "番組終了");
-                // After the 5s hold, only `playback_ended` still blocks the outage.
+                // The info sentence expires at 5s. `playback_ended` still blocks the outage.
                 screen.apply_playback_at(
                     radiko::app::playback::Update {
                         snapshot: Some(gap_snapshot(mode, PlaybackState::Playing, gap.0, gap.1)),
@@ -1264,7 +1264,11 @@ fn reception_and_reconnect_notices_stay_off_when_paused_stopped_starting_or_ende
             );
         }
         if case == "番組終了" {
-            assert_eq!(screen.playback_notice, "番組終了");
+            assert!(
+                screen.playback_notice.is_empty(),
+                "番組終了 is info and expires at 5s: {}",
+                screen.playback_notice
+            );
         }
     }
     let mut screen = screen();

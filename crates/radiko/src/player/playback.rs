@@ -3965,7 +3965,7 @@ mod tests {
                 assert!(!message.contains("再生は続いています"), "{message}");
                 if reconnect {
                     assert_eq!(kind, None);
-                    assert_eq!(prefix, None);
+                    assert_eq!(prefix, Some("再生準備失敗（現在の状態を維持）"));
                     assert!(message.contains(
                         "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください"
                     ));

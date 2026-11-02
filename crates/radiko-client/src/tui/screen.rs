@@ -160,6 +160,7 @@ impl Screen {
         self.notice_clock = Some(now);
     }
     pub(super) fn apply_playback_at(&mut self, update: playback::Update, now: std::time::Instant) {
+        self.expire_timed_notices(now);
         if update.new_session {
             self.app.playback = None;
             self.playback_diagnostics.clear();
@@ -334,8 +335,10 @@ impl Screen {
             // While playback continues, a *WhilePlaying kind is the sentence alone.
             // The failure prefix stays for every other kind, and for the stop
             // sentence used when no snapshot is playing.
-            let idle_failure =
-                kind.is_none() && update.notice_kind.is_some_and(|kind| kind.while_playing());
+            // Any typed or prefixed failure before playback has started.
+            // Untyped status text has neither a kind nor a prefix.
+            let idle_failure = self.app.playback.is_none()
+                && (update.notice_kind.is_some() || update.notice_prefix.is_some());
             self.playback_notice = match kind {
                 Some(kind) if kind.while_playing() => super::messages::playback_notice(kind),
                 Some(kind) => match update.notice_prefix {
@@ -388,14 +391,7 @@ impl Screen {
                 self.notice_hold = super::NoticeHold::Warning;
                 self.notice_hold_until = None;
             }
-            super::notices::NoticeLevel::Info => {
-                if self.playback_stopped || self.playback_ended {
-                    self.notice_hold = super::NoticeHold::Other;
-                    self.notice_hold_until = None;
-                } else {
-                    self.hold_action(now);
-                }
-            }
+            super::notices::NoticeLevel::Info => self.hold_action(now),
         }
     }
     fn set_gap_notice(&mut self, text: String, hold: super::NoticeHold) {
@@ -430,8 +426,7 @@ impl Screen {
     fn note_filter(&mut self) {
         self.filter_seq = self.bump_seq();
     }
-    pub(super) fn expire_preferences(&mut self) {
-        let now = self.playback_now();
+    pub(super) fn expire_timed_notices(&mut self, now: std::time::Instant) {
         if self.preferences_level == super::notices::NoticeLevel::Info
             && !self.preferences_notice.is_empty()
             && self.preferences_until.is_some_and(|until| now >= until)
@@ -439,6 +434,19 @@ impl Screen {
             self.preferences_notice.clear();
             self.preferences_until = None;
         }
+        // One-shot info, including 「一時停止」「停止しました」「番組終了」.
+        // Gap status has no deadline and stays while the condition holds.
+        if self.notice_level == super::notices::NoticeLevel::Info
+            && !self.playback_notice.is_empty()
+            && self.notice_hold_until.is_some_and(|until| now >= until)
+        {
+            self.playback_notice.clear();
+            self.notice_hold = super::NoticeHold::Other;
+            self.notice_hold_until = None;
+        }
+    }
+    pub(super) fn expire_preferences(&mut self) {
+        self.expire_timed_notices(self.playback_now());
     }
     pub(super) fn footer_notice(&self) -> Option<(super::notices::NoticeLevel, &str)> {
         let filter = self

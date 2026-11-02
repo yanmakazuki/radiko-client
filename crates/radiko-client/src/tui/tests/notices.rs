@@ -608,3 +608,169 @@ fn informational_preferences_expire_on_the_injected_clock() {
     screen.expire_preferences();
     assert!(screen.preferences_notice.is_empty());
 }
+
+#[test]
+fn idle_failures_are_errors_for_every_kind_and_for_a_kindless_failure() {
+    use radiko::app::playback::NoticeKind;
+    let prefix = "再生準備失敗（現在の状態を維持）";
+    let cases = [
+        (
+            NoticeKind::LoginRequired,
+            format!("{prefix}: 未ログインです。I でログイン"),
+        ),
+        (
+            NoticeKind::SessionExpired,
+            format!("{prefix}: セッション失効。a で再確認 / I で再ログイン"),
+        ),
+        (
+            NoticeKind::StreamAuthentication,
+            format!("{prefix}: 配信認証が拒否されました。a で再確認 / I で再ログイン"),
+        ),
+        (
+            NoticeKind::AuthExpired,
+            format!("{prefix}: 認証期限切れのため再生を停止しました。a で再確認 / I で再ログイン"),
+        ),
+        (
+            NoticeKind::OutsideArea,
+            format!("{prefix}: この局は現在地のエリア外です（エリアフリー未加入）"),
+        ),
+        (
+            NoticeKind::AuthExpiredWhilePlaying,
+            format!("{prefix}: 認証期限切れのため再生を停止しました。a で再確認 / I で再ログイン"),
+        ),
+        (
+            NoticeKind::ReconnectLimitWhilePlaying,
+            format!("{prefix}: 再接続の上限を超えたため再生を停止しました"),
+        ),
+        (
+            NoticeKind::DeadlineWhilePlaying,
+            format!("{prefix}: 番組終了：放送終了日時に達したため音声を停止しました"),
+        ),
+        (
+            NoticeKind::ProbeTimeoutWhilePlaying,
+            format!("{prefix}: 無音出力診断の実時間上限を超えたため停止しました"),
+        ),
+        (
+            NoticeKind::SourceStalledWhilePlaying,
+            format!("{prefix}: 30秒間新しいセグメントを確認できないため停止しました"),
+        ),
+        (
+            NoticeKind::EarlyEndWhilePlaying,
+            format!("{prefix}: 放送枠末尾より前に配信が終了しました"),
+        ),
+        (
+            NoticeKind::StreamFailedWhilePlaying,
+            format!("{prefix}: 配信取得: 通信に失敗しました"),
+        ),
+        (
+            NoticeKind::InvalidPositionWhilePlaying,
+            format!(
+                "{prefix}: 配信取得: シーク位置は番組冒頭以上・放送枠末尾未満で指定してください"
+            ),
+        ),
+        (
+            NoticeKind::HttpWhilePlaying,
+            format!("{prefix}: 配信取得: 配信サーバーがHTTP 503を返しました"),
+        ),
+    ];
+    for (kind, sentence) in cases {
+        let mut screen = screen();
+        screen.apply_playback(radiko::app::playback::Update {
+            notice: Some(sentence.clone()),
+            notice_kind: Some(kind),
+            notice_prefix: Some(prefix),
+            ..radiko::app::playback::Update::default()
+        });
+        assert_eq!(screen.playback_notice, sentence, "{kind:?}");
+        assert_eq!(
+            screen.notice_level,
+            super::super::notices::NoticeLevel::Error,
+            "{kind:?} while nothing is playing must be Error; idle_failure was ignored"
+        );
+        let (text, fg, bg, bold) = row_style(&mut screen, 80, 24, "✕");
+        assert!(text.starts_with("✕ "), "{kind:?} {text}");
+        assert_eq!(fg, Color::Red, "{kind:?}");
+        assert_eq!(bg, Color::Reset, "{kind:?}");
+        assert!(bold, "{kind:?}");
+    }
+
+    let raw = "再生準備失敗（現在の状態を維持）: 配信取得: 通信に失敗しました";
+    let mut kindless = screen();
+    kindless.apply_playback(radiko::app::playback::Update {
+        notice: Some(raw.into()),
+        notice_kind: None,
+        notice_prefix: Some(prefix),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(kindless.playback_notice, raw);
+    assert_eq!(
+        kindless.notice_level,
+        super::super::notices::NoticeLevel::Error,
+        "a kind-less idle failure must be Error; idle_failure was ignored"
+    );
+    let (text, fg, bg, bold) = row_style(&mut kindless, 80, 24, "✕");
+    assert_eq!(text, format!("✕ {raw}"));
+    assert_eq!(fg, Color::Red);
+    assert_eq!(bg, Color::Reset);
+    assert!(bold);
+
+    let mut playing_area = screen();
+    playing_area.app.playback = Some(playing());
+    let area = format!("{prefix}: この局は現在地のエリア外です（エリアフリー未加入）");
+    playing_area.apply_playback(radiko::app::playback::Update {
+        snapshot: Some(playing()),
+        notice: Some(area.clone()),
+        notice_kind: Some(NoticeKind::OutsideArea),
+        notice_prefix: Some(prefix),
+        ..radiko::app::playback::Update::default()
+    });
+    assert_eq!(playing_area.playback_notice, area);
+    assert_eq!(
+        playing_area.notice_level,
+        super::super::notices::NoticeLevel::Warning
+    );
+    let (text, fg, _, _) = row_style(&mut playing_area, 80, 24, "!");
+    assert!(text.starts_with("! "), "{text}");
+    assert_eq!(fg, Color::Yellow);
+}
+
+#[test]
+fn playback_info_notices_expire_on_the_injected_clock() {
+    let hold = super::super::NOTICE_HOLD;
+    assert_eq!(hold, Duration::from_secs(5));
+    for sentence in ["一時停止", "停止しました", "番組終了"] {
+        let raised = std::time::Instant::now() + Duration::from_secs(86_400);
+        let mut screen = screen();
+        screen.set_notice_clock(raised);
+        if sentence == "一時停止" {
+            screen.show_notice(sentence);
+        } else {
+            screen.apply_playback_at(
+                radiko::app::playback::Update {
+                    ended: true,
+                    notice: Some(sentence.into()),
+                    ..radiko::app::playback::Update::default()
+                },
+                raised,
+            );
+        }
+        assert_eq!(screen.playback_notice, sentence, "{sentence}");
+        assert_eq!(
+            screen.notice_level,
+            super::super::notices::NoticeLevel::Info,
+            "{sentence}"
+        );
+        screen.set_notice_clock(raised + hold - Duration::from_nanos(1));
+        screen.expire_preferences();
+        assert_eq!(
+            screen.playback_notice, sentence,
+            "{sentence} must still be shown before 5s"
+        );
+        screen.set_notice_clock(raised + hold + Duration::from_nanos(1));
+        screen.expire_preferences();
+        assert!(
+            screen.playback_notice.is_empty(),
+            "{sentence} must be gone at 5s+1ns"
+        );
+    }
+}
