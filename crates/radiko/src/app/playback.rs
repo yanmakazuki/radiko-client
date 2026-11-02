@@ -107,8 +107,9 @@ pub struct Update {
     pub output_failure: Option<OutputFailure>,
     /// Set from [`notice_kind`] when `notice` is a playback failure. The TUI rewords from this.
     pub notice_kind: Option<NoticeKind>,
-    /// When set with [`Self::notice_kind`], the TUI keeps this prefix and replaces only the error.
-    /// `None` replaces the whole notice. Not inferred from the notice text.
+    /// Failure prefix for the TUI. Passed even when [`Self::notice_kind`] is absent,
+    /// so a kind-less idle failure is still an error. Not inferred from the notice text.
+    /// The CLI line stays `{prefix}: {error}`.
     pub notice_prefix: Option<&'static str>,
     pub ended: bool,
     pub final_diagnostics: Option<String>,

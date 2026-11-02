@@ -517,24 +517,28 @@ impl Screen {
             || self.output_guide.is_some()
     }
     /// 通常画面の Esc。再生・一時停止・選択・条件と停止フラグは残す。
+    /// 出ている通知だけを消す。エラーの下に隠れていた警告は残し、次の描画で出す。
     fn dismiss_notices(&mut self) {
-        self.playback_notice.clear();
-        self.app.notification.clear();
-        self.preferences_notice.clear();
+        if let Some((level, text)) = self
+            .footer_notice()
+            .map(|(level, text)| (level, text.to_owned()))
+        {
+            self.clear_shown_notice(level, &text);
+        }
         self.output_guide = None;
-        if matches!(
-            self.notice_hold,
-            super::NoticeHold::Action
-                | super::NoticeHold::CatchUp
-                | super::NoticeHold::AuthRenewal
-                | super::NoticeHold::Warning
-                | super::NoticeHold::Error
-        ) {
+        if self.notification_level != super::notices::NoticeLevel::Warning {
+            self.app.notification.clear();
+        }
+        if self.preferences_level != super::notices::NoticeLevel::Warning {
+            self.preferences_notice.clear();
+            self.preferences_until = None;
+        }
+        if self.notice_level != super::notices::NoticeLevel::Warning {
+            self.playback_notice.clear();
             self.notice_hold = super::NoticeHold::Other;
             self.notice_hold_until = None;
+            self.notice_level = super::notices::NoticeLevel::Info;
         }
-        self.notice_level = super::notices::NoticeLevel::Info;
-        self.preferences_until = None;
     }
     /// Clear only the notice that is actually on screen.
     /// A warning hidden under an error stays, and is shown once that error goes.

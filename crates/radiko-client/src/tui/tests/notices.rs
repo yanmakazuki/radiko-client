@@ -775,6 +775,35 @@ fn playback_info_notices_expire_on_the_injected_clock() {
     }
 }
 
+#[test]
+fn info_is_cleared_at_exactly_notice_hold() {
+    // `expire_timed_notices` uses `now >= raised + NOTICE_HOLD`, so the
+    // instant of the hold is already cleared. One nanosecond later stays cleared.
+    let hold = super::super::NOTICE_HOLD;
+    assert_eq!(hold, Duration::from_secs(5));
+    let raised = std::time::Instant::now() + Duration::from_secs(86_400);
+    let mut screen = screen();
+    screen.set_notice_clock(raised);
+    screen.show_notice("一時停止");
+    screen.set_notice_clock(raised + hold - Duration::from_nanos(1));
+    screen.expire_preferences();
+    assert_eq!(screen.playback_notice, "一時停止");
+    screen.set_notice_clock(raised + hold);
+    screen.expire_preferences();
+    assert!(
+        screen.playback_notice.is_empty(),
+        "info is cleared at exactly NOTICE_HOLD"
+    );
+    screen.set_notice_clock(raised);
+    screen.show_notice("一時停止");
+    screen.set_notice_clock(raised + hold + Duration::from_nanos(1));
+    screen.expire_preferences();
+    assert!(
+        screen.playback_notice.is_empty(),
+        "info stays cleared at NOTICE_HOLD + 1ns"
+    );
+}
+
 fn show_auth_stop(screen: &mut Screen) {
     screen.apply_playback(radiko::app::playback::Update {
         stopped: true,
@@ -852,6 +881,50 @@ fn hidden_warning_is_drawn_after_the_error_clears_then_the_next_key_drops_it() {
     assert!(
         !after.contains("再生は続いています"),
         "the following key clears the warning\n{after}"
+    );
+}
+
+#[test]
+fn escape_in_the_list_draws_the_warning_that_was_hidden_under_the_error() {
+    let warning = "認証期限切れです。再生は続いています。a で再確認 / I で再ログイン";
+    let mut screen = screen();
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("escape must not fetch") });
+    show_auth_stop(&mut screen);
+    screen.app.notification = warning.into();
+    screen.notification_level = super::super::notices::NoticeLevel::Warning;
+    screen.notification_seq = screen.playback_seq + 1;
+    let covered = rows(&mut screen, 80, 24).join("\n");
+    assert!(covered.contains("再生を停止しました"), "{covered}");
+    assert!(!covered.contains("再生は続いています"), "{covered}");
+    assert!(
+        !screen
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut search)
+            .unwrap()
+    );
+    let revealed = rows(&mut screen, 80, 24).join("\n");
+    assert!(
+        revealed.contains("再生は続いています") && revealed.contains("a で再確認"),
+        "Esc must draw the warning that was hidden under the error\n{revealed}"
+    );
+    let (text, fg, bg, bold) = row_style(&mut screen, 80, 24, "再生は続いています");
+    assert!(text.starts_with("! "), "{text}");
+    assert!(text.contains("a で再確認"), "{text}");
+    assert_eq!(fg, Color::Yellow, "{text}");
+    assert_eq!(bg, Color::Reset);
+    assert!(!bold);
+    assert!(
+        !screen
+            .key(
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                &mut search
+            )
+            .unwrap()
+    );
+    let after = rows(&mut screen, 80, 24).join("\n");
+    assert!(
+        !after.contains("再生は続いています"),
+        "the next key clears the warning\n{after}"
     );
 }
 
