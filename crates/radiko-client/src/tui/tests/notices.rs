@@ -774,3 +774,203 @@ fn playback_info_notices_expire_on_the_injected_clock() {
         );
     }
 }
+
+fn show_auth_stop(screen: &mut Screen) {
+    screen.apply_playback(radiko::app::playback::Update {
+        stopped: true,
+        ended: true,
+        stop_reason: Some(radiko::app::playback::StopReason::AuthExpired),
+        notice_kind: Some(radiko::app::playback::NoticeKind::AuthExpired),
+        notice: Some(super::super::messages::AUTH_EXPIRED_STOP.into()),
+        ..radiko::app::playback::Update::default()
+    });
+}
+
+#[test]
+fn hidden_warning_is_drawn_after_the_error_clears_then_the_next_key_drops_it() {
+    let warning = "認証期限切れです。再生は続いています。a で再確認 / I で再ログイン";
+    let mut screen = screen();
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("hidden warning must not fetch") });
+    show_auth_stop(&mut screen);
+    screen.app.notification = warning.into();
+    screen.notification_level = super::super::notices::NoticeLevel::Warning;
+    screen.notification_seq = screen.playback_seq + 1;
+    let covered = rows(&mut screen, 80, 24).join("\n");
+    assert!(covered.contains("✕ "), "{covered}");
+    assert!(covered.contains("再生を停止しました"), "{covered}");
+    assert!(
+        !covered.contains("再生は続いています"),
+        "the warning must stay hidden under the error\n{covered}"
+    );
+    assert!(
+        !screen
+            .key(
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                &mut search
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        screen.playback_notice,
+        super::super::messages::AUTH_EXPIRED_STOP
+    );
+    assert_eq!(
+        screen.app.notification, warning,
+        "j must not drop the hidden warning"
+    );
+    assert!(
+        !screen
+            .key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                &mut search
+            )
+            .unwrap()
+    );
+    let revealed = rows(&mut screen, 80, 24).join("\n");
+    assert!(
+        revealed.contains("再生は続いています") && revealed.contains("a で再確認"),
+        "the warning must be drawn once the error clears\n{revealed}"
+    );
+    let (text, fg, bg, bold) = row_style(&mut screen, 80, 24, "再生は続いています");
+    assert!(text.contains("a で再確認"), "{text}");
+    assert!(text.starts_with("! "), "{text}");
+    assert_eq!(fg, Color::Yellow, "{text}");
+    assert_eq!(bg, Color::Reset);
+    assert!(!bold);
+    assert!(!text.contains("再生を停止しました"), "{text}");
+    assert!(
+        !screen
+            .key(
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                &mut search
+            )
+            .unwrap()
+    );
+    assert!(screen.app.notification.is_empty());
+    let after = rows(&mut screen, 80, 24).join("\n");
+    assert!(
+        !after.contains("再生は続いています"),
+        "the following key clears the warning\n{after}"
+    );
+}
+
+#[test]
+fn typing_into_keyword_or_filters_keeps_an_error_until_enter_or_esc() {
+    let error = super::super::messages::AUTH_EXPIRED_STOP;
+    let mut search =
+        Service::new(|| -> Result<CatalogClient, _> { panic!("typing must not fetch") });
+    for ch in ['a', 's', 'x', 'k'] {
+        let mut keyword = screen();
+        show_auth_stop(&mut keyword);
+        keyword.app.begin_edit();
+        keyword.input = Some(String::new());
+        assert!(
+            !keyword
+                .key(
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                    &mut search
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            keyword.playback_notice, error,
+            "keyword {ch} must not clear the error"
+        );
+        let typed = ch.to_string();
+        assert_eq!(keyword.input.as_deref(), Some(typed.as_str()));
+
+        let mut filters = screen();
+        show_auth_stop(&mut filters);
+        filters.app.begin_edit();
+        filters.filters = Some(super::super::filters::Editor::new(
+            &filters.app.committed,
+            &filters.app.programs,
+        ));
+        assert!(
+            !filters
+                .key(
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                    &mut search
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            filters.playback_notice, error,
+            "filter {ch} must not clear the error"
+        );
+    }
+
+    let mut keyword_esc = screen();
+    show_auth_stop(&mut keyword_esc);
+    keyword_esc.app.begin_edit();
+    keyword_esc.input = Some("朝".into());
+    assert!(
+        !keyword_esc
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut search)
+            .unwrap()
+    );
+    assert!(keyword_esc.input.is_none());
+    assert!(
+        keyword_esc.playback_notice.is_empty(),
+        "Esc cancels keyword input and clears the error"
+    );
+
+    let mut keyword_enter = screen();
+    show_auth_stop(&mut keyword_enter);
+    keyword_enter.app.begin_edit();
+    keyword_enter.input = Some("朝".into());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+    let mut fetching = Service::new(|| {
+        Ok::<_, radiko::api::catalog::CatalogError>(super::super::offline::Fixture)
+    });
+    assert!(
+        !keyword_enter
+            .key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut fetching
+            )
+            .unwrap()
+    );
+    assert!(keyword_enter.input.is_none());
+    assert_ne!(keyword_enter.playback_notice, error);
+
+    let mut filter_esc = screen();
+    show_auth_stop(&mut filter_esc);
+    filter_esc.app.begin_edit();
+    filter_esc.filters = Some(super::super::filters::Editor::new(
+        &filter_esc.app.committed,
+        &filter_esc.app.programs,
+    ));
+    assert!(
+        !filter_esc
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut search)
+            .unwrap()
+    );
+    assert!(filter_esc.filters.is_none());
+    assert!(
+        filter_esc.playback_notice.is_empty(),
+        "Esc cancels filter editing and clears the error"
+    );
+
+    let mut filter_enter = screen();
+    show_auth_stop(&mut filter_enter);
+    filter_enter.app.begin_edit();
+    filter_enter.filters = Some(super::super::filters::Editor::new(
+        &filter_enter.app.committed,
+        &filter_enter.app.programs,
+    ));
+    assert!(
+        !filter_enter
+            .key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut fetching
+            )
+            .unwrap()
+    );
+    assert_ne!(filter_enter.playback_notice, error);
+}

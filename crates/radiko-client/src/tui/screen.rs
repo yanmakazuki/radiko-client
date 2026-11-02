@@ -536,32 +536,68 @@ impl Screen {
         self.notice_level = super::notices::NoticeLevel::Info;
         self.preferences_until = None;
     }
-    /// Info and warnings clear on any key. Errors clear only on a user action.
+    /// Clear only the notice that is actually on screen.
+    /// A warning hidden under an error stays, and is shown once that error goes.
+    /// Info and a visible warning clear on any key. A visible error clears only
+    /// on a user action.
     fn dismiss_for_key(&mut self, clear_error: bool) {
-        if Self::should_clear(
-            self.notice_level,
-            clear_error,
-            self.playback_notice.is_empty(),
-        ) {
-            self.playback_notice.clear();
-            self.notice_hold = super::NoticeHold::Other;
-            self.notice_hold_until = None;
-            self.notice_level = super::notices::NoticeLevel::Info;
+        let Some((level, text)) = self
+            .footer_notice()
+            .map(|(level, text)| (level, text.to_owned()))
+        else {
+            return;
+        };
+        if !Self::should_clear(level, clear_error, false) {
+            return;
         }
-        if Self::should_clear(
-            self.notification_level,
-            clear_error,
-            self.app.notification.is_empty(),
-        ) {
-            self.app.notification.clear();
-        }
-        if Self::should_clear(
-            self.preferences_level,
-            clear_error,
-            self.preferences_notice.is_empty(),
-        ) {
-            self.preferences_notice.clear();
-            self.preferences_until = None;
+        self.clear_shown_notice(level, &text);
+    }
+    fn clear_shown_notice(&mut self, level: super::notices::NoticeLevel, text: &str) {
+        let playback = self.notice_level == level && self.playback_notice == text;
+        let filter = self
+            .filters
+            .as_ref()
+            .is_some_and(|editor| editor.error == text)
+            && level == super::notices::NoticeLevel::Warning;
+        let notification = self.filters.is_none()
+            && self.notification_level == level
+            && self.app.notification == text;
+        let preferences = self.preferences_level == level && self.preferences_notice == text;
+        let mut best: Option<(u64, u8)> = None;
+        let mut offer = |seq: u64, slot: u8, matches: bool| {
+            if matches && best.is_none_or(|(best_seq, _)| seq >= best_seq) {
+                best = Some((seq, slot));
+            }
+        };
+        offer(self.playback_seq, 0, playback);
+        offer(
+            if filter {
+                self.filter_seq
+            } else {
+                self.notification_seq
+            },
+            1,
+            filter || notification,
+        );
+        offer(self.preferences_seq, 2, preferences);
+        match best.map(|(_, slot)| slot) {
+            Some(0) => {
+                self.playback_notice.clear();
+                self.notice_hold = super::NoticeHold::Other;
+                self.notice_hold_until = None;
+                self.notice_level = super::notices::NoticeLevel::Info;
+            }
+            Some(1) if filter => {
+                if let Some(editor) = &mut self.filters {
+                    editor.error.clear();
+                }
+            }
+            Some(1) => self.app.notification.clear(),
+            Some(2) => {
+                self.preferences_notice.clear();
+                self.preferences_until = None;
+            }
+            _ => {}
         }
     }
     fn should_clear(level: super::notices::NoticeLevel, clear_error: bool, empty: bool) -> bool {
@@ -907,10 +943,12 @@ impl Screen {
         Ok(false)
     }
     fn key_filters(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
-        self.dismiss_for_key(Self::key_clears_error(&key));
+        // Typing into the form is not a command. Enter and Esc are.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            self.dismiss_for_key(true);
+        }
         let mut filter_error = false;
         if let Some(editor) = &mut self.filters {
-            editor.error.clear();
             match editor.handle(key) {
                 filters::Action::Cancel => {
                     self.filters = None;
@@ -942,7 +980,10 @@ impl Screen {
         Ok(false)
     }
     fn key_keyword(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
-        self.dismiss_for_key(Self::key_clears_error(&key));
+        // Typing into the field is not a command. Enter and Esc are.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            self.dismiss_for_key(true);
+        }
         if let Some(input) = self.input.as_mut() {
             match key.code {
                 KeyCode::Esc => {
