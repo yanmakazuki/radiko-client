@@ -32,6 +32,20 @@ impl Screen {
             playback_notice: String::new(),
             notice_hold: super::NoticeHold::Other,
             notice_hold_until: None,
+            notice_level: super::notices::NoticeLevel::Info,
+            playback_seq: 0,
+            notification_level: super::notices::NoticeLevel::Info,
+            notification_seq: 0,
+            preferences_level: if preferences_notice.is_empty() {
+                super::notices::NoticeLevel::Info
+            } else {
+                super::notices::NoticeLevel::Warning
+            },
+            preferences_seq: u64::from(!preferences_notice.is_empty()),
+            preferences_until: None,
+            filter_seq: 0,
+            notice_generation: u64::from(!preferences_notice.is_empty()),
+            no_color: false,
             notice_clock: None,
             playback_stopped: false,
             stop_cause: None,
@@ -146,6 +160,7 @@ impl Screen {
         self.notice_clock = Some(now);
     }
     pub(super) fn apply_playback_at(&mut self, update: playback::Update, now: std::time::Instant) {
+        self.expire_timed_notices(now);
         if update.new_session {
             self.app.playback = None;
             self.playback_diagnostics.clear();
@@ -153,6 +168,7 @@ impl Screen {
             self.playback_notice.clear();
             self.notice_hold = super::NoticeHold::Other;
             self.notice_hold_until = None;
+            self.notice_level = super::notices::NoticeLevel::Info;
             self.playback_stopped = false;
             self.stop_cause = None;
             self.output_guide = None;
@@ -241,8 +257,10 @@ impl Screen {
         }
         if let Some(count) = renewed {
             self.seen_reauthentications = count;
-            if !self.playback_stopped && !self.playback_ended {
+            if !self.playback_stopped && !self.playback_ended && !self.notice_blocks_replacement() {
                 self.playback_notice = "配信認証を更新して再生を続けます".into();
+                self.notice_level = super::notices::NoticeLevel::Info;
+                self.bump_playback_seq();
                 self.notice_hold = super::NoticeHold::AuthRenewal;
                 self.notice_hold_until = Some(now + super::NOTICE_HOLD);
             }
@@ -250,13 +268,7 @@ impl Screen {
         let at_head = http.is_some_and(|http| http.joined_window_head);
         let paused = snapshot_state == Some(radiko::player::state::PlaybackState::Paused);
         let before_audio = snapshot_state == Some(radiko::player::state::PlaybackState::Buffering);
-        let held = self.notice_hold_until.is_some_and(|until| now < until)
-            && matches!(
-                self.notice_hold,
-                super::NoticeHold::AuthRenewal
-                    | super::NoticeHold::CatchUp
-                    | super::NoticeHold::Action
-            );
+        let held = self.notice_is_held(now);
         // An empty poll has no snapshot. Leaving the notice alone stops the
         // once-a-second blink: most 50ms ticks carry no playback snapshot.
         if has_snapshot {
@@ -264,13 +276,15 @@ impl Screen {
                 !self.playback_stopped && !self.playback_ended && !paused && !before_audio && !held;
             if show_gap {
                 if let Some(elapsed) = reconnecting_for {
-                    self.playback_notice = radiko::player::playback::reconnect_notice(elapsed);
-                    self.notice_hold = super::NoticeHold::Reconnecting;
-                    self.notice_hold_until = None;
+                    self.set_gap_notice(
+                        radiko::player::playback::reconnect_notice(elapsed),
+                        super::NoticeHold::Reconnecting,
+                    );
                 } else if receiving {
-                    self.playback_notice = radiko::player::playback::RECEPTION_NOTICE.into();
-                    self.notice_hold = super::NoticeHold::Receiving;
-                    self.notice_hold_until = None;
+                    self.set_gap_notice(
+                        radiko::player::playback::RECEPTION_NOTICE.into(),
+                        super::NoticeHold::Receiving,
+                    );
                 } else if matches!(
                     self.notice_hold,
                     super::NoticeHold::Receiving | super::NoticeHold::Reconnecting
@@ -293,17 +307,15 @@ impl Screen {
         if let Some((skipped, resets)) = realign {
             self.seen_sequence_resets = resets;
             self.seen_skipped_segments = skipped;
-            let protected = held
-                && matches!(
-                    self.notice_hold,
-                    super::NoticeHold::AuthRenewal | super::NoticeHold::Action
-                );
+            let protected = held && self.notice_blocks_replacement();
             if !self.playback_stopped && !self.playback_ended && !protected {
                 self.playback_notice = if at_head {
                     format!("配信窓の先頭から再開しました（累計{skipped}）")
                 } else {
                     format!("ライブ端に追いつきました（飛ばしたセグメントは累計{skipped}）")
                 };
+                self.notice_level = super::notices::NoticeLevel::Info;
+                self.bump_playback_seq();
                 self.notice_hold = super::NoticeHold::CatchUp;
                 self.notice_hold_until = Some(now + super::NOTICE_HOLD);
             }
@@ -323,6 +335,10 @@ impl Screen {
             // While playback continues, a *WhilePlaying kind is the sentence alone.
             // The failure prefix stays for every other kind, and for the stop
             // sentence used when no snapshot is playing.
+            // Any typed or prefixed failure before playback has started.
+            // Untyped status text has neither a kind nor a prefix.
+            let idle_failure = self.app.playback.is_none()
+                && (update.notice_kind.is_some() || update.notice_prefix.is_some());
             self.playback_notice = match kind {
                 Some(kind) if kind.while_playing() => super::messages::playback_notice(kind),
                 Some(kind) => match update.notice_prefix {
@@ -333,13 +349,141 @@ impl Screen {
                 },
                 None => notice,
             };
-            if self.playback_stopped || self.playback_ended {
-                self.notice_hold = super::NoticeHold::Other;
-                self.notice_hold_until = None;
-            } else {
-                self.hold_action(now);
-            }
+            let level = super::notices::playback_level(
+                kind,
+                update.stopped,
+                idle_failure,
+                output_failure.is_some(),
+            );
+            self.notice_level = level;
+            self.bump_playback_seq();
+            self.apply_notice_hold(level, now);
         }
+    }
+    /// Warnings and errors stay in front of catch-up, auth renewal, and gap text.
+    fn notice_blocks_replacement(&self) -> bool {
+        matches!(
+            self.notice_hold,
+            super::NoticeHold::AuthRenewal
+                | super::NoticeHold::Action
+                | super::NoticeHold::Warning
+                | super::NoticeHold::Error
+        )
+    }
+    fn notice_is_held(&self, now: std::time::Instant) -> bool {
+        match self.notice_hold {
+            super::NoticeHold::Warning | super::NoticeHold::Error => true,
+            super::NoticeHold::AuthRenewal
+            | super::NoticeHold::CatchUp
+            | super::NoticeHold::Action => self.notice_hold_until.is_some_and(|until| now < until),
+            super::NoticeHold::Other
+            | super::NoticeHold::Receiving
+            | super::NoticeHold::Reconnecting => false,
+        }
+    }
+    fn apply_notice_hold(&mut self, level: super::notices::NoticeLevel, now: std::time::Instant) {
+        match level {
+            super::notices::NoticeLevel::Error => {
+                self.notice_hold = super::NoticeHold::Error;
+                self.notice_hold_until = None;
+            }
+            super::notices::NoticeLevel::Warning => {
+                self.notice_hold = super::NoticeHold::Warning;
+                self.notice_hold_until = None;
+            }
+            super::notices::NoticeLevel::Info => self.hold_action(now),
+        }
+    }
+    fn set_gap_notice(&mut self, text: String, hold: super::NoticeHold) {
+        let entered = self.notice_hold != hold;
+        self.playback_notice = text;
+        self.notice_level = super::notices::NoticeLevel::Info;
+        if entered {
+            self.bump_playback_seq();
+        }
+        self.notice_hold = hold;
+        self.notice_hold_until = None;
+    }
+    fn bump_playback_seq(&mut self) {
+        self.playback_seq = self.bump_seq();
+    }
+    fn bump_seq(&mut self) -> u64 {
+        self.notice_generation = self.notice_generation.saturating_add(1);
+        self.notice_generation
+    }
+    pub(super) fn note_preferences(&mut self, level: super::notices::NoticeLevel) {
+        self.preferences_level = level;
+        self.preferences_seq = self.bump_seq();
+        self.preferences_until = match level {
+            super::notices::NoticeLevel::Info => Some(self.playback_now() + super::NOTICE_HOLD),
+            super::notices::NoticeLevel::Warning | super::notices::NoticeLevel::Error => None,
+        };
+    }
+    fn note_notification(&mut self, level: super::notices::NoticeLevel) {
+        self.notification_level = level;
+        self.notification_seq = self.bump_seq();
+    }
+    fn note_filter(&mut self) {
+        self.filter_seq = self.bump_seq();
+    }
+    pub(super) fn expire_timed_notices(&mut self, now: std::time::Instant) {
+        if self.preferences_level == super::notices::NoticeLevel::Info
+            && !self.preferences_notice.is_empty()
+            && self.preferences_until.is_some_and(|until| now >= until)
+        {
+            self.preferences_notice.clear();
+            self.preferences_until = None;
+        }
+        // One-shot info, including 「一時停止」「停止しました」「番組終了」.
+        // Gap status has no deadline and stays while the condition holds.
+        if self.notice_level == super::notices::NoticeLevel::Info
+            && !self.playback_notice.is_empty()
+            && self.notice_hold_until.is_some_and(|until| now >= until)
+        {
+            self.playback_notice.clear();
+            self.notice_hold = super::NoticeHold::Other;
+            self.notice_hold_until = None;
+        }
+    }
+    pub(super) fn expire_preferences(&mut self) {
+        self.expire_timed_notices(self.playback_now());
+    }
+    pub(super) fn footer_notice(&self) -> Option<(super::notices::NoticeLevel, &str)> {
+        let filter = self
+            .filters
+            .as_ref()
+            .map(|editor| editor.error.as_str())
+            .unwrap_or("");
+        let (secondary, secondary_level, secondary_seq) = if self.filters.is_some() {
+            (
+                filter,
+                super::notices::NoticeLevel::Warning,
+                self.filter_seq,
+            )
+        } else {
+            (
+                self.app.notification.as_str(),
+                self.notification_level,
+                self.notification_seq,
+            )
+        };
+        super::notices::choose_notice(&[
+            super::notices::Candidate {
+                level: self.notice_level,
+                seq: self.playback_seq,
+                text: &self.playback_notice,
+            },
+            super::notices::Candidate {
+                level: secondary_level,
+                seq: secondary_seq,
+                text: secondary,
+            },
+            super::notices::Candidate {
+                level: self.preferences_level,
+                seq: self.preferences_seq,
+                text: &self.preferences_notice,
+            },
+        ])
     }
     fn hold_action(&mut self, now: std::time::Instant) {
         self.notice_hold = super::NoticeHold::Action;
@@ -362,6 +506,8 @@ impl Screen {
     pub(super) fn show_notice(&mut self, notice: impl Into<String>) {
         let now = self.playback_now();
         self.playback_notice = notice.into();
+        self.notice_level = super::notices::NoticeLevel::Info;
+        self.bump_playback_seq();
         self.hold_action(now);
     }
     fn has_footer_notice(&self) -> bool {
@@ -371,18 +517,127 @@ impl Screen {
             || self.output_guide.is_some()
     }
     /// 通常画面の Esc。再生・一時停止・選択・条件と停止フラグは残す。
+    /// 出ている通知だけを消す。エラーの下に隠れていた警告は残し、次の描画で出す。
     fn dismiss_notices(&mut self) {
-        self.playback_notice.clear();
-        self.app.notification.clear();
-        self.preferences_notice.clear();
+        if let Some((level, text)) = self
+            .footer_notice()
+            .map(|(level, text)| (level, text.to_owned()))
+        {
+            self.clear_shown_notice(level, &text);
+        }
         self.output_guide = None;
-        if matches!(
-            self.notice_hold,
-            super::NoticeHold::Action | super::NoticeHold::CatchUp | super::NoticeHold::AuthRenewal
-        ) {
+        if self.notification_level != super::notices::NoticeLevel::Warning {
+            self.app.notification.clear();
+        }
+        if self.preferences_level != super::notices::NoticeLevel::Warning {
+            self.preferences_notice.clear();
+            self.preferences_until = None;
+        }
+        if self.notice_level != super::notices::NoticeLevel::Warning {
+            self.playback_notice.clear();
             self.notice_hold = super::NoticeHold::Other;
             self.notice_hold_until = None;
+            self.notice_level = super::notices::NoticeLevel::Info;
         }
+    }
+    /// Clear only the notice that is actually on screen.
+    /// A warning hidden under an error stays, and is shown once that error goes.
+    /// Info and a visible warning clear on any key. A visible error clears only
+    /// on a user action.
+    fn dismiss_for_key(&mut self, clear_error: bool) {
+        let Some((level, text)) = self
+            .footer_notice()
+            .map(|(level, text)| (level, text.to_owned()))
+        else {
+            return;
+        };
+        if !Self::should_clear(level, clear_error, false) {
+            return;
+        }
+        self.clear_shown_notice(level, &text);
+    }
+    fn clear_shown_notice(&mut self, level: super::notices::NoticeLevel, text: &str) {
+        let playback = self.notice_level == level && self.playback_notice == text;
+        let filter = self
+            .filters
+            .as_ref()
+            .is_some_and(|editor| editor.error == text)
+            && level == super::notices::NoticeLevel::Warning;
+        let notification = self.filters.is_none()
+            && self.notification_level == level
+            && self.app.notification == text;
+        let preferences = self.preferences_level == level && self.preferences_notice == text;
+        let mut best: Option<(u64, u8)> = None;
+        let mut offer = |seq: u64, slot: u8, matches: bool| {
+            if matches && best.is_none_or(|(best_seq, _)| seq >= best_seq) {
+                best = Some((seq, slot));
+            }
+        };
+        offer(self.playback_seq, 0, playback);
+        offer(
+            if filter {
+                self.filter_seq
+            } else {
+                self.notification_seq
+            },
+            1,
+            filter || notification,
+        );
+        offer(self.preferences_seq, 2, preferences);
+        match best.map(|(_, slot)| slot) {
+            Some(0) => {
+                self.playback_notice.clear();
+                self.notice_hold = super::NoticeHold::Other;
+                self.notice_hold_until = None;
+                self.notice_level = super::notices::NoticeLevel::Info;
+            }
+            Some(1) if filter => {
+                if let Some(editor) = &mut self.filters {
+                    editor.error.clear();
+                }
+            }
+            Some(1) => self.app.notification.clear(),
+            Some(2) => {
+                self.preferences_notice.clear();
+                self.preferences_until = None;
+            }
+            _ => {}
+        }
+    }
+    fn should_clear(level: super::notices::NoticeLevel, clear_error: bool, empty: bool) -> bool {
+        if empty {
+            return false;
+        }
+        match level {
+            super::notices::NoticeLevel::Error => clear_error,
+            super::notices::NoticeLevel::Warning | super::notices::NoticeLevel::Info => true,
+        }
+    }
+    fn key_clears_error(key: &KeyEvent) -> bool {
+        matches!(
+            key.code,
+            KeyCode::Enter
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char(
+                    ' ' | 's'
+                        | 'l'
+                        | 'g'
+                        | '+'
+                        | '-'
+                        | 'a'
+                        | 'I'
+                        | 'O'
+                        | 'f'
+                        | '/'
+                        | 'b'
+                        | 'r'
+                        | 'v'
+                        | 'c'
+                        | 'e'
+                        | '?'
+                )
+        )
     }
     pub(super) fn rows(&self) -> &[usize] {
         if self.live_mode {
@@ -505,6 +760,10 @@ impl Screen {
     pub(super) fn apply(&mut self, event: radiko::app::search::Event) {
         let key = self.selected().map(|p| p.key.clone());
         self.app.apply(event);
+        if self.app.status == radiko::app::SearchStatus::Failed && !self.app.notification.is_empty()
+        {
+            self.note_notification(super::notices::NoticeLevel::Warning);
+        }
         self.rebuild_live(Utc::now().fixed_offset());
         self.restore_selection(key);
     }
@@ -528,6 +787,13 @@ impl Screen {
     pub(super) fn named_event(&mut self, event: NamedEvent) -> Result<(), &'static str> {
         if event.mutating {
             self.preferences_notice = named_receipt(&event.result);
+            if !self.preferences_notice.is_empty() {
+                let level = match &event.result {
+                    Ok(_) => super::notices::NoticeLevel::Info,
+                    Err(_) => super::notices::NoticeLevel::Warning,
+                };
+                self.note_preferences(level);
+            }
         }
         let Some(manager) = &mut self.named else {
             return Ok(());
@@ -681,6 +947,11 @@ impl Screen {
         Ok(false)
     }
     fn key_filters(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
+        // Typing into the form is not a command. Enter and Esc are.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            self.dismiss_for_key(true);
+        }
+        let mut filter_error = false;
         if let Some(editor) = &mut self.filters {
             match editor.handle(key) {
                 filters::Action::Cancel => {
@@ -693,7 +964,10 @@ impl Screen {
                         self.submit(service)?;
                         self.filters = None;
                     }
-                    Err(reason) => editor.error = reason.into(),
+                    Err(reason) => {
+                        editor.error = reason.into();
+                        filter_error = true;
+                    }
                 },
                 filters::Action::Edit => {
                     editor.error.clear();
@@ -704,9 +978,16 @@ impl Screen {
                 filters::Action::None => (),
             }
         }
+        if filter_error {
+            self.note_filter();
+        }
         Ok(false)
     }
     fn key_keyword(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
+        // Typing into the field is not a command. Enter and Esc are.
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            self.dismiss_for_key(true);
+        }
         if let Some(input) = self.input.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -720,7 +1001,10 @@ impl Screen {
                             self.input = None;
                             self.submit(service)?;
                         }
-                        Err(error) => self.app.notification = error.into(),
+                        Err(error) => {
+                            self.app.notification = error.into();
+                            self.note_notification(super::notices::NoticeLevel::Warning);
+                        }
                     }
                 }
                 KeyCode::Backspace => {
@@ -856,6 +1140,9 @@ impl Screen {
         Ok(())
     }
     fn key_browser(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
+        if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.dismiss_for_key(Self::key_clears_error(&key));
+        }
         match key.code {
             KeyCode::Char('q') => return Ok(true),
             // 通常画面の Esc は終了しない。出ている通知は消すだけ。無いときは終了案内を出す。
@@ -866,6 +1153,8 @@ impl Screen {
                 } else {
                     // 5秒保持にすると、直後の受信待ち・再接続中・追いつきが隠れる。
                     self.playback_notice = super::QUIT_HINT.into();
+                    self.notice_level = super::notices::NoticeLevel::Info;
+                    self.bump_playback_seq();
                     self.notice_hold = super::NoticeHold::Other;
                     self.notice_hold_until = None;
                 }

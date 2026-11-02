@@ -2,6 +2,34 @@
 
 日付ごとの検証記録です。新しい記録は先頭へ足します。1節が1回の確認で、対象、手順、結果、その結果に含めない範囲を分けて書いてあります。
 
+## 2026年11月2日：通知を重要度で出し、消えるタイミングを揃える
+
+TUI のフッター通知を `{level, text}` で1件だけ出す。重要度は表示文との一致では決めない。`NoticeKind` と、再生が止まったか、出力機器の失敗かで決める。高い方を優先し、同じときは新しい方を出す。`playback_notice`、検索失敗、条件保存、フィルタの入力エラーは連結しない。
+
+| 種類 | 重要度 | 理由 |
+| --- | --- | --- |
+| `AuthExpiredWhilePlaying` | 警告 | 再生は続いている |
+| `ReconnectLimitWhilePlaying` | 警告 | 再生は続いている |
+| `DeadlineWhilePlaying` | 警告 | 再生は続いている |
+| `ProbeTimeoutWhilePlaying` | 警告 | 再生は続いている |
+| `SourceStalledWhilePlaying` | 警告 | 再生は続いている |
+| `EarlyEndWhilePlaying` | 警告 | 再生は続いている |
+| `StreamFailedWhilePlaying` | 警告 | 再生は続いている |
+| `InvalidPositionWhilePlaying` | 警告 | 再生は続いている |
+| `HttpWhilePlaying` | 警告 | 再生は続いている |
+
+エラーは、再生が止まったとき、何も再生していないときの失敗、出力機器の失敗である。種類のない準備失敗（通信失敗、30秒の途切れなど）も、何も再生していないときはエラーである。エリア外、ログイン、セッション失効、配信認証の拒否は、再生中は警告、何も再生していないときはエラーである。利用者の「停止しました」、番組終了、追いつき、配信認証の更新、操作の結果は情報である。
+
+エラーは赤の太字で先頭に「✕」、警告は黄色で先頭に「!」、情報は通常の色である。`NO_COLOR` が空でないときは前景も背景も付けず、記号だけを残す。空文字は色を残す。テストは環境変数を書き換えず、設定を引数で渡す。
+
+エラーは時間では消えず、次の操作まで残る。一覧の `j` / `k` では消えない。警告も時間では消えず、次のキーで消える。「一時停止」「停止しました」「番組終了」を含む情報は5秒（`NOTICE_HOLD`）または次のキーで消える。受信待ちと再接続中は、その状態が続くあいだ残り、時間では消えない。警告とエラーのあいだ、受信待ちと再接続中は置き換えない。記号と空白を足した最長の警告は67桁で、80×24 と 160×40 の1行に収まる。文面、接頭辞の外し方、CLI、ライブラリの `Display` は変えていない。
+
+再生が続いている切替またはシークの失敗では「再生を停止しました」を出さない。何も再生していないとき、利用者の停止、認証期限切れで止まったときは、これまでどおり出す。続くときは警告、止まったときはエラーまたは情報である。
+
+何も再生していない失敗は、種類がなくても、エリア外やログインでも、エラーである。エリア外は再生中は警告のままである。「一時停止」「停止しました」「番組終了」は出してから5秒で消える。同じ重要度は、並びではなく新しい方を出す。エラーの下に隠れた警告は、エラーが消えてから表示し、その次のキーで消える。キーワードと検索条件の入力中は、文字を打ってもエラーは消えず、Enter と Esc だけで消える。
+
+確認は Linux x86_64。Rust 1.99.1（`58cf8f9c3`、2026-10-13）と Rust 1.85.0（`4d91de4e4`、2025-02-17）で、`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features -- --test-threads=8` はどちらも 477 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。`idle_failure` を外すと、`idle_failures_are_errors_for_every_kind_and_for_a_kindless_failure` が `crates/radiko-client/src/tui/tests/notices.rs:685` で `LoginRequired` が `Warning`、期待 `Error` になって失敗する。再生情報の期限を外すと、`playback_info_notices_expire_on_the_injected_clock` が 771 行で「一時停止 must be gone at 5s+1ns」になる。同じ重要度の seq を外すと、`same_level_keeps_the_newer_notice_even_when_it_is_listed_first` が `crates/radiko-client/src/tui/notices.rs:135` で `Some("古い警告")`、期待 `Some("新しい警告")` になる。エラーを消すときに隠れた警告も消すと、`hidden_warning_is_drawn_after_the_error_clears_then_the_next_key_drops_it` が 860 行で「the warning must be drawn once the error clears」になる。キーワード入力のどのキーでもエラーを消すと、`typing_into_keyword_or_filters_keeps_an_error_until_enter_or_esc` が `crates/radiko-client/src/tui/tests/notices.rs:949` で `keyword a` の通知が空になる。種類の対応を警告とエラーで入れ替えると、`notice_cells_use_the_level_from_the_kind` が 155 行で「!」ではなく「✕」になって失敗する。色を外すと、同じテストが 159 行で前景 `Reset`、期待 `Yellow` になって失敗する。再生中の切替失敗を生の文に戻すと、`switch_or_seek_failure_while_playing_does_not_say_playback_stopped` が 497 行で「再生切替失敗（現在の状態を維持）: 認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください」になり、続く文と一致しない。radiko への通信と実機の再生はない。macOS はこの環境では実行していない。
+
 ## 2026年11月1日：再生中の失敗文は接頭辞なしで一行に出す
 
 再生が続いているあいだ、`NoticeKind::while_playing` が真の種類は、TUI では文だけを出す。「再生準備失敗（現在の状態を維持）」と「再生切替失敗（現在の状態を維持）」は付けない。種類で決め、文面の一致では決めない。スナップショットが無いときは、これまでどおり接頭辞付きの停止文に戻す。ライブラリの `Display` と CLI の文は変えていない。
@@ -194,7 +222,7 @@ Rust は SIGPIPE を無視する。標準エラーが閉じたパイプだと、
 
 5秒の保持は、操作の結果、画面側の放送前・放送終了、追いつきの2文、配信認証の更新を、1件ずつ見ている。時刻は壁時計から1日ずらしてある。音が戻った2秒後と、出してから4.9秒後はその文のままで、5.1秒後は「受信待ち…」になる。`show_notice` が壁時計のまま、または保持しない改変は、放送前の4.9秒で「受信待ち…」になって失敗する。一時停止と再生準備中の保持を外す改変も、それぞれの4.9秒で失敗する。
 
-番組終了の抑止は、出してから5.1秒後の無音で見ている。5秒の保持が切れたあとでも「番組終了」のままである。`ended` を記録しない改変は、その時点で「再接続中…（40秒）」になって失敗する。
+番組終了は情報である。出してから5秒（`NOTICE_HOLD`）で消え、5.1秒後の無音では空である。「再接続中…」には替わらない。`ended` を記録しない改変は、その時点で「再接続中…（40秒）」になって失敗する。
 
 確認は Linux x86_64、Rust 1.99.1（58cf8f9c3、2026-10-13）と Rust 1.85.0（4d91de4e4、2025-02-17）である。`cargo +stable fmt --all -- --check`、`cargo +stable clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo +stable test --workspace --locked --all-targets --all-features` は 383 件成功、失敗 0、ignored 2 件（`native_muted`）である。`cargo +1.85.0 clippy` と同じオプションのテストも 383 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 57 件成功である。`unshare -rn python3 scripts/smoke_tui.py --require-isolated-network --binary target/debug/radiko-client` は終了 0、端末復元だった。`--help` とオフライン画面は、この変更の前のバイナリとバイト単位で同じである。radiko への通信と実機の再生はない。再接続上限の直前の空フレームと、タイムフリーの一時停止からの再開で秒数を数え直す件は、今回は直していない。
 

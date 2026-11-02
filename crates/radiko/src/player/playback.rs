@@ -3958,6 +3958,15 @@ mod tests {
             .unwrap();
             let quit = tx.clone();
             let handle = thread::spawn(move || {
+                // Drop sends Stop even when an assertion panics, so `play_loop` returns
+                // and the panic becomes a test failure instead of a hang.
+                struct StopOnDrop(std::sync::mpsc::Sender<Command>);
+                impl Drop for StopOnDrop {
+                    fn drop(&mut self) {
+                        let _ = self.0.send(Command::Stop);
+                    }
+                }
+                let _stop = StopOnDrop(quit);
                 let (message, kind, prefix) =
                     received.recv_timeout(Duration::from_secs(2)).unwrap();
                 assert!(message.starts_with("再生準備失敗（現在の状態を維持）: "));
@@ -3965,7 +3974,7 @@ mod tests {
                 assert!(!message.contains("再生は続いています"), "{message}");
                 if reconnect {
                     assert_eq!(kind, None);
-                    assert_eq!(prefix, None);
+                    assert_eq!(prefix, Some("再生準備失敗（現在の状態を維持）"));
                     assert!(message.contains(
                         "再接続の上限を超えたため再生を停止しました。番組を選び直して再生してください"
                     ));
@@ -3976,7 +3985,6 @@ mod tests {
                         "認証期限切れのため再生を停止しました。aで再確認するか、loginで再ログインしてください"
                     ));
                 }
-                quit.send(Command::Stop).unwrap();
             });
             let report = play_loop::<Sink>(
                 Initial::<Source>::Idle(idle),

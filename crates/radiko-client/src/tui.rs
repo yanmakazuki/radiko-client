@@ -29,6 +29,7 @@ mod help;
 mod login;
 mod messages;
 mod named;
+mod notices;
 mod offline;
 mod picker;
 mod screen;
@@ -206,8 +207,13 @@ enum NoticeHold {
     Reconnecting,
     CatchUp,
     AuthRenewal,
-    /// A user-action result or error. Same 5-second hold as catch-up and auth.
+    /// Informational result. Same 5-second hold as catch-up and auth.
     Action,
+    /// A `*WhilePlaying` failure. No timer. The next key clears it.
+    Warning,
+    /// Playback stopped, or an output-device failure. No timer.
+    /// Navigation keys leave it; the next user action clears it.
+    Error,
 }
 struct Screen {
     help_open: bool,
@@ -239,8 +245,22 @@ struct Screen {
     playback_action: Option<PlaybackAction>,
     playback_notice: String,
     notice_hold: NoticeHold,
-    /// Catch-up, auth, and action text stay until this instant. Gap notices wait.
+    /// Catch-up, auth, and informational action text stay until this instant.
+    /// Warnings and errors do not use it.
     notice_hold_until: Option<std::time::Instant>,
+    /// Level of [`Self::playback_notice`]. Derived from the kind or playback state.
+    notice_level: notices::NoticeLevel,
+    playback_seq: u64,
+    notification_level: notices::NoticeLevel,
+    notification_seq: u64,
+    preferences_level: notices::NoticeLevel,
+    preferences_seq: u64,
+    /// Informational preference text expires at this instant. Warnings do not.
+    preferences_until: Option<std::time::Instant>,
+    filter_seq: u64,
+    notice_generation: u64,
+    /// Set from `NO_COLOR` at startup. Tests assign it directly and do not touch the environment.
+    no_color: bool,
     /// Test clock. Empty in production, so notices use the wall clock.
     notice_clock: Option<std::time::Instant>,
     /// Set from a failed playback update. Not inferred from the notice text.
@@ -398,12 +418,14 @@ pub fn run(args: &[String], data_dir: Option<PathBuf>) -> Result<(), Box<dyn std
         let _restore = RestoreTerminal;
         let mut terminal = ratatui::try_init()?;
         let mut screen = Screen::new(criteria, preferences_notice);
+        screen.no_color = notices::no_color_enabled(std::env::var_os("NO_COLOR").as_deref());
         if offline {
             screen.offline = true;
             if !screen.preferences_notice.is_empty() {
                 screen.preferences_notice.push('\n');
             }
             screen.preferences_notice.push_str(offline::NOTICE);
+            screen.note_preferences(notices::NoticeLevel::Info);
         }
         let rt = runtime.0.as_ref().ok_or("実行環境を開始できません")?;
         rt.block_on(async {
