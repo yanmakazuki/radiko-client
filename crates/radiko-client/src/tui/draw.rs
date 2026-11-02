@@ -434,30 +434,35 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
             .unwrap_or("処理診断 未取得")
             .to_owned()
     };
-    // 受信待ち… と再接続中… は、このフッターと同じ通常の状態色で出す。エラー色は付けない。
-    let footer = format!(
-        "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}\n{}\n{} {}",
+    // 受信待ち… と再接続中… は情報なので、このフッターと同じ通常の状態色で出す。
+    let head = format!(
+        "{} / {} / 不正枠{}\n{}\n{}\n{}\n{}",
         state,
         progress,
         screen.app.invalid_count,
         playing,
         screen.playback_diagnostics,
         pipeline,
-        controls,
-        screen.playback_notice,
-        screen
-            .filters
-            .as_ref()
-            .map(|editor| editor.error.as_str())
-            .unwrap_or(&screen.app.notification),
-        screen.preferences_notice
+        controls
     );
+    let mut lines: Vec<ratatui::text::Line> = head
+        .lines()
+        .map(|line| ratatui::text::Line::from(line.to_owned()))
+        .collect();
+    if let Some((level, text)) = screen.footer_notice() {
+        let marked = format!("{}{text}", super::notices::notice_mark(level));
+        lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+            marked,
+            super::notices::notice_style(level, screen.no_color),
+        )));
+    }
     frame.render_widget(
-        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
         area,
     );
 }
 pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
+    screen.expire_preferences();
     if screen.failures_open {
         failures::draw(
             frame,

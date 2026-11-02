@@ -639,8 +639,9 @@ fn slot_mismatch_sentence_is_not_the_position_sentence() {
             .playback_notice
             .contains("指定した位置は番組の範囲外です")
     );
-    assert_full_notice_row(&mut mismatch, 80, 24, generic);
-    assert_full_notice_row(&mut mismatch, 160, 40, generic);
+    let marked = format!("! {generic}");
+    assert_full_notice_row(&mut mismatch, 80, 24, &marked);
+    assert_full_notice_row(&mut mismatch, 160, 40, &marked);
 
     let mut chosen = super::screen();
     chosen.app.playback = Some(playing_snapshot());
@@ -655,8 +656,9 @@ fn slot_mismatch_sentence_is_not_the_position_sentence() {
         ..radiko::app::playback::Update::default()
     });
     assert_eq!(chosen.playback_notice, position);
-    assert_full_notice_row(&mut chosen, 80, 24, position);
-    assert_full_notice_row(&mut chosen, 160, 40, position);
+    let marked = format!("! {position}");
+    assert_full_notice_row(&mut chosen, 80, 24, &marked);
+    assert_full_notice_row(&mut chosen, 160, 40, &marked);
 }
 
 fn assert_full_notice_row(screen: &mut Screen, width: u16, height: u16, sentence: &str) {
@@ -729,8 +731,9 @@ fn while_playing_notices_fit_one_row_without_the_failure_prefix() {
         });
         assert_eq!(screen.playback_notice, sentence);
         assert!(!screen.playback_notice.starts_with(prefix), "{sentence}");
+        let marked = format!("! {sentence}");
         for (width, height) in [(80u16, 24u16), (160, 40)] {
-            assert_full_notice_row(&mut screen, width, height, sentence);
+            assert_full_notice_row(&mut screen, width, height, &marked);
         }
     }
 
@@ -780,9 +783,11 @@ fn while_playing_notices_fit_one_row_without_the_failure_prefix() {
         assert!(idle.app.playback.is_none());
         let rows = content_rows(&mut idle, 80, 24);
         assert!(
-            rows.iter()
-                .any(|row| row.starts_with("再生準備失敗（現在の状態を維持）:")
-                    || row.starts_with("再生切替失敗（現在の状態を維持）:")),
+            rows.iter().any(|row| {
+                let row = row.strip_prefix("✕ ").unwrap_or(row);
+                row.starts_with("再生準備失敗（現在の状態を維持）:")
+                    || row.starts_with("再生切替失敗（現在の状態を維持）:")
+            }),
             "{rows:?}"
         );
     }
