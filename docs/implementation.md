@@ -2,6 +2,14 @@
 
 日付ごとの検証記録です。新しい記録は先頭へ足します。1節が1回の確認で、対象、手順、結果、その結果に含めない範囲を分けて書いてあります。
 
+## 2026年11月4日：出力機器の読み取り専用診断
+
+通常画面の `d` で、全画面の読み取り専用パネルを出す。Esc、`d`、`q` はパネルを閉じるだけで、開いているあいだの `q` は終了しない。キーワードと検索条件の入力中の `d` は文字のままである。表示は、ホスト（CoreAudio または ALSA）、既定の機器名、再生中のサンプルレートでの f32 mono と f32 stereo の対応、最後の `OutputError`、および「出力機器は OS の既定に従います。アプリ内では選べません」である。機器の選択と切り替えはない。`?` の下段に、機器名と最後のエラーを1行で出す。端末の高さが20行未満のときは、操作一覧の折り返しが重ならないよう、この1行は出さない。80×24 と 160×40 では出す。
+
+問い合わせは `DeviceProbe` の背後にあり、CPAL はワーカーで呼ぶ。画面のキー処理と描画は結果を待たず、「取得中…」を出す。機器が無いときは「既定の音声出力機器がありません」、それ以外の失敗は「出力機器を確認できません。」にエラーを続ける。どちらもエラー（赤の太字、✕）で、次の行は「OSのサウンド設定を確認し、d で閉じてから Enter で再生し直してください」である。Linux の問い合わせは、再生と `output-info` と同じ fd 2 の差し替えを通す。ライブラリの `Display` と CLI のバイト列は変えていない。
+
+確認環境は Linux x86_64、音声デバイスなしである。Rust 1.99.1（`58cf8f9c3`、2026-10-13）と Rust 1.85.0（`4d91de4e4`、2025-02-17）で、`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`、`cargo test --workspace --locked --all-targets --all-features -- --test-threads=8` はどちらも 488 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。`q` を終了に戻すと `d_on_the_normal_screen_opens_a_panel_and_q_esc_or_d_only_closes_it` が `crates/radiko-client/src/tui/tests/device.rs:182` で失敗する。キーワード欄の `d` でパネルを開くと、同じテストが 195 行で入力が `Some("")`、期待 `Some("d")` になる。注記を変えると `panel_text_is_literal_at_80x24_and_160x40` が 243 行で失敗する。長い名前を切らないと `long_device_names_stay_on_one_line_and_tiny_terminals_do_not_panic` が 272 行で失敗する。`NoDevice` を失敗問い合わせと同じ文にすると `nodevice_and_a_failed_query_use_different_error_sentences` が 361 行で失敗する。画面スレッドで問い合わせると `the_probe_runs_off_the_ui_thread_and_loading_shows_before_the_result` が 467 行で失敗する。`d` で通知を消すと `playback_and_search_continue_while_the_panel_is_open` が 496 行で通知が空になる。Enter で音量を変えると `enter_and_arrows_do_not_select_or_switch_devices` が 582 行で `0`、期待 `40` になる。`OutputError::NoDevice` の表示を変えると `linux_output_commands_hide_alsa_diagnostics_and_name_a_missing_device` が `crates/radiko-client/tests/cli.rs:462` で stderr が一致しない。診断が列挙を通らないと `diagnose_default_output_silences_fd2_and_reports_no_device_without_panicking` が `crates/radiko/src/player/output.rs:1366` で `SEAM-RAN` が無い。macOS、実機の再生、radiko への通信は確認していない。
+
 ## 2026年11月2日：通知を重要度で出し、消えるタイミングを揃える
 
 TUI のフッター通知を `{level, text}` で1件だけ出す。重要度は表示文との一致では決めない。`NoticeKind` と、再生が止まったか、出力機器の失敗かで決める。高い方を優先し、同じときは新しい方を出す。`playback_notice`、検索失敗、条件保存、フィルタの入力エラーは連結しない。

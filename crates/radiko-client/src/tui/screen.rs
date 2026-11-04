@@ -57,6 +57,12 @@ impl Screen {
             playback_diagnostics: String::new(),
             pipeline_diagnostics: String::new(),
             volume: 25,
+            device_open: false,
+            device_status: super::device::DeviceStatus::Idle,
+            device_rx: None,
+            device_generation: 0,
+            probe: std::sync::Arc::new(super::device::CpalProbe),
+            last_output_error: None,
             app: AppState::new(criteria),
             list: ListState::default(),
             list_height: 1,
@@ -192,6 +198,9 @@ impl Screen {
             }
         }
         let output_failure = update.output_failure;
+        if let Some(kind) = output_failure {
+            self.last_output_error = Some(super::device::output_error_label(kind));
+        }
         if update.ended {
             self.playback_ended = true;
         }
@@ -843,6 +852,9 @@ impl Screen {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
         }
+        if self.device_open {
+            return self.key_device(key);
+        }
         if self.help_open {
             return self.key_help(key);
         }
@@ -874,6 +886,64 @@ impl Screen {
             return Ok(stopped);
         }
         self.key_browser(key, service)
+    }
+    fn key_device(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('d' | 'q')) {
+            self.device_open = false;
+        }
+        Ok(false)
+    }
+    fn device_sample_rate(&self) -> u32 {
+        self.app
+            .playback
+            .as_ref()
+            .and_then(|playback| playback.output.as_ref())
+            .map(|output| output.sample_rate)
+            .filter(|rate| radiko::player::output::PCM_SAMPLE_RATE_RANGE.contains(rate))
+            .unwrap_or(48_000)
+    }
+    fn open_device_panel(&mut self) {
+        self.device_open = true;
+        self.device_status = super::device::DeviceStatus::Loading;
+        self.device_generation = self.device_generation.wrapping_add(1);
+        let generation = self.device_generation;
+        let rate = self.device_sample_rate();
+        self.device_rx = Some(super::device::spawn_inquiry(
+            std::sync::Arc::clone(&self.probe),
+            rate,
+            generation,
+        ));
+    }
+    pub(super) fn poll_device(&mut self) {
+        let Some(rx) = &self.device_rx else {
+            return;
+        };
+        let message = match rx.try_recv() {
+            Ok(message) => message,
+            Err(super::mpsc::TryRecvError::Empty) => return,
+            Err(super::mpsc::TryRecvError::Disconnected) => {
+                self.device_rx = None;
+                if matches!(self.device_status, super::device::DeviceStatus::Loading) {
+                    self.device_status =
+                        super::device::DeviceStatus::Failed(super::device::DeviceFailure::Query(
+                            super::device::query_failed_sentence("出力機器の確認が中断されました"),
+                        ));
+                }
+                return;
+            }
+        };
+        if message.generation != self.device_generation {
+            return;
+        }
+        self.device_rx = None;
+        self.device_status = super::device::status_from(message.outcome);
+    }
+    #[cfg(test)]
+    pub(super) fn set_device_probe(
+        &mut self,
+        probe: std::sync::Arc<dyn super::device::DeviceProbe>,
+    ) {
+        self.probe = probe;
     }
     fn key_help(&mut self, key: KeyEvent) -> Result<bool, &'static str> {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
@@ -1140,6 +1210,15 @@ impl Screen {
         Ok(())
     }
     fn key_browser(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
+        if key.code == KeyCode::Char('d')
+            && self.app.chapters.target.is_none()
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.open_device_panel();
+            return Ok(false);
+        }
         if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.dismiss_for_key(Self::key_clears_error(&key));
         }
