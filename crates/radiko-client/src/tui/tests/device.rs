@@ -1,4 +1,4 @@
-use super::super::device::{self, DeviceFailure, DeviceProbe, DeviceReport, DeviceStatus};
+use super::super::device::{DeviceFailure, DeviceProbe, DeviceReport, DeviceStatus};
 use super::*;
 use radiko::player::output::{OutputError, OutputSampleFormat, OutputSummary};
 use ratatui::{
@@ -624,7 +624,7 @@ fn playback_at(rate: u32) -> radiko::player::state::PlaybackSnapshot {
 #[test]
 fn linux_device_worker_does_not_leak_alsa_text_and_shows_nodevice_without_panic() {
     if std::env::var_os("RADIKO_DEVICE_CHILD").is_some() {
-        let probe = device::CpalProbe;
+        let probe = super::super::device::CpalProbe;
         let result = thread::spawn(move || probe.inquire(48_000))
             .join()
             .expect("device worker");
