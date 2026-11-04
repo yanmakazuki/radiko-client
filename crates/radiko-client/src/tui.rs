@@ -22,6 +22,7 @@ macro_rules! dialog_close_hint {
     };
 }
 mod areas;
+mod device;
 mod draw;
 mod failures;
 mod filters;
@@ -79,6 +80,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     time::Duration,
 };
@@ -278,6 +280,13 @@ struct Screen {
     playback_diagnostics: String,
     pipeline_diagnostics: String,
     volume: u32,
+    device_open: bool,
+    device_status: device::DeviceStatus,
+    device_rx: Option<mpsc::Receiver<device::DeviceMessage>>,
+    device_generation: u64,
+    probe: Arc<dyn device::DeviceProbe>,
+    /// Last playback `OutputError` display text. Kept for the diagnostic panel.
+    last_output_error: Option<String>,
     app: AppState,
     list: ListState,
     list_height: usize,
@@ -345,6 +354,7 @@ async fn poll_services(screen: &mut Screen, jobs: &mut Services<'_>) -> Result<(
     for event in jobs.search.poll().await {
         screen.apply(event);
     }
+    screen.poll_device();
     if let Some(event) = jobs.chapters.poll().await {
         screen.app.chapters.apply(event);
         if screen.chapter_list.selected().is_none()

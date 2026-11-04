@@ -463,6 +463,15 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
 }
 pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     screen.expire_preferences();
+    if screen.device_open {
+        super::device::draw(
+            frame,
+            &screen.device_status,
+            screen.last_output_error.as_deref(),
+            screen.no_color,
+        );
+        return;
+    }
     if screen.failures_open {
         failures::draw(
             frame,
@@ -473,12 +482,19 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
         return;
     }
     if screen.help_open {
+        let device =
+            super::device::summary(&screen.device_status, screen.last_output_error.as_deref());
         help::draw(
             frame,
             screen.app.playback.as_ref(),
             screen.volume,
             &mut screen.help_scroll,
             &screen.pipeline_diagnostics,
+            help::HelpExtras {
+                device_summary: &device.text,
+                device_error: device.error,
+                no_color: screen.no_color,
+            },
         );
         return;
     }

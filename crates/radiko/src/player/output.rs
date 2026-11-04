@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputError {
     InvalidPcm,
     NoDevice,
@@ -384,6 +384,55 @@ fn selected_output_device() -> Result<cpal::Device, OutputError> {
         }
     }
     Ok(fallback)
+}
+
+/// Host name plus the f32 mono and stereo declarations at `sample_rate`.
+///
+/// This does not open a stream. Enumeration uses the same stderr silence as playback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputCapability {
+    pub host: String,
+    pub name: String,
+    pub sample_rate: u32,
+    pub f32_mono: bool,
+    pub f32_stereo: bool,
+}
+
+fn supports_f32(configs: &[cpal::SupportedStreamConfigRange], channels: u16, rate: u32) -> bool {
+    configs.iter().any(|config| {
+        config.sample_format() == SampleFormat::F32
+            && config.channels() == channels
+            && config.min_sample_rate().0 <= rate
+            && config.max_sample_rate().0 >= rate
+    })
+}
+
+/// Read-only default-output report for the diagnostic panel.
+///
+/// `NoDevice` means the host has no default output. Other failures keep [`OutputError`]'s wording.
+pub fn diagnose_default_output(sample_rate: u32) -> Result<OutputCapability, OutputError> {
+    if !PCM_SAMPLE_RATE_RANGE.contains(&sample_rate) {
+        return Err(OutputError::InvalidPcm);
+    }
+    // Held across the device drop so a plugin cannot write fd 2 after enumeration returns.
+    prepare_alsa_errors();
+    let _silence = crate::stderr::silence_native_stderr();
+    let host = cpal::default_host().id().name().to_owned();
+    let device = selected_output_device()?;
+    let name = device.name().map_err(|_| OutputError::DeviceInfo)?;
+    let name: String = name.chars().filter(|c| !c.is_control()).take(256).collect();
+    let configs = supported_configs(&device, config_query_error(false))?;
+    #[cfg(target_os = "linux")]
+    if configs.is_empty() {
+        return Err(OutputError::NoDevice);
+    }
+    Ok(OutputCapability {
+        host,
+        name,
+        sample_rate,
+        f32_mono: supports_f32(&configs, 1, sample_rate),
+        f32_stereo: supports_f32(&configs, 2, sample_rate),
+    })
 }
 
 pub fn inspect_default_output(sample_rate: u32) -> Result<OutputDeviceInfo, OutputError> {
@@ -1234,6 +1283,19 @@ mod tests {
         assert_ne!(opened.0.sample_rate.0, 96_000);
     }
 
+    #[test]
+    fn f32_mono_and_stereo_follow_the_requested_rate_separately() {
+        let configs = [
+            range(1, 48_000, 48_000, SampleFormat::F32),
+            range(2, 44_100, 48_000, SampleFormat::I16),
+            range(2, 96_000, 96_000, SampleFormat::F32),
+        ];
+        assert!(supports_f32(&configs, 1, 48_000));
+        assert!(!supports_f32(&configs, 2, 48_000));
+        assert!(!supports_f32(&configs, 1, 44_100));
+        assert!(supports_f32(&configs, 2, 96_000));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn device_enumeration_writes_fd2_only_while_silence_is_active() {
@@ -1265,6 +1327,50 @@ mod tests {
         assert!(
             !stderr.contains("ENUM-FD2"),
             "fd 2 was not silenced during enumeration:\n{stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnose_default_output_silences_fd2_and_reports_no_device_without_panicking() {
+        if std::env::var_os("RADIKO_DIAG_CHILD").is_some() {
+            super::enumeration_probe::enable();
+            match super::diagnose_default_output(48_000) {
+                Ok(_) => {}
+                Err(error) => assert!(
+                    matches!(error, OutputError::NoDevice),
+                    "a missing default output must be NoDevice, got {error}"
+                ),
+            }
+            return;
+        }
+        let name = std::thread::current()
+            .name()
+            .expect("libtest names the test thread")
+            .to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1"])
+            .env("RADIKO_DIAG_CHILD", "1")
+            .env_remove("RADIKO_ALSA_LOG")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "status {:?} stderr:\n{stderr}",
+            output.status.code()
+        );
+        assert!(
+            stderr.contains("SEAM-RAN"),
+            "diagnose did not enumerate under the silence seam:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("ENUM-FD2"),
+            "fd 2 was not silenced during diagnose:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("ALSA lib"),
+            "ALSA diagnostics leaked from diagnose:\n{stderr}"
         );
     }
 
