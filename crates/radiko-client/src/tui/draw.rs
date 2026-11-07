@@ -523,11 +523,37 @@ fn side_block(area: Rect) -> Block<'static> {
         Block::default()
     }
 }
+const KEYWORD_PREFIX: &str = "キーワード: ";
+/// One column keeps the terminal cursor inside the field when a count is shown.
+const KEYWORD_CURSOR_COLUMNS: usize = 1;
+/// A space between the field viewport and the count. The count is never sliced.
+const KEYWORD_COUNT_GAP: usize = 1;
+
+fn keyword_count_label(inner_width: usize, count: usize) -> Option<String> {
+    let full = format!("表示中の一覧で一致 {count} 件（未確定）");
+    let short = format!("一致 {count} 件");
+    let prefix = super::field::display_width(KEYWORD_PREFIX);
+    let fits = |label: &str| {
+        prefix
+            .saturating_add(KEYWORD_CURSOR_COLUMNS)
+            .saturating_add(KEYWORD_COUNT_GAP)
+            .saturating_add(super::field::display_width(label))
+            <= inner_width
+    };
+    if fits(&full) {
+        Some(full)
+    } else if fits(&short) {
+        Some(short)
+    } else {
+        None
+    }
+}
 fn draw_keyword(
     frame: &mut Frame,
     editor: &super::field::LineEditor,
     area: Rect,
     full_border: bool,
+    preview: Option<usize>,
 ) {
     let block = if full_border {
         Block::default().borders(Borders::ALL).title("条件編集中")
@@ -535,14 +561,27 @@ fn draw_keyword(
         side_block(area)
     };
     let inner = block.inner(area);
-    let prefix = "キーワード: ";
-    let prefix_width = super::field::display_width(prefix);
-    let columns = usize::from(inner.width).saturating_sub(prefix_width);
+    let prefix_width = super::field::display_width(KEYWORD_PREFIX);
+    let inner_width = usize::from(inner.width);
+    let label = preview.and_then(|count| keyword_count_label(inner_width, count));
+    let reserved = label.as_ref().map_or(0, |label| {
+        super::field::display_width(label).saturating_add(KEYWORD_COUNT_GAP)
+    });
+    let columns = inner_width
+        .saturating_sub(prefix_width)
+        .saturating_sub(reserved);
     let view = editor.view(columns);
-    let body = format!(
-        "{prefix}{}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）",
-        view.text
-    );
+    let keyword_line = if let Some(label) = &label {
+        let pad = inner_width
+            .saturating_sub(prefix_width)
+            .saturating_sub(super::field::display_width(&view.text))
+            .saturating_sub(super::field::display_width(label));
+        format!("{KEYWORD_PREFIX}{}{}{label}", view.text, " ".repeat(pad))
+    } else {
+        format!("{KEYWORD_PREFIX}{}", view.text)
+    };
+    let body =
+        format!("{keyword_line}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）");
     frame.render_widget(Paragraph::new(body).block(block), area);
     super::field::place_cursor(
         frame,
@@ -552,7 +591,7 @@ fn draw_keyword(
 }
 fn draw_compact_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, area: Rect) {
     if let Some(input) = &screen.input {
-        draw_keyword(frame, input, area, false);
+        draw_keyword(frame, input, area, false, screen.keyword_preview_count());
         return;
     }
     let text = if let Some(editor) = &screen.seek {
@@ -713,7 +752,7 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
     if compact {
         draw_compact_footer(frame, screen, areas[2]);
     } else if let Some(input) = &screen.input {
-        draw_keyword(frame, input, areas[2], true);
+        draw_keyword(frame, input, areas[2], true, screen.keyword_preview_count());
     } else {
         draw_status(frame, screen, areas[2], show_http);
     }

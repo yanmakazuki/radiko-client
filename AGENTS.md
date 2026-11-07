@@ -19,7 +19,7 @@ The workspace has two crates. `crates/radiko` (`radiko`) is the screen-free libr
 
 - `crates/radiko/src/domain/search.rs`: validated criteria and startup date reset; `crates/radiko/src/storage/searches.rs`: atomic versioned criteria storage; `crates/radiko-client/src/searches.rs`: offline named-search management CLI.
 
-- `crates/radiko/src/catalog/search.rs`: pure AND/OR filtering and observed classification aggregation.
+- `crates/radiko/src/catalog/search.rs`: pure AND/OR filtering and observed classification aggregation. While the keyword field is open, the TUI may count currently displayed rows with this filter and show that count as uncommitted. The count does not replace the list and does not skip the next committed fetch.
 
 - `crates/radiko-client/src/chapters.rs`: read-only chapter CLI; `crates/radiko/src/api/stream/chapters.rs`: metadata identity checks and bounded chapter acquisition.
 
@@ -119,7 +119,7 @@ macOSとLinux向けのRust製radiko TUIクライアントを開発する。全�
 - 条件編集・検索確定・取得失敗の間も現在の再生を続ける。検索取得と再生用通信を独立させ、新しい検索確定時は古い検索だけをキャンセルする。古い検索結果を新しい一覧へ反映しない。
 - 地域は「その地域で聴ける局」と定義し、地域別の局一覧から対象局を決定する。複数地域に含まれる同じ局は局ID、同じ放送枠は「放送局ID＋開始日時」で重複排除する。別局の同名番組や開始日時の異なる分割枠は統合しない。
 - 全国の局IDを重複排除し、選択した期間のみを最大4並列で取得する。全国30日分を起動時に一括取得しない。
-- 番組表・局一覧・分類一覧のキャッシュは使用しない。起動時、検索条件の確定時、手動更新時に必要なデータを取得する。現在の検索・表示用データのみメモリに保持し、次の取得を省略するために再利用しない。
+- 番組表・局一覧・分類一覧のキャッシュは使用しない。起動時、検索条件の確定時、手動更新時に必要なデータを取得する。現在の検索・表示用データのみメモリに保持し、次の取得を省略するために再利用しない。キーワード入力中に限り、表示中の行を確定時と同じ条件で数えた未確定の件数を出してよい。この件数は次の確定取得を省く理由にせず、Enter では番組表を取り直す。
 - 取得途中・部分失敗・未取得の範囲を画面で明示する。取得失敗を前回のデータで補完しない。
 - 検索条件を保存する。起動時の自動復元では日付を当日に戻し、他の検索条件のみ復元する。名前付き条件の明示的な呼び出しでは保存した日付・期間も適用する。再生位置は初期版では保存しない。
 - 番組終了時は再生を停止し、次の番組へ自動で移らない。ライブは選択した番組の終了日時で停止して残った音声バッファを破棄し、タイムフリーは選択した放送枠の末尾で停止する。画面に「番組終了」と表示する。

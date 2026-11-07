@@ -7,6 +7,7 @@ mod device;
 mod editing;
 mod field;
 mod keys;
+mod keyword_preview;
 mod notices;
 mod on_air;
 mod output;
