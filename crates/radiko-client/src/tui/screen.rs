@@ -1065,7 +1065,8 @@ impl Screen {
                     self.app.cancel_edit();
                 }
                 KeyCode::Enter => {
-                    let keyword = (!input.trim().is_empty()).then(|| input.clone());
+                    let text = input.text().to_owned();
+                    let keyword = (!text.trim().is_empty()).then_some(text);
                     match self.app.edit_keyword(keyword) {
                         Ok(()) => {
                             self.input = None;
@@ -1077,27 +1078,13 @@ impl Screen {
                         }
                     }
                 }
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    input.clear()
-                }
-                KeyCode::Char(c)
-                    if !c.is_control()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                        && input.len() + c.len_utf8() <= 1024 =>
-                {
-                    input.push(c);
-                }
-                _ => (),
+                _ => input.handle(key),
             }
         }
         if let Some(input) = &self.input {
+            let text = input.text();
             self.app
-                .edit_keyword((!input.trim().is_empty()).then(|| input.clone()))?;
+                .edit_keyword((!text.trim().is_empty()).then(|| text.to_owned()))?;
         }
         Ok(false)
     }
@@ -1299,14 +1286,10 @@ impl Screen {
             }
             KeyCode::Char('/') => {
                 self.app.begin_edit();
-                self.input = Some(
-                    self.app
-                        .committed
-                        .filter()
-                        .keyword()
-                        .unwrap_or_default()
-                        .into(),
-                );
+                self.input = Some(super::field::LineEditor::new(
+                    self.app.committed.filter().keyword().unwrap_or_default(),
+                    1024,
+                ));
             }
             KeyCode::Char('v') if self.app.chapters.target.is_none() => {
                 self.toggle_live(service)?

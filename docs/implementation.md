@@ -2,6 +2,16 @@
 
 日付ごとの検証記録です。新しい記録は先頭へ足します。1節が1回の確認で、対象、手順、結果、その結果に含めない範囲を分けて書いてあります。
 
+## 2026年11月7日：キーワード・条件・保存名を書記素単位で編集する
+
+キーワード欄、条件編集の6つの入力欄、名前付き条件の名前欄は `tui/field.rs` の同じ1行編集にした。ログインと秒指定の欄は変えていない。編集を始めるとカーソルは既存の文字列の末尾にある。←→は拡張書記素クラスタを1つ、Home と End は先頭と末尾、Backspace は前、Delete は次を消す。挿入はカーソル位置である。空欄、先頭、末尾の移動と削除は何もしない。結合文字を隣に入れるとクラスタの境目が変わるので、カーソルは次の境目へ揃える。
+
+表示は1行で折り返さない。幅は `unicode-width` 0.2 の `UnicodeWidthStr::width`、移動は `unicode-segmentation` 1.13 の `graphemes(true)` である。見える範囲はカーソルに合わせ、書記素と全角のセルの途中から始めない。カーソルは端末のカーソル座標で、末尾でも欄の中に置く。高さ29と30の境でも編集位置は残る。端末が渡した確定済みの文字だけを入れる。変換中の未確定文字は扱わない。移動、挿入、削除、Esc では検索も保存もせず、Esc は確定済みの値へ戻す。Enter の確定はこれまでどおりである。`?` の操作一覧、設計、アーキテクチャ、README にこの操作を書いた。`tui --help` のバイト列は変えていない。
+
+確認環境は Linux x86_64 である。Rust 1.99.1（`58cf8f9c3`、2026-10-13）で `cargo fmt --all -- --check` と `cargo clippy --workspace --all-targets --all-features -- -D warnings` が成功し、同じ版の `cargo test --workspace --all-targets --all-features -- --test-threads=4` と Rust 1.85.0（`4d91de4e4`、2025-02-17）の `--locked --test-threads=4` はどちらも 545 件成功、失敗 0、ignored 2 件である。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。`origin/main`（`0198f63`）との CLI 比較は、デバッグビルドでオフライン 46 件の stdout、stderr、終了コードがすべて一致した。実機の IME、実機の再生、radiko への通信は確認していない。
+
+カーソルを末尾に固定すると、`keyword_condition_and_name_delete_i_from_aiu_and_backspace_ai` が `tests/field.rs` の 160 行で、左 9、右 0 になって失敗した。Delete を Backspace にすると、同じテストの 178 行で、左 `Some("いう")`、右 `Some("あう")` になって失敗した。表示幅をバイト長にすると、`empty_edges_and_fullwidth_cursor_use_display_columns_in_the_cells` が 311 行で、カーソル列が 22、期待 16 になって失敗した。左右の移動で検索すると、`movement_edits_and_escape_do_not_search_and_enter_commits` が 476 行で、状態が `Loading`、期待 `Idle` になって失敗した。結合文字の挿入後にカーソルをクラスタの途中へ残すと、`combining_insertion_keeps_a_boundary_and_one_left_skips_the_cluster` が 614 行で、左 1、右 3 になって失敗した。いずれもアサーションの失敗で、コンパイルエラーやタイムアウトではない。変えた箇所は戻した。戻したあとの全件が上の 545 件である。
+
 ## 2026年11月7日：長い通知と出力案内を折り返す
 
 高さ29行以下のフッターは、再生・通知・ヒントがそれぞれ1行のとき3行のままである。通知か出力機器の案内が1行に収まらないときだけ、表示幅で書記素クラスタの境目から折り返し、その行数だけフッターを広げる。文は消さない。消すか、案内の対象でなくなったら3行に戻り、番組一覧の行数も戻る。選択は見えるところに残す。80×24で通知が無いまたは1行、かつ案内が広がっていないときは、枠を除いた番組行は12行以上である。端末に入りきらない折り返しはそこで切り、保存している全文は変えない。

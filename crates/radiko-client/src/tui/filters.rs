@@ -15,73 +15,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
-#[derive(Clone)]
-struct Text {
-    value: String,
-    cursor: usize,
-}
-impl Text {
-    fn new(value: String) -> Self {
-        let cursor = value.len();
-        Self { value, cursor }
-    }
-    fn key(&mut self, key: KeyEvent, limit: usize) {
-        let previous = self.value[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i);
-        let next = self.value[self.cursor..]
-            .chars()
-            .next()
-            .map(|c| self.cursor + c.len_utf8());
-        match key.code {
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.value.clear();
-                self.cursor = 0;
-            }
-            KeyCode::Char(c)
-                if !c.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && self.value.len() + c.len_utf8() <= limit =>
-            {
-                self.value.insert(self.cursor, c);
-                self.cursor += c.len_utf8();
-            }
-            KeyCode::Backspace => {
-                if let Some(previous) = previous {
-                    self.value.drain(previous..self.cursor);
-                    self.cursor = previous;
-                }
-            }
-            KeyCode::Delete => {
-                if let Some(next) = next {
-                    self.value.drain(self.cursor..next);
-                }
-            }
-            KeyCode::Left => self.cursor = previous.unwrap_or(0),
-            KeyCode::Right => self.cursor = next.unwrap_or(self.value.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.value.len(),
-            _ => (),
-        }
-    }
-    fn display(&self, focused: bool) -> String {
-        if !focused {
-            return self.value.chars().take(50).collect();
-        }
-        let mut before: Vec<_> = self.value[..self.cursor].chars().rev().take(28).collect();
-        before.reverse();
-        format!(
-            "{}▏{}",
-            before.into_iter().collect::<String>(),
-            self.value[self.cursor..]
-                .chars()
-                .take(12)
-                .collect::<String>()
-        )
-    }
+const FIELD_LIMITS: [usize; 6] = [8, 8, 512, 4096, 4096, 1024];
+
+fn field(value: impl Into<String>, index: usize) -> super::field::LineEditor {
+    super::field::LineEditor::new(value, FIELD_LIMITS[index])
 }
 pub(super) enum Action {
     Cancel,
@@ -94,7 +31,7 @@ pub(super) struct Editor {
     area_picker: Option<super::areas::Picker>,
     choices: [Vec<Classification>; 2],
     selected_ids: [Option<Vec<String>>; 2],
-    fields: [Text; 6],
+    fields: [super::field::LineEditor; 6],
     unclassified: [bool; 2],
     focus: usize,
     list: ListState,
@@ -141,16 +78,19 @@ impl Editor {
             choices,
             selected_ids: [None, None],
             fields: [
-                Text::new(criteria.range().start().format("%Y%m%d").to_string()),
-                Text::new(if criteria.range().start() == criteria.range().end() {
-                    String::new()
-                } else {
-                    criteria.range().end().format("%Y%m%d").to_string()
-                }),
-                Text::new(scope),
-                Text::new(filter.program_genres().join(",")),
-                Text::new(filter.personality_genres().join(",")),
-                Text::new(filter.keyword().unwrap_or_default().into()),
+                field(criteria.range().start().format("%Y%m%d").to_string(), 0),
+                field(
+                    if criteria.range().start() == criteria.range().end() {
+                        String::new()
+                    } else {
+                        criteria.range().end().format("%Y%m%d").to_string()
+                    },
+                    1,
+                ),
+                field(scope, 2),
+                field(filter.program_genres().join(","), 3),
+                field(filter.personality_genres().join(","), 4),
+                field(filter.keyword().unwrap_or_default(), 5),
             ],
             unclassified: [
                 filter.unclassified_program(),
@@ -169,7 +109,7 @@ impl Editor {
             match picker.handle(key) {
                 super::areas::Action::Cancel => self.area_picker = None,
                 super::areas::Action::Apply(value) => {
-                    self.fields[2] = Text::new(value);
+                    self.fields[2] = field(value, 2);
                     self.area_picker = None;
                     return Action::Edit;
                 }
@@ -185,7 +125,7 @@ impl Editor {
                 super::picker::Action::Apply => {
                     let axis = picker.axis;
                     let ids: Vec<_> = picker.ids.iter().cloned().collect();
-                    self.fields[axis + 3] = Text::new(ids.join(","));
+                    self.fields[axis + 3] = field(ids.join(","), axis + 3);
                     self.unclassified[axis] = picker.unclassified;
                     self.selected_ids[axis] = Some(ids);
                     self.picker = None;
@@ -197,7 +137,7 @@ impl Editor {
         }
         match key.code {
             KeyCode::F(2) if self.focus == 2 => {
-                self.area_picker = Some(super::areas::Picker::new(&self.fields[2].value))
+                self.area_picker = Some(super::areas::Picker::new(self.fields[2].text()))
             }
             KeyCode::F(2) if (3..5).contains(&self.focus) => {
                 let axis = self.focus - 3;
@@ -225,10 +165,9 @@ impl Editor {
                 return Action::Edit;
             }
             _ if self.focus < 6 => {
-                let limit = [8, 8, 512, 4096, 4096, 1024][self.focus];
-                let before = self.fields[self.focus].value.clone();
-                self.fields[self.focus].key(key, limit);
-                if (3..5).contains(&self.focus) && before != self.fields[self.focus].value {
+                let before = self.fields[self.focus].text().to_owned();
+                self.fields[self.focus].handle(key);
+                if (3..5).contains(&self.focus) && before != self.fields[self.focus].text() {
                     self.selected_ids[self.focus - 3] = None;
                 }
                 return Action::Edit;
@@ -242,7 +181,7 @@ impl Editor {
         if self.picker.is_some() || self.area_picker.is_some() {
             "上下 選択 / Space 切替 / Enter 条件へ反映（検索しません） / Esc 取消"
         } else {
-            "Tab・上下 項目 / F2 地域・分類を名称選択 / Space 未分類 / Ctrl+U 消去 / Enter 検索 / Esc 取消"
+            "Tab・上下 項目 / ←→ Home End Delete Backspace 文字編集 / F2 地域・分類を名称選択 / Space 未分類 / Ctrl+U 消去 / Enter 検索 / Esc 取消"
         }
     }
     fn ids(&self, axis: usize) -> Vec<String> {
@@ -254,7 +193,7 @@ impl Editor {
         } else {
             self.original.filter().personality_genres()
         };
-        let text = self.fields[axis + 3].value.trim();
+        let text = self.fields[axis + 3].text().trim();
         if text == original.join(",") {
             original.to_vec()
         } else if text.is_empty() {
@@ -270,13 +209,13 @@ impl Editor {
             }
             NaiveDate::parse_from_str(value, "%Y%m%d").map_err(|_| "日付が不正です")
         }
-        let start = day(self.fields[0].value.trim())?;
-        let end = if self.fields[1].value.trim().is_empty() {
+        let start = day(self.fields[0].text().trim())?;
+        let end = if self.fields[1].text().trim().is_empty() {
             start
         } else {
-            day(self.fields[1].value.trim())?
+            day(self.fields[1].text().trim())?
         };
-        let scope = self.fields[2].value.trim();
+        let scope = self.fields[2].text().trim();
         let scope = if scope == "全国" || scope.eq_ignore_ascii_case("all") {
             Scope::Nationwide
         } else if let Some(id) = scope
@@ -294,7 +233,7 @@ impl Editor {
             }
             Scope::Areas(areas)
         };
-        let keyword = self.fields[5].value.trim();
+        let keyword = self.fields[5].text().trim();
         SearchCriteria::new(
             scope,
             BroadcastRange::new(start, end)?,
@@ -325,14 +264,33 @@ impl Editor {
             "出演者分類ID（カンマ区切り）",
             "キーワード",
         ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("検索条件編集中・確定まで通信しません");
+        let list_area = block.inner(panes[0]);
+        let gutter = super::field::display_width("▶ ");
+        let content_width = usize::from(list_area.width).saturating_sub(gutter);
+        let mut focused_cursor = None;
         let mut items: Vec<_> = labels
             .iter()
             .enumerate()
             .map(|(i, label)| {
-                ListItem::new(format!(
-                    "{label}: {}",
-                    self.fields[i].display(i == self.focus)
-                ))
+                let prefix = format!("{label}: ");
+                let shown = if i == self.focus {
+                    let columns =
+                        content_width.saturating_sub(super::field::display_width(&prefix));
+                    let view = self.fields[i].view(columns);
+                    focused_cursor = Some(
+                        super::field::display_width(&prefix).saturating_add(view.cursor_column),
+                    );
+                    format!("{prefix}{}", view.text)
+                } else {
+                    format!(
+                        "{prefix}{}",
+                        self.fields[i].text().chars().take(50).collect::<String>()
+                    )
+                };
+                ListItem::new(shown)
             })
             .collect();
         items.extend([
@@ -348,16 +306,34 @@ impl Editor {
         ]);
         frame.render_stateful_widget(
             List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("検索条件編集中・確定まで通信しません"),
-                )
+                .block(block)
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ "),
             panes[0],
             &mut self.list,
         );
+        if let Some(column) = focused_cursor {
+            let offset = self.list.offset();
+            if self.focus >= offset {
+                let row = self.focus - offset;
+                if row < usize::from(list_area.height) {
+                    if let Ok(row_u16) = u16::try_from(row) {
+                        if let Some(y) = list_area.y.checked_add(row_u16) {
+                            let cursor_area = Rect {
+                                y,
+                                height: list_area.height.saturating_sub(row_u16),
+                                ..list_area
+                            };
+                            super::field::place_cursor(
+                                frame,
+                                cursor_area,
+                                gutter.saturating_add(column),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let options = self
             .observed
             .iter()
@@ -390,7 +366,7 @@ mod tests {
         .unwrap()
     }
     fn set(editor: &mut Editor, index: usize, value: &str) {
-        editor.fields[index] = Text::new(value.into());
+        editor.fields[index] = field(value, index);
     }
     fn programs() -> Vec<Program> {
         radiko::api::catalog::parse_programs(
@@ -512,7 +488,7 @@ mod tests {
         )
         .unwrap();
         let editor = Editor::new(&initial, &[]);
-        assert!(editor.fields[1].value.is_empty());
+        assert!(editor.fields[1].text().is_empty());
         assert_eq!(editor.criteria().unwrap(), initial);
     }
     #[test]
@@ -575,7 +551,7 @@ mod tests {
     }
     #[test]
     fn unicode_cursor_editing_and_input_limits_preserve_character_boundaries() {
-        let mut text = Text::new("aあb".into());
+        let mut text = super::super::field::LineEditor::new("aあb", 1024);
         for code in [
             KeyCode::Left,
             KeyCode::Backspace,
@@ -584,21 +560,19 @@ mod tests {
             KeyCode::Right,
             KeyCode::Delete,
         ] {
-            text.key(KeyEvent::new(code, KeyModifiers::NONE), 1024);
+            text.handle(KeyEvent::new(code, KeyModifiers::NONE));
         }
-        assert_eq!(text.value, "ab");
-        assert_eq!(text.cursor, 1);
-        text.key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-            1024,
-        );
-        assert!(text.value.is_empty());
-        assert_eq!(text.cursor, 0);
-        text.key(KeyEvent::new(KeyCode::Char('あ'), KeyModifiers::NONE), 2);
-        assert!(text.value.is_empty());
-        text.key(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE), 2);
-        text.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), 2);
-        assert_eq!(text.value, "é");
+        assert_eq!(text.text(), "ab");
+        assert_eq!(text.cursor(), 1);
+        text.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(text.text().is_empty());
+        assert_eq!(text.cursor(), 0);
+        text.set_byte_limit(2);
+        text.handle(KeyEvent::new(KeyCode::Char('あ'), KeyModifiers::NONE));
+        assert!(text.text().is_empty());
+        text.handle(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE));
+        text.handle(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(text.text(), "é");
     }
     #[test]
     fn observed_classifications_come_from_unfiltered_results_and_form_handles_small_terminals() {

@@ -26,6 +26,7 @@ mod compact;
 mod device;
 mod draw;
 mod failures;
+mod field;
 mod filters;
 mod help;
 mod login;
@@ -293,7 +294,7 @@ struct Screen {
     app: AppState,
     list: ListState,
     list_height: usize,
-    input: Option<String>,
+    input: Option<field::LineEditor>,
     preferences_notice: String,
     offline: bool,
 }

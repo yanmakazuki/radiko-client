@@ -1,5 +1,5 @@
 //! Named-criteria browser. Recalling edits a draft; it never starts acquisition.
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use radiko::{
     app::named::{Operation, ViewId},
     domain::search::{Scope, SearchCriteria},
@@ -13,7 +13,7 @@ use ratatui::{
 use std::collections::BTreeMap;
 enum Mode {
     Browse,
-    Name(String),
+    Name(super::field::LineEditor),
     Delete(String),
 }
 pub(super) enum Action {
@@ -76,29 +76,14 @@ impl Manager {
                     Action::None
                 }
                 KeyCode::Enter => {
+                    let saved = name.text().to_owned();
                     self.busy = true;
-                    Action::Operation(Operation::Save(name.clone(), Box::new(criteria.clone())))
+                    Action::Operation(Operation::Save(saved, Box::new(criteria.clone())))
                 }
-                KeyCode::Backspace => {
-                    name.pop();
+                _ => {
+                    name.handle(key);
                     Action::None
                 }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    name.clear();
-                    Action::None
-                }
-                KeyCode::Char(c)
-                    if !c.is_control()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                        && name.chars().count() < 64
-                        && name.len() + c.len_utf8() <= 256 =>
-                {
-                    name.push(c);
-                    Action::None
-                }
-                _ => Action::None,
             },
             Mode::Delete(name) => match key.code {
                 KeyCode::Char('y') => {
@@ -114,7 +99,9 @@ impl Manager {
             Mode::Browse => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Action::Close,
                 KeyCode::Char('n') => {
-                    self.mode = Mode::Name(String::new());
+                    self.mode = Mode::Name(
+                        super::field::LineEditor::new(String::new(), 256).with_scalar_limit(64),
+                    );
                     self.notice = "確定済み条件を保存します。同名の条件は更新します".into();
                     Action::None
                 }
@@ -172,7 +159,7 @@ impl Manager {
                 dialog_close_hint!()
             ),
             Mode::Name(_) => {
-                "Enter 保存（同名は更新） / Backspace・Ctrl+U 編集 / Esc 取消 / Ctrl+C 終了"
+                "Enter 保存（同名は更新） / ←→ Home End Delete Backspace Ctrl+U 編集 / Esc 取消 / Ctrl+C 終了"
             }
             Mode::Delete(_) => {
                 concat!("y 削除 / n 取消 / ", dialog_close_hint!(), " / Ctrl+C 終了")
@@ -197,37 +184,58 @@ impl Manager {
             panes[0],
             &mut self.list,
         );
-        let text = match &self.mode {
-            Mode::Name(name) => format!(
-                "保存名: {name}▏\nEnter 保存（同名は更新） / Esc 取消 / Ctrl+U 消去\n{}",
-                describe(committed)
-            ),
-            Mode::Delete(name) => {
-                format!(
-                    "「{name}」を削除しますか？ y 削除 / n / {}",
-                    dialog_close_hint!()
+        let detail = Block::default()
+            .borders(Borders::ALL)
+            .title("保存条件の詳細（通信なし）");
+        let inner = detail.inner(panes[1]);
+        let status = format!(
+            "{}{}",
+            if self.busy { "処理中 / " } else { "" },
+            self.notice
+        );
+        let (text, cursor_column) = match &self.mode {
+            Mode::Name(name) => {
+                let prefix = "保存名: ";
+                let prefix_width = super::field::display_width(prefix);
+                let columns = usize::from(inner.width).saturating_sub(prefix_width);
+                let view = name.view(columns);
+                // The name stays on the first content row so the cursor row does not
+                // move when the notice wraps.
+                (
+                    format!(
+                        "{prefix}{}\n{status}\nEnter 保存（同名は更新） / Esc 取消 / Ctrl+U 消去\n{}",
+                        view.text,
+                        describe(committed)
+                    ),
+                    Some(prefix_width.saturating_add(view.cursor_column)),
                 )
             }
-            Mode::Browse => self
-                .selected()
-                .map(|(_, criteria)| describe(criteria))
-                .unwrap_or_default(),
+            Mode::Delete(name) => (
+                format!(
+                    "{status}\n「{name}」を削除しますか？ y 削除 / n / {}",
+                    dialog_close_hint!()
+                ),
+                None,
+            ),
+            Mode::Browse => (
+                format!(
+                    "{status}\n{}",
+                    self.selected()
+                        .map(|(_, criteria)| describe(criteria))
+                        .unwrap_or_default()
+                ),
+                None,
+            ),
         };
         frame.render_widget(
-            Paragraph::new(format!(
-                "{}{}\n{}",
-                if self.busy { "処理中 / " } else { "" },
-                self.notice,
-                text
-            ))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("保存条件の詳細（通信なし）"),
-            ),
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .block(detail),
             panes[1],
         );
+        if let Some(column) = cursor_column {
+            super::field::place_cursor(frame, inner, column);
+        }
     }
 }
 fn describe(criteria: &SearchCriteria) -> String {
@@ -254,6 +262,7 @@ fn describe(criteria: &SearchCriteria) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     fn criteria() -> SearchCriteria {
         SearchCriteria::initial(
             chrono::DateTime::parse_from_rfc3339("2026-10-17T06:00:00+09:00").unwrap(),
