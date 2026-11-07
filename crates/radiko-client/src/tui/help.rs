@@ -5,7 +5,7 @@ use crossterm::event::KeyCode;
 use radiko::player::state::PlaybackSnapshot;
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
@@ -87,18 +87,7 @@ pub fn draw(
             ))),
         areas[0],
     );
-    let active = playback
-        .map(|p| {
-            format!(
-                "再生中: [{} / {:?}] {:?} / 音量{}% / {}",
-                p.info.station,
-                p.info.mode,
-                p.state,
-                p.volume,
-                p.info.title.as_deref().unwrap_or("番組名未取得"),
-            )
-        })
-        .unwrap_or_else(|| format!("再生中: なし / 音量{volume}%"));
+    let active = playback.map(|snapshot| (snapshot, super::playback_view::presentation(snapshot)));
     let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(areas[1]);
     frame.render_widget(block, areas[1]);
@@ -111,7 +100,12 @@ pub fn draw(
         constraints.push(Constraint::Length(1));
     }
     let rows = Layout::vertical(constraints).split(inner);
-    frame.render_widget(Paragraph::new(active), rows[0]);
+    paint_active(
+        frame,
+        rows[0],
+        active.as_ref().map(|(snapshot, view)| (*snapshot, view)),
+        volume,
+    );
     frame.render_widget(diagnostic, rows[1]);
     frame.render_widget(
         Paragraph::new(concat!(
@@ -139,6 +133,46 @@ pub fn draw(
             rows[3],
         );
     }
+}
+
+fn paint_active(
+    frame: &mut Frame,
+    area: Rect,
+    active: Option<(&PlaybackSnapshot, &super::playback_view::Presentation)>,
+    volume: u32,
+) {
+    let Some((snapshot, view)) = active else {
+        frame.render_widget(
+            Paragraph::new(format!("再生中: なし / 音量{volume}%")),
+            area,
+        );
+        return;
+    };
+    let prefix = format!(
+        "再生中: [{} / {}] {} / 音量{}% / {}",
+        snapshot.info.station, view.mode, view.state, snapshot.volume, view.clock
+    );
+    let title = snapshot.info.title.as_deref().unwrap_or("番組名未取得");
+    let Some(ratio) = view.ratio else {
+        frame.render_widget(Paragraph::new(format!("{prefix} / {title}")), area);
+        return;
+    };
+    let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+    let Some(bar) = super::playback_view::reserved_bar(area.width, prefix_width) else {
+        frame.render_widget(Paragraph::new(format!("{prefix} / {title}")), area);
+        return;
+    };
+    let text_width = u16::try_from(prefix_width).unwrap_or(area.width);
+    let columns = Layout::horizontal([
+        Constraint::Length(text_width),
+        Constraint::Length(1),
+        Constraint::Length(bar),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    frame.render_widget(Paragraph::new(prefix), columns[0]);
+    super::playback_view::paint_bar(frame, columns[2], ratio);
+    frame.render_widget(Paragraph::new(format!(" {title}")), columns[3]);
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ mod editing;
 mod keys;
 mod notices;
 mod output;
+mod progress;
 mod status;
 mod truncate;
 mod wording;

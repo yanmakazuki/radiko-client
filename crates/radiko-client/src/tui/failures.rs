@@ -108,9 +108,9 @@ pub fn draw(frame: &mut Frame, app: &AppState, list: &mut ListState, height: &mu
         .as_ref()
         .map(|p| {
             format!(
-                "再生中: {} / {:?} / 音量{}%\n{}",
+                "再生中: {} / {} / 音量{}%\n{}",
                 p.info.station,
-                p.state,
+                super::playback_view::state_label(p.state),
                 p.volume,
                 output_diagnostics(p.output.as_ref(), p.segments)
             )

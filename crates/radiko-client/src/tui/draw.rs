@@ -392,23 +392,27 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
             )
         })
         .unwrap_or_default();
+    let playback_view = screen
+        .app
+        .playback
+        .as_ref()
+        .map(super::playback_view::presentation);
     let playing = screen
         .app
         .playback
         .as_ref()
-        .map(|p| {
+        .zip(playback_view.as_ref())
+        .map(|(p, view)| {
             format!(
-                "再生中: [{} / {:?}] {}\n{}〜{} JST / {:?} / 音量{}% / {}",
+                "再生中: [{} / {}] {}\n{}〜{} JST / {} / 音量{}% / {}",
                 p.info.station,
-                p.info.mode,
+                view.mode,
                 p.info.title.as_deref().unwrap_or("番組名未取得"),
                 local(p.info.starts_at).format("%m/%d %H:%M"),
                 local(p.info.ends_at).format("%m/%d %H:%M"),
-                p.state,
+                view.state,
                 p.volume,
-                p.position
-                    .map(|v| format!("位置{:.1}秒", v.as_secs_f64()))
-                    .unwrap_or_else(|| "番組内位置未確認".into())
+                view.clock
             )
         })
         .unwrap_or_else(|| {
@@ -467,10 +471,20 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
             super::notices::notice_style(level, screen.no_color),
         )));
     }
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
-        area,
-    );
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(view) = playback_view.as_ref() {
+        if let Some(ratio) = view.ratio {
+            let gap = {
+                let buf = frame.buffer_mut();
+                super::playback_view::trailing_bar_area(buf, inner, &view.clock)
+            };
+            if let Some(gap) = gap {
+                super::playback_view::paint_bar(frame, gap, ratio);
+            }
+        }
+    }
 }
 pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     screen.expire_preferences();

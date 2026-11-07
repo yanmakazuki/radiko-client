@@ -691,11 +691,11 @@ fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
     narrow.draw(|frame| draw(frame, &mut screen, now)).unwrap();
     let text = visible(&narrow).replace(' ', "");
     assert!(text.contains("取得max120ms/復号25/80ms/音声5000ms"));
-    assert!(text.contains("再生中:[TBS/TimeFree]"));
+    assert!(text.contains("再生中:[TBS/タイムフリー]"));
     screen.help_open = true;
     narrow.draw(|frame| draw(frame, &mut screen, now)).unwrap();
     let text = visible(&narrow).replace(' ', "");
-    assert!(text.contains("再生中:[TBS/TimeFree]Playing/音量0%"));
+    assert!(text.contains("再生中:[TBS/タイムフリー]再生中/音量0%"));
     assert!(text.contains("通信診断応答待ち12ms"));
     assert!(text.replace('│', "").contains("通信失敗2・期限1・接続1"));
     assert!(text.contains("HTTP200"));
