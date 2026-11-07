@@ -658,6 +658,38 @@ impl Screen {
             &self.app.visible
         }
     }
+    /// Uncommitted match count for the keyword field.
+    ///
+    /// The predicate is the committed filter with the field's keyword, the same
+    /// `Filter::matches` a committed search applies after acquisition. Only rows
+    /// on screen are counted. An empty field and a list that has not finished
+    /// loading produce no count. A finished empty list produces zero.
+    pub(super) fn keyword_preview_count(&self) -> Option<usize> {
+        let keyword = self.input.as_ref()?.text().trim();
+        if keyword.is_empty() {
+            return None;
+        }
+        if !matches!(self.app.status, SearchStatus::Ready | SearchStatus::Partial) {
+            return None;
+        }
+        let filter = self
+            .app
+            .committed
+            .filter()
+            .with_keyword(Some(keyword.to_owned()))
+            .ok()?;
+        Some(
+            self.rows()
+                .iter()
+                .filter(|index| {
+                    self.app
+                        .programs
+                        .get(**index)
+                        .is_some_and(|program| filter.matches(program))
+                })
+                .count(),
+        )
+    }
     pub(super) fn rebuild_live(&mut self, now: DateTime<FixedOffset>) {
         self.last_live_time = Some(now);
         self.live_rows = self
