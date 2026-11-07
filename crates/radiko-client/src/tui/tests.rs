@@ -5,6 +5,7 @@ mod chapters;
 mod compact;
 mod device;
 mod editing;
+mod field;
 mod keys;
 mod notices;
 mod output;

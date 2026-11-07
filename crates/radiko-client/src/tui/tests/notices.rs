@@ -937,7 +937,7 @@ fn typing_into_keyword_or_filters_keeps_an_error_until_enter_or_esc() {
         let mut keyword = screen();
         show_auth_stop(&mut keyword);
         keyword.app.begin_edit();
-        keyword.input = Some(String::new());
+        keyword.input = Some(String::new().into());
         assert!(
             !keyword
                 .key(

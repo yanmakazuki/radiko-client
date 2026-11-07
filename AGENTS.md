@@ -12,6 +12,7 @@ The workspace has two crates. `crates/radiko` (`radiko`) is the screen-free libr
 - `crates/radiko/src/app/playback.rs`: bounded TUI playback commands, session resolution, snapshots, and output shutdown.
 - `crates/radiko/src/app/chapters.rs`: chapter request generations, bounded acquisition, and origin/slot-bound jump validation; listening permission is rechecked by playback.
 - `crates/radiko/src/app/auth.rs`: asynchronous session checks, explicit login/logout jobs, and contract-only snapshots; credential drafts are zeroized and never logged.
+- `crates/radiko-client/src/tui/field.rs`: grapheme-cluster line editing shared by the keyword field, condition fields, and named-condition names. Login and seconds fields stay separate.
 - `crates/radiko-client/src/tui/filters.rs`: local date/scope/classification/keyword editing, validation, and observed-classification display; no I/O.
 - `crates/radiko-client/src/tui/viewport.rs`: global list/page selection and visible row ranges; format only visible rows. `crates/radiko-client/src/tui/failures.rs`: read-only current acquisition failures and malformed-slot provenance. `crates/radiko-client/src/tui/scroll.rs`: bounded wrap-aware help/chapter-summary scrolling. `crates/radiko-client/src/tui/help.rs`: read-only key guide.
 - `crates/radiko/src/app/named.rs` and `crates/radiko-client/src/tui/named.rs`: serialized local saved-search operations and browser; recalls populate drafts without fetching.

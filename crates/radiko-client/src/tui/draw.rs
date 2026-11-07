@@ -523,10 +523,39 @@ fn side_block(area: Rect) -> Block<'static> {
         Block::default()
     }
 }
+fn draw_keyword(
+    frame: &mut Frame,
+    editor: &super::field::LineEditor,
+    area: Rect,
+    full_border: bool,
+) {
+    let block = if full_border {
+        Block::default().borders(Borders::ALL).title("条件編集中")
+    } else {
+        side_block(area)
+    };
+    let inner = block.inner(area);
+    let prefix = "キーワード: ";
+    let prefix_width = super::field::display_width(prefix);
+    let columns = usize::from(inner.width).saturating_sub(prefix_width);
+    let view = editor.view(columns);
+    let body = format!(
+        "{prefix}{}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）",
+        view.text
+    );
+    frame.render_widget(Paragraph::new(body).block(block), area);
+    super::field::place_cursor(
+        frame,
+        inner,
+        prefix_width.saturating_add(view.cursor_column),
+    );
+}
 fn draw_compact_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, area: Rect) {
-    let text = if let Some(input) = &screen.input {
-        format!("キーワード: {input}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）")
-    } else if let Some(editor) = &screen.seek {
+    if let Some(input) = &screen.input {
+        draw_keyword(frame, input, area, false);
+        return;
+    }
+    let text = if let Some(editor) = &screen.seek {
         editor.prompt()
     } else {
         let (mode, scope) = search_context(screen, now);
@@ -684,13 +713,7 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
     if compact {
         draw_compact_footer(frame, screen, areas[2]);
     } else if let Some(input) = &screen.input {
-        frame.render_widget(
-            Paragraph::new(format!(
-                "キーワード: {input}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）"
-            ))
-            .block(Block::default().borders(Borders::ALL).title("条件編集中")),
-            areas[2],
-        );
+        draw_keyword(frame, input, areas[2], true);
     } else {
         draw_status(frame, screen, areas[2], show_http);
     }
