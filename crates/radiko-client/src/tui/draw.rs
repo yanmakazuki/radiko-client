@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    truncate::{self, fit_after_prefix, list_text_columns},
+    *,
+};
 pub(super) fn local(time: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
     FixedOffset::east_opt(9 * 3600)
         .map(|zone| time.with_timezone(&zone))
@@ -135,6 +138,7 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
     frame.render_widget(Paragraph::new(format!("{} / {}\n{}〜{} JST\n{} / {}\nr 再取得 / Esc 番組詳細へ（選択移動では再生しません）\n{}",
         target.title, target.key.station_id, local(target.key.starts_at).format("%Y/%m/%d %H:%M"), local(target.ends_at).format("%Y/%m/%d %H:%M"),
         state.label(), counts, failure)).block(Block::default().borders(Borders::ALL).title("公式AIチャプター・閲覧中")), panes[0]);
+    let content_width = list_text_columns(panes[1].width, screen.chapter_list.selected().is_some());
     let items: Vec<_> = state
         .candidates
         .as_ref()
@@ -142,8 +146,8 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
             set.chapters
                 .iter()
                 .map(|chapter| {
-                    ListItem::new(format!(
-                        "{}{:.1}〜{:.1}秒 {}",
+                    let prefix = format!(
+                        "{}{:.1}〜{:.1}秒 ",
                         if current == Some(chapter.source_index) {
                             "[再生位置] "
                         } else {
@@ -151,7 +155,10 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
                         },
                         chapter.start.as_secs_f64(),
                         chapter.end.as_secs_f64(),
-                        chapter.title
+                    );
+                    ListItem::new(format!(
+                        "{prefix}{}",
+                        fit_after_prefix(&prefix, &chapter.title, content_width)
                     ))
                 })
                 .collect()
@@ -172,7 +179,7 @@ fn draw_chapters(frame: &mut Frame, screen: &mut Screen, area: Rect, now: DateTi
                 ),
             )
             .highlight_style(Style::default().bg(Color::DarkGray))
-            .highlight_symbol("▶ "),
+            .highlight_symbol(truncate::HIGHLIGHT),
         panes[1],
         &mut screen.chapter_list,
     );
@@ -282,16 +289,20 @@ fn draw_programs(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffs
             .filter(|i| visible.contains(i))
             .map(|i| i - visible.start),
     );
+    let content_width = list_text_columns(panes[0].width, local_list.selected().is_some());
     let items: Vec<_> = screen.rows()[visible]
         .iter()
         .map(|i| {
             let p = &screen.app.programs[*i];
-            ListItem::new(format!(
-                "{} {} [{}] {}",
+            let prefix = format!(
+                "{} {} [{}] ",
                 local(p.key.starts_at).format("%m/%d %H:%M"),
                 p.key.station_id,
                 status(p, now),
-                p.title.chars().take(120).collect::<String>()
+            );
+            ListItem::new(format!(
+                "{prefix}{}",
+                fit_after_prefix(&prefix, &p.title, content_width)
             ))
         })
         .collect();
@@ -303,7 +314,7 @@ fn draw_programs(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffs
                 screen.app.programs.len()
             )))
             .highlight_style(Style::default().bg(Color::DarkGray))
-            .highlight_symbol("▶ "),
+            .highlight_symbol(truncate::HIGHLIGHT),
         panes[0],
         &mut local_list,
     );
