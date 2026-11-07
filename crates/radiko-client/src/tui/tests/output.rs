@@ -40,20 +40,12 @@ fn assert_exact_rows(screen: &mut Screen, lines: &[&str]) {
                     rows.join("\n")
                 )
             });
-        let shown = if height <= 29 { &lines[..1] } else { lines };
-        for (offset, expected) in shown.iter().enumerate() {
+        for (offset, expected) in lines.iter().enumerate() {
             assert_eq!(
                 rows[start + offset].as_str(),
                 *expected,
                 "{width}x{height} row {}",
                 start + offset
-            );
-        }
-        if height <= 29 && lines.len() > 1 {
-            assert!(
-                rows.iter().all(|row| row != lines[1]),
-                "{width}x{height} kept the second guide line on its own row\n{}",
-                rows.join("\n")
             );
         }
     }
@@ -153,21 +145,10 @@ fn output_guides_render_exactly_at_80_and_160_from_the_error_type() {
         assert_exact_rows(&mut screen, expected);
         for (width, height) in [(80u16, 24u16), (160, 40)] {
             let shown = content_rows(&mut screen, width, height).join("\n");
-            let required = if height <= 29 {
-                &expected[..1]
-            } else {
-                expected
-            };
-            for line in required {
+            for line in expected {
                 assert!(
                     shown.contains(line),
                     "{width}x{height} missing {line}\n{shown}"
-                );
-            }
-            if height <= 29 {
-                assert!(
-                    !shown.contains(expected[1]),
-                    "{width}x{height} joined or wrapped the follow-up\n{shown}"
                 );
             }
         }

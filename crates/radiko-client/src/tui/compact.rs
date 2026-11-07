@@ -1,7 +1,10 @@
 //! Compact main screen for short terminals. Height selects it; width does not.
 //!
-//! The header is 2 rows and the footer is 3, borders included. Side borders sit
-//! on those rows. Top and bottom borders are not added on top of the budget.
+//! The header is 2 rows. The footer is 3 when playback, the notice, and the hint
+//! each take one row. A long notice or output guide wraps by display width and
+//! the footer grows only while that text is showing. Side borders sit on the
+//! content rows. Top and bottom borders are not added on top of the budget.
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// `height <= MAX_HEIGHT` is compact. `30` and above keep the normal layout.
@@ -56,23 +59,52 @@ pub(super) fn playback_line(identity: &str, state: &str, clock: &str, width: usi
     }
 }
 
-/// The first guide sentence, plus the follow-up when both fit on one row.
-pub(super) fn guide_line(lines: &[&str], width: usize) -> String {
-    let Some(first) = lines.first().copied() else {
-        return String::new();
-    };
-    if let Some(second) = lines.get(1).copied() {
-        let both = format!("{first} / {second}");
-        if fits(width, &both) {
-            return both;
-        }
+/// Break `text` on grapheme boundaries so each line's display width is at most
+/// `width`. Joining the lines restores `text`. A width of 0 keeps one line.
+pub(super) fn wrap_display(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
     }
-    first.to_owned()
+    if width == 0 {
+        return vec![text.to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for cluster in text.graphemes(true) {
+        let cluster_width = UnicodeWidthStr::width(cluster);
+        if !current.is_empty() && used.saturating_add(cluster_width) > width {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push_str(cluster);
+        used = used.saturating_add(cluster_width);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Each source sentence stays intact. A sentence wider than `width` wraps, and
+/// the next sentence starts on the following row.
+pub(super) fn guide_rows(lines: &[&str], width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in lines {
+        rows.extend(wrap_display(line, width));
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{guide_line, hint, playback_line};
+    use super::{guide_rows, hint, playback_line, wrap_display};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -136,17 +168,29 @@ mod tests {
     }
 
     #[test]
-    fn guide_follow_up_stays_off_the_row_unless_the_whole_second_sentence_fits() {
+    fn guide_rows_keep_both_sentences_and_add_a_row_one_column_below_the_fit() {
         let first = "出力先がありません。OSのサウンド設定を確認し、Enterで再生し直してください";
         let second = "自動再開はしません";
         assert_eq!(UnicodeWidthStr::width(first), 73);
         assert_eq!(UnicodeWidthStr::width(second), 18);
-        let lines = [first, second];
-        assert_eq!(guide_line(&lines, 78), first);
-        assert!(!guide_line(&lines, 78).contains(second));
-        let both = format!("{first} / {second}");
-        assert_eq!(UnicodeWidthStr::width(both.as_str()), 94);
-        assert_eq!(guide_line(&lines, 94), both);
-        assert_eq!(guide_line(&lines, 93), first);
+        let fitted = guide_rows(&[first, second], 73);
+        assert_eq!(fitted, vec![first.to_owned(), second.to_owned()]);
+        let narrower = guide_rows(&[first, second], 72);
+        assert_eq!(narrower.len(), fitted.len() + 1);
+        assert_eq!(narrower.concat(), format!("{first}{second}"));
+        assert_eq!(narrower.last().map(String::as_str), Some(second));
+    }
+
+    #[test]
+    fn wrap_display_splits_on_the_column_below_an_exact_fit_without_losing_text() {
+        let marked = "✕ 再生切替失敗（現在の状態を維持）: 配信取得: シーク位置は番組冒頭以上・放送枠末尾未満で指定してください";
+        assert_eq!(UnicodeWidthStr::width(marked), 104);
+        assert_eq!(wrap_display(marked, 104), vec![marked.to_owned()]);
+        let wrapped = wrap_display(marked, 103);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped.concat(), marked);
+        assert!(wrapped.concat().contains("末尾未満で指定してください"));
+        assert!(UnicodeWidthStr::width(wrapped[0].as_str()) <= 103);
+        assert!(!wrapped[0].is_empty());
     }
 }

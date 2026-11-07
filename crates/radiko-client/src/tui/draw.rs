@@ -539,21 +539,39 @@ fn draw_compact_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOf
     };
     frame.render_widget(Paragraph::new(text).block(side_block(area)), area);
 }
-fn compact_playback_text(screen: &Screen, width: usize) -> String {
+fn compact_playback_lines(screen: &Screen, width: usize) -> Vec<String> {
     if let Some(snapshot) = screen.app.playback.as_ref() {
         let view = super::playback_view::presentation(snapshot);
         let identity = format!("再生中: [{} / {}]", snapshot.info.station, view.mode);
-        return super::compact::playback_line(&identity, view.state, &view.clock, width);
+        return vec![super::compact::playback_line(
+            &identity,
+            view.state,
+            &view.clock,
+            width,
+        )];
     }
     if let Some(cause) = screen.stop_cause {
-        return cause
-            .player_line(&screen.app.authentication.status)
-            .to_owned();
+        return vec![
+            cause
+                .player_line(&screen.app.authentication.status)
+                .to_owned(),
+        ];
     }
     if let Some(guide) = screen.output_guide {
-        return super::compact::guide_line(guide.lines(), width);
+        return super::compact::guide_rows(guide.lines(), width);
     }
-    "再生中: なし".to_owned()
+    vec!["再生中: なし".to_owned()]
+}
+fn compact_notice_lines(screen: &Screen, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    let Some((level, text)) = screen.footer_notice() else {
+        return vec![ratatui::text::Line::from("")];
+    };
+    let marked = format!("{}{text}", super::notices::notice_mark(level));
+    let style = super::notices::notice_style(level, screen.no_color);
+    super::compact::wrap_display(&marked, width)
+        .into_iter()
+        .map(|line| ratatui::text::Line::from(ratatui::text::Span::styled(line, style)))
+        .collect()
 }
 fn compact_hint_text(screen: &Screen, width: usize) -> String {
     if screen.logout_confirm {
@@ -561,29 +579,31 @@ fn compact_hint_text(screen: &Screen, width: usize) -> String {
     }
     super::compact::hint(width)
 }
+fn compact_footer_lines(screen: &Screen, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    let mut lines: Vec<_> = compact_playback_lines(screen, width)
+        .into_iter()
+        .map(ratatui::text::Line::from)
+        .collect();
+    lines.extend(compact_notice_lines(screen, width));
+    lines.push(ratatui::text::Line::from(compact_hint_text(screen, width)));
+    lines
+}
+fn compact_footer_height(screen: &Screen, area: Rect) -> u16 {
+    let width = usize::from(area.width.saturating_sub(2));
+    let needed = u16::try_from(compact_footer_lines(screen, width).len()).unwrap_or(u16::MAX);
+    // Leave the 2-row header when the terminal can hold it. Extra wrapped rows
+    // that do not fit stay in the screen state and are not drawn.
+    let budget = area.height.saturating_sub(2);
+    if budget == 0 {
+        return area.height.min(needed.max(1));
+    }
+    needed.max(1).min(budget)
+}
 fn draw_compact_footer(frame: &mut Frame, screen: &Screen, area: Rect) {
     let block = side_block(area);
     let width = usize::from(block.inner(area).width);
-    let playback = compact_playback_text(screen, width);
-    let notice = if let Some((level, text)) = screen.footer_notice() {
-        let marked = format!("{}{text}", super::notices::notice_mark(level));
-        ratatui::text::Line::from(ratatui::text::Span::styled(
-            marked,
-            super::notices::notice_style(level, screen.no_color),
-        ))
-    } else {
-        ratatui::text::Line::from("")
-    };
-    let hint = compact_hint_text(screen, width);
-    frame.render_widget(
-        Paragraph::new(vec![
-            ratatui::text::Line::from(playback),
-            notice,
-            ratatui::text::Line::from(hint),
-        ])
-        .block(block),
-        area,
-    );
+    let lines = compact_footer_lines(screen, width);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     screen.expire_preferences();
@@ -628,7 +648,7 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
         Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(compact_footer_height(screen, frame.area())),
         ])
         .split(frame.area())
     } else {
