@@ -14,7 +14,7 @@ import tempfile
 import signal
 from pathlib import Path
 
-from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, device_check, number, select_program, failure_observation, check_timefree_end, UnderrunObservations, output_has_started, require_playback_alive, require_no_alsa_noise, playback_failure_visible
+from verify_tui_playback import Terminal, wait_exit, target_matches, failure_diagnostics, pipeline_diagnostics, sleep_check, device_check, number, select_program, failure_observation, check_timefree_end, UnderrunObservations, output_has_started, require_playback_alive, require_no_alsa_noise, playback_failure_visible, shows_playing, shows_paused
 
 
 class TerminalTests(unittest.TestCase):
@@ -428,6 +428,19 @@ else:
         self.assertTrue(target_matches('再生中: [TBS / TimeFree] title\n' + selected, 'TBS', start, end, 'TimeFree'))
         self.assertFalse(target_matches('再生中: [OBS / Live] title / TBS / TimeFree\n' + selected, 'TBS', start, end))
         self.assertFalse(target_matches('再生中: title / TBS / TimeFree / OBS / Live\n' + selected, 'TBS', start, end))
+        japanese = ('再生中: [TBS / タイムフリー] 朝の番組\n'
+                    '10/15 12:00〜10/15 13:00 JST / 再生中 / 音量0% / 12:34 / 55:00\n')
+        self.assertTrue(target_matches(japanese, 'TBS', start, end, 'TimeFree'))
+        self.assertFalse(target_matches(japanese, 'TBS', start, end, 'Live'))
+        self.assertTrue(shows_playing(japanese))
+        self.assertFalse(shows_paused(japanese))
+        self.assertEqual(number(japanese, r'位置([0-9.]+)秒'), 754.0)
+        paused = japanese.replace(' / 再生中 / ', ' / 一時停止 / ')
+        self.assertTrue(shows_paused(paused))
+        self.assertFalse(shows_playing(paused))
+        unknown = japanese.replace('12:34 / 55:00', '番組内位置未確認')
+        self.assertIsNone(number(unknown, r'位置([0-9.]+)秒'))
+        self.assertFalse(shows_playing('再生中: なし / 音量25%'))
 
     def test_failure_diagnostics_ignore_program_text_and_never_return_raw_notice(self):
         body = '再生停止: 配信取得: signed-url-secret\n' + '\n'.join(['body'] * 9)

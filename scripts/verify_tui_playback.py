@@ -144,19 +144,44 @@ class Terminal:
         return self.grid[-1][0] == '└' and self.grid[-1][-1] == '┘'
 
 
+_MODE_LABELS = {
+    None: ('TimeFree', 'Live', 'タイムフリー', 'ライブ'),
+    'TimeFree': ('TimeFree', 'タイムフリー'),
+    'Live': ('Live', 'ライブ'),
+}
+_STATE = r'(?:Buffering|Playing|Paused|バッファ中|再生中|一時停止)'
+
+
+def shows_playing(text):
+    """True for the playback state, not the `再生中:` row prefix."""
+    return 'Playing' in text or '再生中 /' in text
+
+
+def shows_paused(text):
+    return 'Paused' in text or '一時停止 /' in text
+
+
+def _mode_matches(label, mode):
+    return label in _MODE_LABELS.get(mode, (mode,))
+
+
 def number(text, expression):
     """Read counters from known footer rows, never from titles or schedule content."""
     for line in text.splitlines()[-10:]:
         line = line.strip(' │')
         if expression.startswith('位置'):
             eligible = re.match(r'^\d{2}/\d{2} \d{2}:\d{2}〜\d{2}/\d{2} \d{2}:\d{2} JST / '
-                                r'(?:Buffering|Playing|Paused) / 音量\d+% / ', line)
+                                + _STATE + r' / 音量\d+% / ', line)
         else:
             eligible = re.match(r'^(?:(?:停止時|直近通知（終了時未集計）):\s*)?今回の出力\s+', line)
         if eligible:
             found = re.search(expression, line)
             if found:
                 return float(found.group(1))
+            if expression.startswith('位置'):
+                clock = re.match(r'(\d+):(\d{2})', line[eligible.end():])
+                if clock:
+                    return float(int(clock.group(1)) * 60 + int(clock.group(2)))
     return None
 
 
@@ -165,13 +190,14 @@ def target_matches(text, station, start, end, mode=None):
     lines = text.splitlines()
     for index, line in enumerate(lines):
         line = line.strip(' │')
-        identity = re.match(r'^再生中: \[([A-Za-z0-9_-]+) / (TimeFree|Live)\]', line)
+        identity = re.match(r'^再生中: \[([A-Za-z0-9_-]+) / ([^]]+)\]', line)
         if identity:
-            matches = identity[1] == station and (mode is None or identity[2] == mode)
+            matches = identity[1] == station and _mode_matches(identity[2], mode)
         else:  # Older fixed binaries put the station/mode after the title.
-            identity = re.search(r' / ([A-Za-z0-9_-]+) / (TimeFree|Live)$', line)
+            identity = re.search(
+                r' / ([A-Za-z0-9_-]+) / (TimeFree|Live|タイムフリー|ライブ)$', line)
             matches = line.startswith('再生中: ') and identity is not None and \
-                identity[1] == station and (mode is None or identity[2] == mode)
+                identity[1] == station and _mode_matches(identity[2], mode)
         if matches and index+1 < len(lines) and expected in lines[index+1]:
             return True
     return False
@@ -358,7 +384,7 @@ def device_check(terminal, proc, master, station, selected, ends_at, wait):
     wait(lambda t: '再生中: なし' in t, 10)
     terminal.pump(1)
     os.write(master, b'\r')
-    wait(lambda t: 'Playing' in t and target_matches(t, station, selected, ends_at, 'TimeFree') and
+    wait(lambda t: shows_playing(t) and target_matches(t, station, selected, ends_at, 'TimeFree') and
          (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 2, 90)
     report(phase='device_replay_started', muted=True)
     return dict(disconnected=disconnected, reconnected=reconnected)
@@ -366,7 +392,7 @@ def device_check(terminal, proc, master, station, selected, ends_at, wait):
 
 def sleep_check(terminal, proc, master, station, selected, ends_at, wait):
     """The operator controls sleep; acknowledgment alone does not prove OS sleep."""
-    before = wait(lambda t: 'Playing' in t and '音量0%' in t and
+    before = wait(lambda t: shows_playing(t) and '音量0%' in t and
                   (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 5)
     report(phase='sleep_ready', muted=True,
            output_seconds=number(before, r'今回の出力\s+([0-9.]+)秒'))
@@ -413,7 +439,7 @@ def sleep_check(terminal, proc, master, station, selected, ends_at, wait):
     wait(lambda t: '再生中: なし' in t, 10)
     terminal.pump(1)
     os.write(master, b'\r')
-    wait(lambda t: 'Playing' in t and '音量0%' in t and
+    wait(lambda t: shows_playing(t) and '音量0%' in t and
          target_matches(t, station, selected, ends_at, 'TimeFree') and
          '停止時:' not in t and not failure_diagnostics(t)['notice_visible'] and
          (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 2, 90,
@@ -433,7 +459,7 @@ def restart_check(terminal, master, wait, args, selected, ends_at, index, filter
     terminal.pump(0.3)
     os.write(master, b'\r')
     wait(lambda t: target_matches(t, args.station, selected, ends_at, 'TimeFree')
-         and 'Playing' in t and '音量0%' in t and '停止時:' not in t
+         and shows_playing(t) and '音量0%' in t and '停止時:' not in t
          and (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 5, 90,
          check='explicit restart did not produce a new output generation')
     os.write(master, b's')
@@ -624,7 +650,7 @@ def verify(args, directory):
         if args.pause_seconds:
             wait(lambda t: (number(t, r'今回の出力\s+([0-9.]+)秒') or 0) >= 2, check_playback=True)
             os.write(master, b' ')
-            paused = wait(lambda t: 'Paused' in t)
+            paused = wait(lambda t: shows_paused(t))
             position = number(paused, r'位置([0-9.]+)秒')
             require(position is not None, 'paused position absent')
             paused_at = time.monotonic()
@@ -636,14 +662,14 @@ def verify(args, directory):
                 text = terminal.screen()
                 require(proc.poll() is None, 'TUI exited while paused')
                 require_no_alsa_noise(text)
-                if not ('Paused' in text and target_matches(text, args.station, selected, ends_at, expected_mode)):
+                if not (shows_paused(text) and target_matches(text, args.station, selected, ends_at, expected_mode)):
                     # Drain a possibly incomplete draw before classifying a state change.
                     terminal.pump(0.5)
                     text = terminal.screen()
                     require_no_alsa_noise(text)
-                    if not ('Paused' in text and target_matches(text, args.station, selected, ends_at, expected_mode)):
+                    if not (shows_paused(text) and target_matches(text, args.station, selected, ends_at, expected_mode)):
                         report(phase='paused_state_changed', paused_seconds=round(time.monotonic()-paused_at, 1),
-                               paused_visible='Paused' in text, playing_visible='Playing' in text,
+                               paused_visible=shows_paused(text), playing_visible=shows_playing(text),
                                active_target_matches=target_matches(text, args.station, selected, ends_at, expected_mode),
                                inactive_visible='再生中: なし' in text,
                                playback_error_visible=playback_failure_visible(text),
@@ -660,11 +686,11 @@ def verify(args, directory):
                     os.write(master, b'?')
                     wait(lambda t: '┌操作一覧' in t, 10)
                     os.write(master, b'?')
-                    wait(lambda t: '┌操作一覧' not in t and 'Paused' in t, 10)
+                    wait(lambda t: '┌操作一覧' not in t and shows_paused(t), 10)
                     os.write(master, b'/pause-cancel')
                     wait(lambda t: '条件編集中' in t, 10)
                     os.write(master, b'\x1b')
-                    wait(lambda t: '条件編集中' not in t and 'Paused' in t, 10)
+                    wait(lambda t: '条件編集中' not in t and shows_paused(t), 10)
                     # Keep Esc separate from the next key, including parser observation.
                     terminal.pump(0.1)
                     os.write(master, b'r')
@@ -674,7 +700,7 @@ def verify(args, directory):
                     next_operation = time.monotonic() + args.interval
             pause_elapsed = time.monotonic() - paused_at
             os.write(master, b' ')
-            resumed = wait(lambda t: 'Playing' in t and
+            resumed = wait(lambda t: shows_playing(t) and
                            (number(t, r'位置([0-9.]+)秒') or 0) > position + 1, check_playback=True)
             require(target_matches(resumed, args.station, selected, ends_at, expected_mode), 'resumed slot changed')
             report(phase='resumed', paused_seconds=round(pause_elapsed, 1),

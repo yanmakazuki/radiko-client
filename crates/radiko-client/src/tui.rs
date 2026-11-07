@@ -33,6 +33,7 @@ mod named;
 mod notices;
 mod offline;
 mod picker;
+mod playback_view;
 mod screen;
 mod scroll;
 mod seek;
