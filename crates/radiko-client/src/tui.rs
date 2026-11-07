@@ -22,6 +22,7 @@ macro_rules! dialog_close_hint {
     };
 }
 mod areas;
+mod compact;
 mod device;
 mod draw;
 mod failures;

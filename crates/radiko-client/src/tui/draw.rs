@@ -493,6 +493,98 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
         }
     }
 }
+fn search_context(screen: &Screen, now: DateTime<FixedOffset>) -> (String, String) {
+    let scope = match screen.app.committed.scope() {
+        Scope::Nationwide => "全国".into(),
+        Scope::Station(id) => id.clone(),
+        Scope::Areas(ids) => ids.join(","),
+    };
+    let mode = if screen.live_mode
+        && radiko::domain::broadcast_day(now)
+            .is_some_and(|day| day != screen.app.committed.range().start())
+    {
+        "ライブ（取得日が当日と異なります・rで更新）"
+    } else if screen.live_mode {
+        "ライブ（放送中のみ）"
+    } else {
+        "タイムフリー"
+    };
+    let mode = if screen.offline {
+        format!("{mode} / オフライン確認")
+    } else {
+        mode.to_string()
+    };
+    (mode, scope)
+}
+fn side_block(area: Rect) -> Block<'static> {
+    if area.width >= 2 {
+        Block::default().borders(Borders::LEFT | Borders::RIGHT)
+    } else {
+        Block::default()
+    }
+}
+fn draw_compact_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, area: Rect) {
+    let text = if let Some(input) = &screen.input {
+        format!("キーワード: {input}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）")
+    } else if let Some(editor) = &screen.seek {
+        editor.prompt()
+    } else {
+        let (mode, scope) = search_context(screen, now);
+        format!(
+            "{mode} / {scope} / {}〜{}\n{}",
+            screen.app.committed.range().start(),
+            screen.app.committed.range().end(),
+            super::messages::auth_detail(&screen.app.authentication.status)
+        )
+    };
+    frame.render_widget(Paragraph::new(text).block(side_block(area)), area);
+}
+fn compact_playback_text(screen: &Screen, width: usize) -> String {
+    if let Some(snapshot) = screen.app.playback.as_ref() {
+        let view = super::playback_view::presentation(snapshot);
+        let identity = format!("再生中: [{} / {}]", snapshot.info.station, view.mode);
+        return super::compact::playback_line(&identity, view.state, &view.clock, width);
+    }
+    if let Some(cause) = screen.stop_cause {
+        return cause
+            .player_line(&screen.app.authentication.status)
+            .to_owned();
+    }
+    if let Some(guide) = screen.output_guide {
+        return super::compact::guide_line(guide.lines(), width);
+    }
+    "再生中: なし".to_owned()
+}
+fn compact_hint_text(screen: &Screen, width: usize) -> String {
+    if screen.logout_confirm {
+        return screen.control_hint();
+    }
+    super::compact::hint(width)
+}
+fn draw_compact_footer(frame: &mut Frame, screen: &Screen, area: Rect) {
+    let block = side_block(area);
+    let width = usize::from(block.inner(area).width);
+    let playback = compact_playback_text(screen, width);
+    let notice = if let Some((level, text)) = screen.footer_notice() {
+        let marked = format!("{}{text}", super::notices::notice_mark(level));
+        ratatui::text::Line::from(ratatui::text::Span::styled(
+            marked,
+            super::notices::notice_style(level, screen.no_color),
+        ))
+    } else {
+        ratatui::text::Line::from("")
+    };
+    let hint = compact_hint_text(screen, width);
+    frame.render_widget(
+        Paragraph::new(vec![
+            ratatui::text::Line::from(playback),
+            notice,
+            ratatui::text::Line::from(hint),
+        ])
+        .block(block),
+        area,
+    );
+}
 pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     screen.expire_preferences();
     if screen.device_open {
@@ -530,20 +622,34 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
         );
         return;
     }
+    let compact = super::compact::active(frame.area().height);
     let show_http = frame.area().height >= 36;
-    let areas = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Min(1),
-        Constraint::Length(if screen.input.is_some() {
-            4
-        } else if screen.seek.is_some() {
-            11 + u16::from(show_http)
-        } else {
-            10 + u16::from(show_http)
-        }),
-    ])
-    .split(frame.area());
-    draw_header(frame, screen, now, areas[0]);
+    let areas = if compact {
+        Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .split(frame.area())
+    } else {
+        Layout::vertical([
+            Constraint::Length(7),
+            Constraint::Min(1),
+            Constraint::Length(if screen.input.is_some() {
+                4
+            } else if screen.seek.is_some() {
+                11 + u16::from(show_http)
+            } else {
+                10 + u16::from(show_http)
+            }),
+        ])
+        .split(frame.area())
+    };
+    if compact {
+        draw_compact_header(frame, screen, now, areas[0]);
+    } else {
+        draw_header(frame, screen, now, areas[0]);
+    }
     if let Some(editor) = &screen.login {
         editor.draw(frame, areas[1]);
     } else if let Some(manager) = &mut screen.named {
@@ -555,7 +661,9 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
     } else {
         draw_programs(frame, screen, now, areas[1]);
     }
-    if let Some(input) = &screen.input {
+    if compact {
+        draw_compact_footer(frame, screen, areas[2]);
+    } else if let Some(input) = &screen.input {
         frame.render_widget(
             Paragraph::new(format!(
                 "キーワード: {input}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）"

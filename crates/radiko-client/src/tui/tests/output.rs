@@ -40,12 +40,20 @@ fn assert_exact_rows(screen: &mut Screen, lines: &[&str]) {
                     rows.join("\n")
                 )
             });
-        for (offset, expected) in lines.iter().enumerate() {
+        let shown = if height <= 29 { &lines[..1] } else { lines };
+        for (offset, expected) in shown.iter().enumerate() {
             assert_eq!(
                 rows[start + offset].as_str(),
                 *expected,
                 "{width}x{height} row {}",
                 start + offset
+            );
+        }
+        if height <= 29 && lines.len() > 1 {
+            assert!(
+                rows.iter().all(|row| row != lines[1]),
+                "{width}x{height} kept the second guide line on its own row\n{}",
+                rows.join("\n")
             );
         }
     }
@@ -145,10 +153,21 @@ fn output_guides_render_exactly_at_80_and_160_from_the_error_type() {
         assert_exact_rows(&mut screen, expected);
         for (width, height) in [(80u16, 24u16), (160, 40)] {
             let shown = content_rows(&mut screen, width, height).join("\n");
-            for line in expected {
+            let required = if height <= 29 {
+                &expected[..1]
+            } else {
+                expected
+            };
+            for line in required {
                 assert!(
                     shown.contains(line),
                     "{width}x{height} missing {line}\n{shown}"
+                );
+            }
+            if height <= 29 {
+                assert!(
+                    !shown.contains(expected[1]),
+                    "{width}x{height} joined or wrapped the follow-up\n{shown}"
                 );
             }
         }
@@ -166,9 +185,12 @@ fn the_device_sentence_without_output_failure_does_not_show_a_guide() {
     });
     assert!(bare.output_guide.is_none());
     let rows = content_rows(&mut bare, 80, 24);
+    assert!(rows.iter().any(|row| row == "再生中: なし"), "{rows:?}");
+    assert!(rows.iter().all(|row| !row.contains("音量")), "{rows:?}");
+    let wide = content_rows(&mut bare, 160, 40);
     assert!(
-        rows.iter().any(|row| row == "再生中: なし / 音量25%"),
-        "{rows:?}"
+        wide.iter().any(|row| row == "再生中: なし / 音量25%"),
+        "{wide:?}"
     );
     assert!(
         rows.iter()
@@ -265,8 +287,15 @@ fn output_guide_stays_until_escape_or_the_next_playback_and_auth_stop_wins() {
     assert!(view.playback_stopped);
     let cleared = content_rows(&mut view, 80, 24);
     assert!(
-        cleared.iter().any(|row| row == "再生中: なし / 音量25%"),
+        cleared.iter().any(|row| row == "再生中: なし"),
         "{cleared:?}"
+    );
+    let cleared_wide = content_rows(&mut view, 160, 40);
+    assert!(
+        cleared_wide
+            .iter()
+            .any(|row| row == "再生中: なし / 音量25%"),
+        "{cleared_wide:?}"
     );
     assert!(cleared.iter().all(|row| row != lines[0]));
 
