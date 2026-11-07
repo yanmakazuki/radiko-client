@@ -166,9 +166,12 @@ fn the_device_sentence_without_output_failure_does_not_show_a_guide() {
     });
     assert!(bare.output_guide.is_none());
     let rows = content_rows(&mut bare, 80, 24);
+    assert!(rows.iter().any(|row| row == "再生中: なし"), "{rows:?}");
+    assert!(rows.iter().all(|row| !row.contains("音量")), "{rows:?}");
+    let wide = content_rows(&mut bare, 160, 40);
     assert!(
-        rows.iter().any(|row| row == "再生中: なし / 音量25%"),
-        "{rows:?}"
+        wide.iter().any(|row| row == "再生中: なし / 音量25%"),
+        "{wide:?}"
     );
     assert!(
         rows.iter()
@@ -265,8 +268,15 @@ fn output_guide_stays_until_escape_or_the_next_playback_and_auth_stop_wins() {
     assert!(view.playback_stopped);
     let cleared = content_rows(&mut view, 80, 24);
     assert!(
-        cleared.iter().any(|row| row == "再生中: なし / 音量25%"),
+        cleared.iter().any(|row| row == "再生中: なし"),
         "{cleared:?}"
+    );
+    let cleared_wide = content_rows(&mut view, 160, 40);
+    assert!(
+        cleared_wide
+            .iter()
+            .any(|row| row == "再生中: なし / 音量25%"),
+        "{cleared_wide:?}"
     );
     assert!(cleared.iter().all(|row| row != lines[0]));
 

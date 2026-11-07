@@ -85,11 +85,15 @@ fn assert_inside(buffer: &Buffer) {
     let filled = super::super::playback_view::FILLED;
     let empty = super::super::playback_view::UNFILLED;
     if width >= 20 && height >= 16 {
-        assert_eq!(buffer[(0, height - 1)].symbol(), "└", "bottom-left");
-        assert_eq!(
-            buffer[(width - 1, height - 1)].symbol(),
-            "┘",
-            "bottom-right"
+        let left = buffer[(0, height - 1)].symbol();
+        let right = buffer[(width - 1, height - 1)].symbol();
+        assert!(
+            left == "└" || left == "│",
+            "bottom-left {left} at {width}x{height}"
+        );
+        assert!(
+            right == "┘" || right == "│",
+            "bottom-right {right} at {width}x{height}"
         );
     }
     for y in 0..height {
@@ -136,10 +140,19 @@ fn player_and_help_cells_use_the_same_japanese_labels_for_every_mode_and_state()
                     body.contains(&format!("[TBS / {mode_label}]")),
                     "{width}x{height} {mode_label}\n{body}"
                 );
-                assert!(
-                    body.contains(&format!(" / {state_label} / 音量25% / ")),
-                    "{width}x{height} {state_label}\n{body}"
-                );
+                if height <= 29 {
+                    assert!(
+                        body.contains(state_label),
+                        "{width}x{height} {state_label}\n{body}"
+                    );
+                    assert!(!body.contains("音量"), "{width}x{height}\n{body}");
+                    assert_eq!(counts(&shown), (0, 0), "{width}x{height}\n{body}");
+                } else {
+                    assert!(
+                        body.contains(&format!(" / {state_label} / 音量25% / ")),
+                        "{width}x{height} {state_label}\n{body}"
+                    );
+                }
                 assert_no_debug(&body);
                 assert!(body.contains("NOTICE_KEEP"), "{width}x{height}\n{body}");
                 assert!(body.contains("? 操作一覧"), "{width}x{height}\n{body}");
@@ -205,12 +218,16 @@ fn timefree_cells_show_754_over_3300_as_12_34_of_55_00_at_start_middle_and_end()
             assert!(!body.replace("音量25%", "").contains('%'), "{body}");
             let (filled, empty) = counts(&shown);
             let bar = filled + empty;
-            assert!(bar > 0, "{width}x{height} missing bar for {clock}\n{body}");
-            assert_eq!(
-                filled,
-                (bar as f64 * ratio).floor() as usize,
-                "{width}x{height} {clock} filled {filled} empty {empty}"
-            );
+            if height <= 29 {
+                assert_eq!(bar, 0, "{width}x{height} compact hides the bar\n{body}");
+            } else {
+                assert!(bar > 0, "{width}x{height} missing bar for {clock}\n{body}");
+                assert_eq!(
+                    filled,
+                    (bar as f64 * ratio).floor() as usize,
+                    "{width}x{height} {clock} filled {filled} empty {empty}"
+                );
+            }
             assert_inside(&shown);
             assert!(body.contains("NOTICE_KEEP"), "{body}");
             assert!(body.contains("? 操作一覧"), "{body}");
@@ -341,9 +358,15 @@ fn out_of_range_position_clamps_the_bar_and_keeps_the_clock() {
     let shown = buffer(&mut screen, 80, 24);
     let body = text(&shown);
     assert!(body.contains("66:40 / 55:00"), "{body}");
-    let (filled, empty) = counts(&shown);
-    assert!(filled > 0, "{body}");
-    assert_eq!(empty, 0, "{body}");
+    assert_eq!(
+        counts(&shown),
+        (0, 0),
+        "compact hides the clamped bar\n{body}"
+    );
+    let wide = buffer(&mut screen, 160, 40);
+    let (filled, empty) = counts(&wide);
+    assert!(filled > 0, "{}", text(&wide));
+    assert_eq!(empty, 0, "{}", text(&wide));
     assert_eq!(
         screen.app.playback.as_ref().unwrap().position,
         Some(position)
@@ -373,7 +396,12 @@ fn narrow_resize_and_tiny_terminals_keep_borders_notices_and_the_clock() {
     assert!(text(&normal).contains("12:34 / 55:00"));
     assert!(text(&normal).contains("NOTICE_KEEP"));
     assert!(text(&normal).contains("? 操作一覧"));
-    assert!(counts(&normal).0 + counts(&normal).1 > 0);
+    assert_eq!(
+        counts(&normal).0 + counts(&normal).1,
+        0,
+        "compact hides the bar\n{}",
+        text(&normal)
+    );
     assert_inside(&normal);
 
     let narrow = buffer(&mut screen, 36, 24);
@@ -433,9 +461,11 @@ fn rows(buffer: &Buffer) -> Vec<String> {
 }
 
 fn detail_row(buffer: &Buffer) -> String {
-    rows(buffer)
-        .into_iter()
+    let rows = rows(buffer);
+    rows.iter()
         .find(|row| row.contains("JST /"))
+        .or_else(|| rows.iter().find(|row| row.contains("[TBS /")))
+        .cloned()
         .unwrap_or_default()
 }
 
@@ -492,6 +522,7 @@ fn narrow_player_and_help_keep_state_and_a_whole_clock() {
                 row.contains("[TBS / タイムフリー]")
                     || text(&shown).contains("[TBS / タイムフリー]")
             );
+            assert!(!row.contains("音量"), "{row}");
             assert_inside(&shown);
             screen.help_open = true;
             let help = buffer(&mut screen, width, 24);
@@ -505,7 +536,11 @@ fn narrow_player_and_help_keep_state_and_a_whole_clock() {
             let shown = buffer(&mut screen, width, height);
             let row = detail_row(&shown);
             whole_clock(&row, CLOCK, state_label);
-            assert!(row.contains("音量25%"), "wide player keeps volume:\n{row}");
+            if height <= 29 {
+                assert!(!row.contains("音量"), "compact hides volume:\n{row}");
+            } else {
+                assert!(row.contains("音量25%"), "wide player keeps volume:\n{row}");
+            }
             screen.help_open = true;
             let help_line = help_row(&buffer(&mut screen, width, height));
             whole_clock(&help_line, CLOCK, state_label);

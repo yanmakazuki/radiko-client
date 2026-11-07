@@ -493,6 +493,118 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
         }
     }
 }
+fn search_context(screen: &Screen, now: DateTime<FixedOffset>) -> (String, String) {
+    let scope = match screen.app.committed.scope() {
+        Scope::Nationwide => "全国".into(),
+        Scope::Station(id) => id.clone(),
+        Scope::Areas(ids) => ids.join(","),
+    };
+    let mode = if screen.live_mode
+        && radiko::domain::broadcast_day(now)
+            .is_some_and(|day| day != screen.app.committed.range().start())
+    {
+        "ライブ（取得日が当日と異なります・rで更新）"
+    } else if screen.live_mode {
+        "ライブ（放送中のみ）"
+    } else {
+        "タイムフリー"
+    };
+    let mode = if screen.offline {
+        format!("{mode} / オフライン確認")
+    } else {
+        mode.to_string()
+    };
+    (mode, scope)
+}
+fn side_block(area: Rect) -> Block<'static> {
+    if area.width >= 2 {
+        Block::default().borders(Borders::LEFT | Borders::RIGHT)
+    } else {
+        Block::default()
+    }
+}
+fn draw_compact_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, area: Rect) {
+    let text = if let Some(input) = &screen.input {
+        format!("キーワード: {input}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）")
+    } else if let Some(editor) = &screen.seek {
+        editor.prompt()
+    } else {
+        let (mode, scope) = search_context(screen, now);
+        format!(
+            "{mode} / {scope} / {}〜{}\n{}",
+            screen.app.committed.range().start(),
+            screen.app.committed.range().end(),
+            super::messages::auth_detail(&screen.app.authentication.status)
+        )
+    };
+    frame.render_widget(Paragraph::new(text).block(side_block(area)), area);
+}
+fn compact_playback_lines(screen: &Screen, width: usize) -> Vec<String> {
+    if let Some(snapshot) = screen.app.playback.as_ref() {
+        let view = super::playback_view::presentation(snapshot);
+        let identity = format!("再生中: [{} / {}]", snapshot.info.station, view.mode);
+        return vec![super::compact::playback_line(
+            &identity,
+            view.state,
+            &view.clock,
+            width,
+        )];
+    }
+    if let Some(cause) = screen.stop_cause {
+        return vec![
+            cause
+                .player_line(&screen.app.authentication.status)
+                .to_owned(),
+        ];
+    }
+    if let Some(guide) = screen.output_guide {
+        return super::compact::guide_rows(guide.lines(), width);
+    }
+    vec!["再生中: なし".to_owned()]
+}
+fn compact_notice_lines(screen: &Screen, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    let Some((level, text)) = screen.footer_notice() else {
+        return vec![ratatui::text::Line::from("")];
+    };
+    let marked = format!("{}{text}", super::notices::notice_mark(level));
+    let style = super::notices::notice_style(level, screen.no_color);
+    super::compact::wrap_display(&marked, width)
+        .into_iter()
+        .map(|line| ratatui::text::Line::from(ratatui::text::Span::styled(line, style)))
+        .collect()
+}
+fn compact_hint_text(screen: &Screen, width: usize) -> String {
+    if screen.logout_confirm {
+        return screen.control_hint();
+    }
+    super::compact::hint(width)
+}
+fn compact_footer_lines(screen: &Screen, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    let mut lines: Vec<_> = compact_playback_lines(screen, width)
+        .into_iter()
+        .map(ratatui::text::Line::from)
+        .collect();
+    lines.extend(compact_notice_lines(screen, width));
+    lines.push(ratatui::text::Line::from(compact_hint_text(screen, width)));
+    lines
+}
+fn compact_footer_height(screen: &Screen, area: Rect) -> u16 {
+    let width = usize::from(area.width.saturating_sub(2));
+    let needed = u16::try_from(compact_footer_lines(screen, width).len()).unwrap_or(u16::MAX);
+    // Leave the 2-row header when the terminal can hold it. Extra wrapped rows
+    // that do not fit stay in the screen state and are not drawn.
+    let budget = area.height.saturating_sub(2);
+    if budget == 0 {
+        return area.height.min(needed.max(1));
+    }
+    needed.max(1).min(budget)
+}
+fn draw_compact_footer(frame: &mut Frame, screen: &Screen, area: Rect) {
+    let block = side_block(area);
+    let width = usize::from(block.inner(area).width);
+    let lines = compact_footer_lines(screen, width);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
 pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOffset>) {
     screen.expire_preferences();
     if screen.device_open {
@@ -530,20 +642,34 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
         );
         return;
     }
+    let compact = super::compact::active(frame.area().height);
     let show_http = frame.area().height >= 36;
-    let areas = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Min(1),
-        Constraint::Length(if screen.input.is_some() {
-            4
-        } else if screen.seek.is_some() {
-            11 + u16::from(show_http)
-        } else {
-            10 + u16::from(show_http)
-        }),
-    ])
-    .split(frame.area());
-    draw_header(frame, screen, now, areas[0]);
+    let areas = if compact {
+        Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(compact_footer_height(screen, frame.area())),
+        ])
+        .split(frame.area())
+    } else {
+        Layout::vertical([
+            Constraint::Length(7),
+            Constraint::Min(1),
+            Constraint::Length(if screen.input.is_some() {
+                4
+            } else if screen.seek.is_some() {
+                11 + u16::from(show_http)
+            } else {
+                10 + u16::from(show_http)
+            }),
+        ])
+        .split(frame.area())
+    };
+    if compact {
+        draw_compact_header(frame, screen, now, areas[0]);
+    } else {
+        draw_header(frame, screen, now, areas[0]);
+    }
     if let Some(editor) = &screen.login {
         editor.draw(frame, areas[1]);
     } else if let Some(manager) = &mut screen.named {
@@ -555,7 +681,9 @@ pub(super) fn draw(frame: &mut Frame, screen: &mut Screen, now: DateTime<FixedOf
     } else {
         draw_programs(frame, screen, now, areas[1]);
     }
-    if let Some(input) = &screen.input {
+    if compact {
+        draw_compact_footer(frame, screen, areas[2]);
+    } else if let Some(input) = &screen.input {
         frame.render_widget(
             Paragraph::new(format!(
                 "キーワード: {input}\nEnter 検索 / Ctrl+U 消去 / Esc 取消（編集中は取得しません）"

@@ -126,10 +126,14 @@ fn spec_fit(text: &str, width: usize) -> String {
 }
 
 fn frame_panes(width: u16, height: u16) -> (Rect, Rect) {
-    let footer = 10 + u16::from(height >= 36);
+    let (header, footer, body_min) = if height <= 29 {
+        (2, 3, 0)
+    } else {
+        (7, 10 + u16::from(height >= 36), 1)
+    };
     let middle = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Min(1),
+        Constraint::Length(header),
+        Constraint::Min(body_min),
         Constraint::Length(footer),
     ])
     .split(Rect::new(0, 0, width, height))[1];

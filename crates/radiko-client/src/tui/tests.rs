@@ -2,6 +2,7 @@ use super::*;
 use ratatui::{Terminal, backend::TestBackend};
 
 mod chapters;
+mod compact;
 mod device;
 mod editing;
 mod keys;

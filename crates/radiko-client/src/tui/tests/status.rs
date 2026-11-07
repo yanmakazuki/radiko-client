@@ -687,11 +687,28 @@ fn pipeline_diagnostics_and_notices_fit_the_playback_footer() {
     assert!(text.replace(' ', "").contains("音声5000ms"));
     assert!(text.contains("NOTICE_END"));
     assert!(text.replace(' ', "").contains("通信診断応答待ち12ms"));
+    let mut normal_narrow = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    normal_narrow
+        .draw(|frame| draw(frame, &mut screen, now))
+        .unwrap();
+    let kept = visible(&normal_narrow).replace(' ', "");
+    assert!(
+        kept.contains("取得max120ms/復号25/80ms/音声5000ms"),
+        "{kept}"
+    );
+    assert!(kept.contains("再生中:[TBS/タイムフリー]"), "{kept}");
     let mut narrow = Terminal::new(TestBackend::new(80, 20)).unwrap();
     narrow.draw(|frame| draw(frame, &mut screen, now)).unwrap();
     let text = visible(&narrow).replace(' ', "");
-    assert!(text.contains("取得max120ms/復号25/80ms/音声5000ms"));
-    assert!(text.contains("再生中:[TBS/タイムフリー]"));
+    assert!(
+        !text.contains("処理診断"),
+        "compact hides pipeline detail\n{text}"
+    );
+    assert!(
+        !text.contains("通信診断"),
+        "compact hides http detail\n{text}"
+    );
+    assert!(text.contains("再生中:[TBS/タイムフリー]"), "{text}");
     screen.help_open = true;
     narrow.draw(|frame| draw(frame, &mut screen, now)).unwrap();
     let text = visible(&narrow).replace(' ', "");
