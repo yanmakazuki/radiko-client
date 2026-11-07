@@ -47,6 +47,8 @@ impl Screen {
             notice_generation: u64::from(!preferences_notice.is_empty()),
             no_color: false,
             notice_clock: None,
+            #[cfg(test)]
+            list_now: None,
             playback_stopped: false,
             stop_cause: None,
             output_guide: None,
@@ -645,6 +647,7 @@ impl Screen {
                         | 'c'
                         | 'e'
                         | '?'
+                        | 'o'
                 )
         )
     }
@@ -1196,6 +1199,78 @@ impl Screen {
         }
         Ok(())
     }
+    /// Wall clock, unless a test injected one. `n` does not read the draw clock.
+    fn list_now(&self) -> DateTime<FixedOffset> {
+        #[cfg(test)]
+        if let Some(now) = self.list_now {
+            return now;
+        }
+        Utc::now().fixed_offset()
+    }
+    #[cfg(test)]
+    pub(super) fn set_list_now(&mut self, now: DateTime<FixedOffset>) {
+        self.list_now = Some(now);
+    }
+    /// First on-air row from the current row through the end of the displayed list.
+    /// Otherwise the displayed row whose start is closest to now. Ties keep the earlier row.
+    fn select_on_air(&mut self) {
+        let now = self.list_now();
+        let choice = {
+            let rows = self.rows();
+            let current = self.list.selected().unwrap_or(0);
+            let times: Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> = rows
+                .iter()
+                .map(|index| {
+                    let program = &self.app.programs[*index];
+                    (program.key.starts_at, program.ends_at)
+                })
+                .collect();
+            choose_displayed_row(&times, current, now)
+        };
+        match choice {
+            DisplayedChoice::Empty => self.show_notice("移動できる番組がありません"),
+            DisplayedChoice::OnAir(index) => self.reveal(index),
+            DisplayedChoice::Nearest(index) => {
+                self.reveal(index);
+                self.show_notice("現在時刻に近い番組を選択しました");
+            }
+        }
+    }
+    fn reveal(&mut self, index: usize) {
+        self.list.select(Some(index));
+        let count = self.rows().len();
+        viewport::visible(&mut self.list, count, self.list_height);
+    }
+    /// Copy the committed criteria, replace only the station, and open the editor.
+    /// A leftover draft is not the source. Nothing is fetched, saved, or played.
+    fn open_station_draft(&mut self) {
+        let Some(station) = self
+            .selected()
+            .map(|program| program.key.station_id.clone())
+        else {
+            self.show_notice("局で絞るには番組を選択してください");
+            return;
+        };
+        let committed = self.app.committed.clone();
+        let criteria = match SearchCriteria::new(
+            Scope::Station(station),
+            committed.range().clone(),
+            committed.filter().clone(),
+        ) {
+            Ok(criteria) => criteria,
+            Err(reason) => {
+                self.show_notice(reason);
+                return;
+            }
+        };
+        self.app.begin_edit();
+        if self.app.edit_criteria(criteria.clone()).is_err() {
+            self.app.cancel_edit();
+            self.show_notice("検索条件を編集中ではありません");
+            return;
+        }
+        self.filters = Some(filters::Editor::new(&criteria, &self.app.programs));
+    }
     fn key_browser(&mut self, key: KeyEvent, service: &mut Service) -> Result<bool, &'static str> {
         if key.code == KeyCode::Char('d')
             && self.app.chapters.target.is_none()
@@ -1305,6 +1380,22 @@ impl Screen {
             | KeyCode::End => {
                 let count = self.rows().len();
                 viewport::navigate(&mut self.list, count, self.list_height, key.code);
+            }
+            KeyCode::Char('n')
+                if self.app.chapters.target.is_none()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.select_on_air();
+            }
+            KeyCode::Char('o')
+                if self.app.chapters.target.is_none()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.open_station_draft();
             }
             KeyCode::Enter => {
                 if self.offline {
@@ -1423,4 +1514,40 @@ impl Screen {
             "? 操作一覧 / e 取得状況 / {enter} / Space 一時停止・再開 / s 停止 / ←→ 15秒 / g 位置 / +- 音量 / {tail}"
         )
     }
+}
+
+enum DisplayedChoice {
+    Empty,
+    OnAir(usize),
+    Nearest(usize),
+}
+
+/// On air means `start <= now < end`, in displayed order, from `current` inclusive.
+/// The fallback is absolute start distance over the whole displayed list. An earlier
+/// on-air row is not preferred. Equal distances keep the earlier row.
+fn choose_displayed_row(
+    times: &[(DateTime<FixedOffset>, DateTime<FixedOffset>)],
+    current: usize,
+    now: DateTime<FixedOffset>,
+) -> DisplayedChoice {
+    if times.is_empty() {
+        return DisplayedChoice::Empty;
+    }
+    let current = current.min(times.len() - 1);
+    if let Some(index) = (current..times.len()).find(|&index| {
+        let (start, end) = times[index];
+        start <= now && now < end
+    }) {
+        return DisplayedChoice::OnAir(index);
+    }
+    let mut best = 0usize;
+    let mut best_distance = (times[0].0 - now).abs();
+    for (index, (start, _)) in times.iter().enumerate().skip(1) {
+        let distance = (*start - now).abs();
+        if distance < best_distance {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    DisplayedChoice::Nearest(best)
 }

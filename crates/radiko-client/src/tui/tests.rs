@@ -8,6 +8,7 @@ mod editing;
 mod field;
 mod keys;
 mod notices;
+mod on_air;
 mod output;
 mod progress;
 mod status;

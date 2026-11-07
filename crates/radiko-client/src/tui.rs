@@ -269,6 +269,9 @@ struct Screen {
     no_color: bool,
     /// Test clock. Empty in production, so notices use the wall clock.
     notice_clock: Option<std::time::Instant>,
+    /// Injected clock for `n`. Empty in production, so the list uses the wall clock.
+    #[cfg(test)]
+    list_now: Option<DateTime<FixedOffset>>,
     /// Set from a failed playback update. Not inferred from the notice text.
     playback_stopped: bool,
     /// Auth expiry or reconnect limit, kept after the notice text is dismissed.
