@@ -295,6 +295,34 @@ fn unknown_position_zero_total_and_live_draw_no_program_bar() {
     assert!(help.contains("12:34 / --:--"), "{help}");
     assert!(help.contains("[TBS / ライブ]"), "{help}");
     assert!(!help.contains("55:00"), "{help}");
+
+    for (mut screen, clock) in [
+        (unknown, "番組内位置未確認"),
+        (zero, "12:34 / --:--"),
+        (backwards, "12:34 / --:--"),
+        (live, "12:34 / --:--"),
+    ] {
+        screen.help_open = false;
+        let shown = buffer(&mut screen, 60, 24);
+        let row = detail_row(&shown);
+        if row.contains(clock) {
+            assert!(row.contains("再生中") || row.contains("一時停止"), "{row}");
+        } else {
+            assert_no_clock_fragment(&row, clock);
+        }
+        assert_eq!(counts(&shown), (0, 0), "{row}");
+        screen.help_open = true;
+        let help_line = help_row(&buffer(&mut screen, 60, 24));
+        if help_line.contains(clock) {
+            assert!(help_line.contains("[TBS /"), "{help_line}");
+        } else {
+            assert_no_clock_fragment(&help_line, clock);
+        }
+        assert!(
+            !help_line.contains("55:00") || clock.contains("55:00"),
+            "{help_line}"
+        );
+    }
 }
 
 #[test]
@@ -385,4 +413,159 @@ fn narrow_resize_and_tiny_terminals_keep_borders_notices_and_the_clock() {
         screen.app.playback.as_ref().unwrap().info.position,
         Duration::ZERO
     );
+}
+
+const CLOCK: &str = "12:34 / 55:00";
+
+fn rows(buffer: &Buffer) -> Vec<String> {
+    let mut rows = Vec::new();
+    for y in 0..buffer.area.height {
+        let mut line = String::new();
+        let mut x = 0;
+        while x < buffer.area.width {
+            let symbol = buffer[(x, y)].symbol();
+            line.push_str(symbol);
+            x += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+        }
+        rows.push(line.trim_end().to_owned());
+    }
+    rows
+}
+
+fn detail_row(buffer: &Buffer) -> String {
+    rows(buffer)
+        .into_iter()
+        .find(|row| row.contains("JST /"))
+        .unwrap_or_default()
+}
+
+fn help_row(buffer: &Buffer) -> String {
+    rows(buffer)
+        .into_iter()
+        .find(|row| row.contains("再生中: ["))
+        .unwrap_or_default()
+}
+
+fn assert_no_clock_fragment(row: &str, clock: &str) {
+    assert!(!row.contains(clock), "full clock still present:\n{row}");
+    let mut prefix = String::new();
+    for ch in clock.chars() {
+        prefix.push(ch);
+        if prefix.chars().count() >= 4 {
+            assert!(!row.contains(&prefix), "partial clock {prefix:?} in\n{row}");
+        }
+    }
+}
+
+fn whole_clock(row: &str, clock: &str, state: &str) {
+    assert!(row.contains(state), "{state} missing:\n{row}");
+    assert!(row.contains(clock), "clock missing:\n{row}");
+}
+
+#[test]
+fn narrow_player_and_help_keep_state_and_a_whole_clock() {
+    for state in [
+        PlaybackState::Playing,
+        PlaybackState::Paused,
+        PlaybackState::Buffering,
+    ] {
+        let mut screen = screen();
+        attach(
+            &mut screen,
+            snapshot(
+                ProbeMode::TimeFree,
+                state,
+                Some(Duration::from_secs(754)),
+                3300,
+            ),
+        );
+        let state_label = match state {
+            PlaybackState::Playing => "再生中",
+            PlaybackState::Paused => "一時停止",
+            PlaybackState::Buffering => "バッファ中",
+        };
+        for width in [60u16, 64] {
+            let shown = buffer(&mut screen, width, 24);
+            let row = detail_row(&shown);
+            whole_clock(&row, CLOCK, state_label);
+            assert!(
+                row.contains("[TBS / タイムフリー]")
+                    || text(&shown).contains("[TBS / タイムフリー]")
+            );
+            assert_inside(&shown);
+            screen.help_open = true;
+            let help = buffer(&mut screen, width, 24);
+            let help_line = help_row(&help);
+            whole_clock(&help_line, CLOCK, state_label);
+            assert!(help_line.contains("[TBS / タイムフリー]"), "{help_line}");
+            assert_inside(&help);
+            screen.help_open = false;
+        }
+        for (width, height) in [(80u16, 24u16), (160, 40)] {
+            let shown = buffer(&mut screen, width, height);
+            let row = detail_row(&shown);
+            whole_clock(&row, CLOCK, state_label);
+            assert!(row.contains("音量25%"), "wide player keeps volume:\n{row}");
+            screen.help_open = true;
+            let help_line = help_row(&buffer(&mut screen, width, height));
+            whole_clock(&help_line, CLOCK, state_label);
+            assert!(
+                help_line.contains("音量25%"),
+                "wide help keeps volume:\n{help_line}"
+            );
+            screen.help_open = false;
+        }
+        let wide = buffer(&mut screen, 160, 40);
+        assert!(detail_row(&wide).contains(CLOCK));
+        let _ = buffer(&mut screen, 80, 24);
+        let _ = buffer(&mut screen, 64, 24);
+        let again = buffer(&mut screen, 60, 24);
+        whole_clock(&detail_row(&again), CLOCK, state_label);
+        let restored = buffer(&mut screen, 160, 40);
+        whole_clock(&detail_row(&restored), CLOCK, state_label);
+        assert!(detail_row(&restored).contains("音量25%"));
+        assert!(text(&restored).contains("NOTICE_KEEP"));
+        assert!(text(&restored).contains("? 操作一覧"));
+    }
+}
+
+#[test]
+fn clock_fits_at_one_width_and_is_absent_one_column_below() {
+    let mut player = screen();
+    attach(
+        &mut player,
+        snapshot(
+            ProbeMode::TimeFree,
+            PlaybackState::Buffering,
+            Some(Duration::from_secs(754)),
+            3300,
+        ),
+    );
+    let player_fit = (20u16..90)
+        .find(|width| detail_row(&buffer(&mut player, *width, 24)).contains(CLOCK))
+        .expect("player clock never fit");
+    let at = detail_row(&buffer(&mut player, player_fit, 24));
+    whole_clock(&at, CLOCK, "バッファ中");
+    let below = detail_row(&buffer(&mut player, player_fit - 1, 24));
+    assert!(
+        below.contains("バッファ中") || below.contains("JST"),
+        "{below}"
+    );
+    assert_no_clock_fragment(&below, CLOCK);
+    assert_inside(&buffer(&mut player, player_fit, 24));
+    assert_inside(&buffer(&mut player, player_fit - 1, 24));
+
+    player.help_open = true;
+    let help_fit = (20u16..90)
+        .find(|width| help_row(&buffer(&mut player, *width, 24)).contains(CLOCK))
+        .expect("help clock never fit");
+    let help_at = help_row(&buffer(&mut player, help_fit, 24));
+    whole_clock(&help_at, CLOCK, "バッファ中");
+    assert!(help_at.contains("[TBS / タイムフリー]"), "{help_at}");
+    let help_below = help_row(&buffer(&mut player, help_fit - 1, 24));
+    assert!(help_below.contains("バッファ中"), "{help_below}");
+    assert!(help_below.contains("[TBS / タイムフリー]"), "{help_below}");
+    assert_no_clock_fragment(&help_below, CLOCK);
+    assert_inside(&buffer(&mut player, help_fit, 24));
+    assert_inside(&buffer(&mut player, help_fit - 1, 24));
 }

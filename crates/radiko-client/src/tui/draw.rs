@@ -397,22 +397,29 @@ fn draw_status(frame: &mut Frame, screen: &Screen, area: Rect, show_http: bool) 
         .playback
         .as_ref()
         .map(super::playback_view::presentation);
+    let detail_columns = usize::from(area.width.saturating_sub(2));
     let playing = screen
         .app
         .playback
         .as_ref()
         .zip(playback_view.as_ref())
         .map(|(p, view)| {
+            let schedule = format!(
+                "{}〜{} JST",
+                local(p.info.starts_at).format("%m/%d %H:%M"),
+                local(p.info.ends_at).format("%m/%d %H:%M"),
+            );
+            let detail = super::playback_view::fit_status_line(
+                &format!("{schedule} / {}", view.state),
+                p.volume,
+                &view.clock,
+                detail_columns,
+            );
             format!(
-                "再生中: [{} / {}] {}\n{}〜{} JST / {} / 音量{}% / {}",
+                "再生中: [{} / {}] {}\n{detail}",
                 p.info.station,
                 view.mode,
                 p.info.title.as_deref().unwrap_or("番組名未取得"),
-                local(p.info.starts_at).format("%m/%d %H:%M"),
-                local(p.info.ends_at).format("%m/%d %H:%M"),
-                view.state,
-                p.volume,
-                view.clock
             )
         })
         .unwrap_or_else(|| {

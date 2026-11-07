@@ -148,31 +148,36 @@ fn paint_active(
         );
         return;
     };
-    let prefix = format!(
-        "再生中: [{} / {}] {} / 音量{}% / {}",
-        snapshot.info.station, view.mode, view.state, snapshot.volume, view.clock
+    let head = format!(
+        "再生中: [{} / {}] {}",
+        snapshot.info.station, view.mode, view.state
+    );
+    let prefix = super::playback_view::fit_status_line(
+        &head,
+        snapshot.volume,
+        &view.clock,
+        usize::from(area.width),
     );
     let title = snapshot.info.title.as_deref().unwrap_or("番組名未取得");
-    let Some(ratio) = view.ratio else {
-        frame.render_widget(Paragraph::new(format!("{prefix} / {title}")), area);
-        return;
-    };
-    let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
-    let Some(bar) = super::playback_view::reserved_bar(area.width, prefix_width) else {
-        frame.render_widget(Paragraph::new(format!("{prefix} / {title}")), area);
-        return;
-    };
-    let text_width = u16::try_from(prefix_width).unwrap_or(area.width);
-    let columns = Layout::horizontal([
-        Constraint::Length(text_width),
-        Constraint::Length(1),
-        Constraint::Length(bar),
-        Constraint::Min(0),
-    ])
-    .split(area);
-    frame.render_widget(Paragraph::new(prefix), columns[0]);
-    super::playback_view::paint_bar(frame, columns[2], ratio);
-    frame.render_widget(Paragraph::new(format!(" {title}")), columns[3]);
+    let clock_kept = prefix.ends_with(view.clock.as_str());
+    if let Some(ratio) = view.ratio.filter(|_| clock_kept) {
+        let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+        if let Some(bar) = super::playback_view::reserved_bar(area.width, prefix_width) {
+            let text_width = u16::try_from(prefix_width).unwrap_or(area.width);
+            let columns = Layout::horizontal([
+                Constraint::Length(text_width),
+                Constraint::Length(1),
+                Constraint::Length(bar),
+                Constraint::Min(0),
+            ])
+            .split(area);
+            frame.render_widget(Paragraph::new(prefix.as_str()), columns[0]);
+            super::playback_view::paint_bar(frame, columns[2], ratio);
+            frame.render_widget(Paragraph::new(format!(" {title}")), columns[3]);
+            return;
+        }
+    }
+    frame.render_widget(Paragraph::new(format!("{prefix} / {title}")), area);
 }
 
 #[cfg(test)]

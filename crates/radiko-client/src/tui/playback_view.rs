@@ -197,6 +197,24 @@ pub(super) fn trailing_bar_area(buf: &Buffer, inner: Rect, needle: &str) -> Opti
     None
 }
 
+fn fits(width: usize, text: &str) -> bool {
+    UnicodeWidthStr::width(text) <= width
+}
+
+/// `head`, then the whole clock, then volume. Volume is dropped before the clock.
+/// A clock that still does not fit is omitted entirely, never clipped to `12:3`.
+pub(super) fn fit_status_line(head: &str, volume: u32, clock: &str, width: usize) -> String {
+    let timed = format!("{head} / {clock}");
+    let full = format!("{head} / 音量{volume}% / {clock}");
+    if fits(width, &full) {
+        full
+    } else if fits(width, &timed) {
+        timed
+    } else {
+        head.to_owned()
+    }
+}
+
 /// Width of a help-line bar beside `prefix`, when the row can keep that prefix.
 pub(super) fn reserved_bar(area_width: u16, prefix_width: usize) -> Option<u16> {
     let Ok(prefix_width) = u16::try_from(prefix_width) else {
