@@ -172,10 +172,13 @@ fn key_cases() -> Vec<KeyCase> {
             KeyModifiers::NONE,
             KeyEffect::Hint,
         ));
-        // #22 の n / o と #23 の = は未実装。一覧とライブでは何もしない。
-        for code in [KeyCode::Char('n'), KeyCode::Char('o'), KeyCode::Char('=')] {
-            cases.push(case(surface, code, KeyModifiers::NONE, KeyEffect::None));
-        }
+        // #23 の = は未実装。一覧とライブでは何もしない。
+        cases.push(case(
+            surface,
+            KeyCode::Char('='),
+            KeyModifiers::NONE,
+            KeyEffect::None,
+        ));
     }
     cases.extend(close_keys(Surface::Help));
     cases.extend(close_keys(Surface::FetchStatus));
