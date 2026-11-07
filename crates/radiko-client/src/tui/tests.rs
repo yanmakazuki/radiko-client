@@ -8,6 +8,7 @@ mod keys;
 mod notices;
 mod output;
 mod status;
+mod truncate;
 mod wording;
 
 fn screen() -> Screen {

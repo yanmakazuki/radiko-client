@@ -36,6 +36,7 @@ mod picker;
 mod screen;
 mod scroll;
 mod seek;
+mod truncate;
 mod viewport;
 use crate::stderr::stderr_ln;
 use crate::stdout::stdout_ln;
