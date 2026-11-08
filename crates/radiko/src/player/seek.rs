@@ -8,6 +8,8 @@ use crate::api::stream::{
     playback::{SegmentSource, StreamInfo},
 };
 use chrono::{DateTime, FixedOffset, Utc};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::{
     sync::{
         Arc, Mutex,
@@ -73,6 +75,57 @@ type Reporter = dyn FnMut(
         Option<&'static str>,
         Option<super::playback::OutputFailure>,
     ) + Send;
+/// 準備結果を載せるたびに試験を起こす。リリースビルドには含めない。
+#[cfg(test)]
+struct PrepNotify {
+    lock: Mutex<()>,
+    seq: AtomicU64,
+    cv: Condvar,
+}
+#[cfg(test)]
+impl PrepNotify {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            seq: AtomicU64::new(0),
+            cv: Condvar::new(),
+        }
+    }
+    fn publish(&self) {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.seq.fetch_add(1, Ordering::Release);
+        self.cv.notify_all();
+    }
+    fn seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+    fn wait_after(&self, seen: u64, deadline: std::time::Instant) -> bool {
+        let mut guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if self.seq.load(Ordering::Acquire) != seen {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, status) = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard = next;
+            if status.timed_out() && self.seq.load(Ordering::Acquire) == seen {
+                return false;
+            }
+        }
+    }
+}
 pub struct Controller {
     commands: Receiver<Command>,
     preparation_worker: Option<thread::JoinHandle<()>>,
@@ -98,6 +151,8 @@ pub struct Controller {
     last_slot_mismatch: AtomicBool,
     #[cfg(test)]
     prepare_stall_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    prep_notify: Arc<PrepNotify>,
 }
 impl Controller {
     pub fn new(
@@ -178,6 +233,10 @@ impl Controller {
         let stall_ms = Arc::new(AtomicU64::new(30_000));
         #[cfg(test)]
         let prepare_stall_ms = stall_ms.clone();
+        #[cfg(test)]
+        let prep_notify = Arc::new(PrepNotify::new());
+        #[cfg(test)]
+        let prep_notify_worker = Arc::clone(&prep_notify);
         let compare_schedule_start = Arc::new(AtomicBool::new(false));
         let (mailbox, ids, shutdown, stall_ms, compare_schedule_start_flag) = (
             latest.clone(),
@@ -249,7 +308,11 @@ impl Controller {
                         break;
                     }
                     match tx.try_send(value) {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            #[cfg(test)]
+                            prep_notify_worker.publish();
+                            break;
+                        }
                         Err(TrySendError::Disconnected(_)) => return,
                         Err(TrySendError::Full(v)) => {
                             value = v;
@@ -279,6 +342,8 @@ impl Controller {
             last_slot_mismatch: AtomicBool::new(false),
             #[cfg(test)]
             prepare_stall_ms,
+            #[cfg(test)]
+            prep_notify,
         }
     }
     /// Whether the latest completed preparation was an internal slot mismatch.
@@ -296,6 +361,16 @@ impl Controller {
     pub(crate) fn set_prepare_stall(&self, stall: Duration) {
         let millis = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX);
         self.prepare_stall_ms.store(millis, Ordering::Release);
+    }
+    /// 準備結果がチャネルに載った回数。試験が結果を待つのに使う。
+    #[cfg(test)]
+    fn preparation_seq(&self) -> u64 {
+        self.prep_notify.seq()
+    }
+    /// 新しい準備結果が載るまで待つ。期限はハング検出であり、成功時の性能条件ではない。
+    #[cfg(test)]
+    fn wait_preparation_after(&self, seen: u64, deadline: std::time::Instant) -> bool {
+        self.prep_notify.wait_after(seen, deadline)
     }
     /// Call only from the owning background control thread, after output has been stopped.
     /// Prevents a replacement session from accumulating workers blocked in old HTTP requests.
@@ -525,8 +600,12 @@ mod tests {
         ProbeError,
         playback::{Next, Segment},
     };
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+    /// ハング検出の上限。成功時はイベントが着き次第進み、この時間は性能条件ではない。
+    /// 同期イベントが来ないときだけ失敗させ、チャネルの無限待ちにはしない。
+    const HANG_WATCHDOG: Duration = Duration::from_secs(20);
     struct Source {
         info: StreamInfo,
         bytes: Option<Vec<u8>>,
@@ -588,15 +667,85 @@ mod tests {
             position: Duration::ZERO,
         }
     }
+    fn recv_within<T>(rx: &mpsc::Receiver<T>, bound: Duration, phase: &str) -> T {
+        match rx.recv_timeout(bound) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("synchronization event missing: {phase} (hang watchdog {bound:?})")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("synchronization channel disconnected: {phase}")
+            }
+        }
+    }
+    fn recv_phase<T>(rx: &mpsc::Receiver<T>, phase: &str) -> T {
+        recv_within(rx, HANG_WATCHDOG, phase)
+    }
+    /// 試験側が送信端を落としたときは false。イベントが来ないときだけハング上限で失敗する。
+    fn released(rx: &mpsc::Receiver<()>, phase: &str) -> bool {
+        match rx.recv_timeout(HANG_WATCHDOG) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("synchronization event missing: {phase} (hang watchdog {HANG_WATCHDOG:?})")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => false,
+        }
+    }
     fn wait_ready(control: &mut Controller, current: &StreamInfo) -> Ready {
-        let began = Instant::now();
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
+            let seen = control.preparation_seq();
             if let Some(ready) = control.poll(current, Duration::ZERO) {
                 return ready;
             }
-            assert!(began.elapsed() < Duration::from_secs(3));
-            thread::sleep(Duration::from_millis(2));
+            if !control.wait_preparation_after(seen, deadline) {
+                panic!(
+                    "synchronization event missing: preparation result (hang watchdog {HANG_WATCHDOG:?})"
+                );
+            }
         }
+    }
+    /// 失敗の完了を待つ。待っているあいだの `poll` は、pending を消す最後の1回も含めて `Ready` を返さない。
+    fn wait_pending_cleared(control: &mut Controller, current: &StreamInfo) {
+        let deadline = Instant::now() + HANG_WATCHDOG;
+        loop {
+            let seen = control.preparation_seq();
+            assert!(
+                control.poll(current, Duration::ZERO).is_none(),
+                "a failed preparation must not become ready"
+            );
+            if control.pending.is_none() {
+                return;
+            }
+            if !control.wait_preparation_after(seen, deadline) {
+                panic!(
+                    "synchronization event missing: preparation finished (hang watchdog {HANG_WATCHDOG:?})"
+                );
+            }
+        }
+    }
+    #[test]
+    fn missing_synchronization_event_fails_inside_the_hang_watchdog() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let bound = Duration::from_millis(200);
+        let began = Instant::now();
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _hold_sender = &tx;
+            recv_within(&rx, bound, "fixture phase");
+        }));
+        let elapsed = began.elapsed();
+        assert!(
+            panicked.is_err(),
+            "a missing synchronization event must fail"
+        );
+        assert!(
+            elapsed + Duration::from_millis(50) >= bound,
+            "watchdog returned early: {elapsed:?} bound {bound:?}"
+        );
+        assert!(
+            elapsed < bound + Duration::from_secs(1),
+            "watchdog exceeded its finite bound: {elapsed:?} bound {bound:?}"
+        );
     }
     #[test]
     fn status_only_requests_a_notification_without_fetching_or_cancelling() {
@@ -610,6 +759,7 @@ mod tests {
         assert!(control.pending_target.is_none());
         assert!(!control.paused);
         assert!(!stop.is_cancelled());
+        control.finish_preparation();
     }
     #[test]
     fn selected_station_and_split_slot_become_the_target_of_following_seek() {
@@ -637,13 +787,14 @@ mod tests {
         assert_eq!(ready.info.starts_at, later);
         assert!(control.paused); // Output creation must succeed before clearing pause.
         assert_eq!(control.volume, 45);
-        received.recv().unwrap();
+        recv_phase(&received, "selected station request");
         tx.send(Command::Seek(Duration::from_secs(15))).unwrap();
         let next = wait_ready(&mut control, &ready.info);
-        let request = received.recv().unwrap();
+        let request = recv_phase(&received, "following seek request");
         assert_eq!(request.station, "OBS");
         assert_eq!(request.cursor, later);
         assert_eq!(next.info.position, Duration::from_secs(15));
+        control.finish_preparation();
     }
     #[test]
     fn selecting_twice_discards_old_station_even_when_preparation_finishes_late() {
@@ -653,8 +804,10 @@ mod tests {
         let pcm = bytes();
         let mut control = Controller::new(rx, StopToken::default(), move |request| {
             if request.station == "OBS" {
-                entered.send(()).unwrap();
-                gate.recv().unwrap();
+                entered.send(()).expect("station observation channel open");
+                if !released(&gate, "old station preparation release") {
+                    return Err(PlaybackError::Source(ProbeError::Cancelled));
+                }
             }
             let mut selected = info();
             selected.station = request.station;
@@ -666,16 +819,20 @@ mod tests {
         tx.send(Command::Select(target("OBS", info().starts_at)))
             .unwrap();
         control.poll(&info(), Duration::ZERO);
-        seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        recv_phase(&seen, "old station preparation entered");
         let old = control.pending.as_ref().unwrap().clone();
         tx.send(Command::Select(target("QRR", info().starts_at)))
             .unwrap();
         control.poll(&info(), Duration::ZERO);
-        assert!(old.is_cancelled());
+        assert!(
+            old.is_cancelled(),
+            "a newer selection must cancel the previous preparation"
+        );
         release.send(()).unwrap();
         let ready = wait_ready(&mut control, &info());
         assert_eq!(ready.info.station, "QRR");
         assert!(!ready.worker.stop.is_cancelled());
+        control.finish_preparation();
     }
     #[test]
     fn invalid_selection_never_fetches_and_wrong_slot_response_is_not_decoded() {
@@ -683,12 +840,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let stop = StopToken::default();
+        let pcm = bytes();
         let mut control = Controller::new(rx, stop.clone(), move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             // A mismatching response must be rejected before polling/decoding this source.
+            // The bytes are decodable so accepting the wrong slot would become Ready.
             Ok(Box::new(Source {
                 info: info(),
-                bytes: Some(vec![0]),
+                bytes: Some(pcm.clone()),
             }))
         });
         tx.send(Command::Select(target("../OBS", info().starts_at)))
@@ -700,15 +859,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         tx.send(Command::Select(target("TBS", info().ends_at)))
             .unwrap();
-        control.poll(&info(), Duration::ZERO);
-        let began = Instant::now();
-        while control.pending.is_some() {
-            assert!(control.poll(&info(), Duration::ZERO).is_none());
-            assert!(began.elapsed() < Duration::from_secs(2));
-            thread::sleep(Duration::from_millis(2));
-        }
+        wait_pending_cleared(&mut control, &info());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(!stop.is_cancelled());
+        control.finish_preparation();
     }
     #[test]
     fn pause_invalidates_pending_seek_and_resume_uses_frozen_or_latest_position() {
@@ -718,9 +872,12 @@ mod tests {
             let (release, gate) = mpsc::channel();
             let stop = StopToken::default();
             let mut control = Controller::new(rx, stop.clone(), move |request| {
-                let position = request.position;
-                seen_tx.send((position, request.cursor)).unwrap();
-                gate.recv_timeout(Duration::from_secs(2)).unwrap();
+                seen_tx
+                    .send((request.position, request.cursor))
+                    .expect("resume observation channel open");
+                if !released(&gate, "pause test released the in-flight resume") {
+                    return Err(PlaybackError::EarlyEnd);
+                }
                 Err(PlaybackError::EarlyEnd)
             });
             let mut slot = info();
@@ -732,39 +889,45 @@ mod tests {
             assert_eq!(control.volume, 40);
             tx.send(Command::Resume).unwrap();
             control.poll(&slot, Duration::from_secs(65));
+            let expected = if mode == ProbeMode::Live {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(65)
+            };
             assert_eq!(
-                seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-                (
-                    if mode == ProbeMode::Live {
-                        Duration::ZERO
-                    } else {
-                        Duration::from_secs(65)
-                    },
-                    slot.starts_at
-                )
+                recv_phase(&seen_rx, "resume preparation request"),
+                (expected, slot.starts_at),
+                "resume must use the paused position (time-free 65s, live 0)"
             );
             let token = control.pending.as_ref().unwrap().clone();
             tx.send(Command::Pause).unwrap();
             control.poll(&slot, Duration::from_secs(65));
-            assert!(token.is_cancelled());
+            assert!(
+                token.is_cancelled(),
+                "pause must cancel the in-flight resume preparation"
+            );
             assert!(control.paused);
             assert!(!stop.is_cancelled());
             release.send(()).unwrap();
+            control.finish_preparation();
         }
     }
     #[test]
     fn newer_seek_cancels_factory_token_and_starts_only_the_latest_preparation() {
         let (tx, rx) = mpsc::channel();
         let (seen, events) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let (saw_tx, saw_rx) = mpsc::channel();
         let stop = StopToken::default();
         let mut control = Controller::new_cancellable(rx, stop.clone(), move |request, cancel| {
-            seen.send(request.position).unwrap();
-            if request.position == Duration::from_secs(1) {
-                let began = Instant::now();
-                while !cancel.is_cancelled() {
-                    assert!(began.elapsed() < Duration::from_secs(2));
-                    thread::sleep(Duration::from_millis(1));
-                }
+            seen.send(request.position)
+                .expect("preparation observation channel open");
+            if request.position == Duration::from_secs(1)
+                && released(&gate, "newer seek released the old factory")
+            {
+                saw_tx
+                    .send(cancel.is_cancelled())
+                    .expect("cancellation observation channel open");
             }
             Err(PlaybackError::Source(ProbeError::Cancelled))
         });
@@ -772,16 +935,33 @@ mod tests {
         tx.send(Command::Seek(Duration::from_secs(1))).unwrap();
         control.poll(&info(), Duration::ZERO);
         assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            recv_phase(&events, "first preparation"),
             Duration::from_secs(1)
         );
+        let old = control
+            .pending
+            .as_ref()
+            .expect("first preparation is in flight")
+            .clone();
         tx.send(Command::Seek(Duration::from_secs(2))).unwrap();
         control.poll(&info(), Duration::ZERO);
+        assert!(
+            old.is_cancelled(),
+            "newer seek must cancel the previous factory token"
+        );
+        assert!(
+            !stop.is_cancelled(),
+            "newer seek must not cancel the current playback stop"
+        );
+        release.send(()).unwrap();
+        assert!(
+            recv_phase(&saw_rx, "old factory cancellation observation"),
+            "the old factory token must already be cancelled"
+        );
         assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            recv_phase(&events, "latest preparation"),
             Duration::from_secs(2)
         );
-        assert!(!stop.is_cancelled());
         control.finish_preparation();
     }
     #[test]
@@ -816,6 +996,7 @@ mod tests {
             assert!(control.pending.is_none());
             assert!(!stop.is_cancelled());
         }
+        control.finish_preparation();
     }
     #[test]
     fn invalid_seek_and_live_requests_never_call_factory_or_cancel_current_playback() {
@@ -835,25 +1016,26 @@ mod tests {
         assert!(control.poll(&live, Duration::ZERO).is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(!stop.is_cancelled());
+        control.finish_preparation();
     }
     #[test]
     fn stale_preparation_is_discarded_and_only_latest_position_becomes_ready() {
         let stop = StopToken::default();
-        let entered = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
-        let (seen, gate, shutdown) = (entered.clone(), release.clone(), stop.clone());
         let pcm = bytes();
         let (tx, rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
         let mut control = Controller::new(rx, stop.clone(), move |request| {
-            let position = request.position;
-            if position == Duration::from_secs(1) {
-                seen.store(true, Ordering::Release);
-                while !gate.load(Ordering::Acquire) && !shutdown.is_cancelled() {
-                    thread::sleep(Duration::from_millis(1));
+            if request.position == Duration::from_secs(1) {
+                entered_tx
+                    .send(())
+                    .expect("first preparation observation channel open");
+                if !released(&go_rx, "first preparation may finish") {
+                    return Err(PlaybackError::Source(ProbeError::Cancelled));
                 }
             }
             let mut target = info();
-            target.position = position;
+            target.position = request.position;
             Ok(Box::new(Source {
                 info: target,
                 bytes: Some(pcm.clone()),
@@ -861,25 +1043,25 @@ mod tests {
         });
         tx.send(Command::Seek(Duration::from_secs(1))).unwrap();
         control.poll(&info(), Duration::ZERO);
-        let began = Instant::now();
-        while !entered.load(Ordering::Acquire) {
-            assert!(began.elapsed() < Duration::from_secs(2));
-            thread::sleep(Duration::from_millis(1));
-        }
+        recv_phase(&entered_rx, "first preparation entered");
+        let seen = control.preparation_seq();
+        go_tx.send(()).unwrap();
+        let deadline = Instant::now() + HANG_WATCHDOG;
+        assert!(
+            control.wait_preparation_after(seen, deadline),
+            "synchronization event missing: first preparation queued (hang watchdog {HANG_WATCHDOG:?})"
+        );
         tx.send(Command::Seek(Duration::from_secs(2))).unwrap();
-        control.poll(&info(), Duration::ZERO);
-        release.store(true, Ordering::Release);
-        let ready = loop {
-            if let Some(ready) = control.poll(&info(), Duration::ZERO) {
-                break ready;
-            }
-            assert!(began.elapsed() < Duration::from_secs(2));
-            thread::sleep(Duration::from_millis(2));
-        };
-        assert_eq!(ready.info.position, Duration::from_secs(2));
+        let ready = wait_ready(&mut control, &info());
+        assert_eq!(
+            ready.info.position,
+            Duration::from_secs(2),
+            "a stale preparation must be discarded"
+        );
         assert!(!stop.is_cancelled());
         assert!(!ready.worker.stop.is_cancelled());
         assert!(ready.pcm.summary.media_duration >= Duration::from_secs(2));
+        control.finish_preparation();
     }
     #[test]
     fn authentication_failure_does_not_cancel_current_audio() {
@@ -889,13 +1071,8 @@ mod tests {
             Err(PlaybackError::Source(ProbeError::Authentication))
         });
         tx.send(Command::Seek(Duration::from_secs(60))).unwrap();
-        control.poll(&info(), Duration::ZERO);
-        let began = Instant::now();
-        while control.pending.is_some() {
-            assert!(control.poll(&info(), Duration::ZERO).is_none());
-            assert!(began.elapsed() < Duration::from_secs(2));
-            thread::sleep(Duration::from_millis(2));
-        }
+        wait_pending_cleared(&mut control, &info());
         assert!(!stop.is_cancelled());
+        control.finish_preparation();
     }
 }
