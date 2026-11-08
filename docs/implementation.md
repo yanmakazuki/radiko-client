@@ -2,6 +2,22 @@
 
 日付ごとの検証記録です。新しい記録は先頭へ足します。1節が1回の確認で、対象、手順、結果、その結果に含めない範囲を分けて書いてあります。
 
+## 2026年11月8日：タイムフリー判定の翌日05:00を共有する
+
+不具合の修正ではない。`eligible` と `availability` がそれぞれ持っていた「終了時刻の放送日の翌日 05:00 JST」の生成だけを、`morning_after_end_broadcast_day` にまとめた。この関数が返すのは基準時刻である。`eligible` の旧 `boundary` はこの基準であり、`availability` の旧 `boundary` は基準の7日後である。同じ瞬間ではない。呼び出し側の名前は `base`、`free_deadline`（基準+7日）、`paid_deadline`（基準+30日）、`tsplus_deadline`（基準+7日）である。7日と30日の加算、期限ちょうどでの失効、`time_free_30` の `Some(true)` 以外を契約不足にすること、ts / tsplus、エリア内外、ブラックアウト、エラー型は呼び出し側のままである。比較はこれまでどおり `now >= 期限` である。番組表の放送日 05:00 変換（`catalog`）は別の計算なので触っていない。設計書の方針は変えていない。
+
+基準 `59e1a20c68c47f41827a613d9f9562291beb84ae` の関数のまま、追加した2件のテストを先に実行し、両方成功した。そのあとヘルパーへ移しても、同じ期待値のまま成功した。期待時刻はテスト内の文字列で、ヘルパーの戻り値は使っていない。
+
+表は終了時刻18件である。昼の枠、04:59:59 と 05:00:00、月末、年越し、2024年の閏日、2025年の平年2月、UTC で表した 04:30 JST と 05:30 JST、UTC の 00:30（JST では 09:30）を含む。04:59:59 と 05:00:00 の6組は、手書きの7日後と30日後がどちらもちょうど1日ずれる。各終了時刻について、7日後と30日後のそれぞれ直前1秒、一致、直後1秒で、`eligible` を `time_free_30` の `Some(false)`、`Some(true)`、`None` で見た。`None` は `Some(false)` と同じで、7日後からは契約不足、30日後からは期限切れである。`Some(true)` は30日後の直前まで通り、一致で期限切れになる。未加入でも30日後の一致は契約不足ではなく期限切れである。`availability` は同じ時刻で、フラグ `[ts内 可, tsplus内 不可, ts外 不可, tsplus外 可]` のエリア内とエリア外を見た。7日後の直前は ts、一致と直後は tsplus である。30日後の前後も tsplus のままである。表示文は「対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）」「タイムフリーの候補期限を過ぎています」「番組情報でタイムフリー配信対象外とされています」である。
+
+もう1件は、7日後の直前と一致で、録音失敗が配信対象外、失敗フラグ未確認が配信条件未確認のままであること、選ばれた ts / tsplus とエリア内 / 外のフラグだけが未確認または不可なら、他のフラグが可でもそのエラーになること、放送前・放送中・終了ちょうどでライブとタイムフリーのエラー型と表示文が分かれたままであることを見ている。
+
+確認環境は Linux x86_64 である。Rust 1.99.1（`58cf8f9c3`、2026-10-13）で `cargo fmt --all -- --check` と `cargo clippy --workspace --locked --all-targets --all-features -- -D warnings` が成功し、同じ版の `cargo test --workspace --locked --all-targets --all-features -- --test-threads=4` と Rust 1.85.0（`4d91de4e4`、2025-02-17）の `--locked --test-threads=4` はどちらも 565 件成功、失敗 0、ignored 2 件である。全件の再実行はしていない。ignored はこれまでどおり `native_muted_acquisition_gap_distinguishes_startup_from_filled_prefetch` と `native_muted_fragmented_aac_reaches_the_explicit_output_limit` で、新しい ignore はない。`python3 -m unittest discover -s scripts -p 'test_*.py'` は 75 件成功である。`59e1a20` との CLI 比較は、stable のデバッグビルドでオフライン 64 件の stdout、stderr、終了コードがすべて一致した。対象は引数なしと各 `--help`、不正引数、非端末の `tui` と `login`、空の `--data-dir` での `session`、`logout`、`searches`、`output-info` と `probe-output` の範囲外、`play-live` と `play-timefree` と `probe-live` と `probe-timefree` と `play-sample` と `chapters` の引数不足・不正・未ログイン・放送前、`inspect-chapters` の fixture である。番組表の取得と、機器を開く出力診断は入れていない。実機の再生、radiko への通信、実アカウントはない。
+
+`eligible` の基準を開始時刻にすると、`paired_clock_keeps_seven_and_thirty_day_edges_for_eligible_and_availability` が `stream.rs` の 1680 行で、終了 2026-10-02 05:00 の 2026-10-10 04:59:59、`time_free_30` `Some(false)` が左 `Err(ContractRequired)`、右 `Ok(())` になって失敗した。`availability` の加算を8日にすると、同じテストの 1697 行で、終了 2026-10-01 12:00 の 2026-10-09 05:00、エリア内が左 `Ok(())`、右 `Err(Unavailable)` になって失敗し、`blackout_and_pre_deadline_errors_stay_distinct_around_the_seven_day_edge` も 1922 行で左 `Ok(())`、右 `Err(AvailabilityUnknown)` になって失敗した。7日の比較を `>` にすると、1680 行で 2026-10-09 05:00 の `Some(false)` が左 `Ok(())`、右 `Err(ContractRequired)` になって失敗した。30日の比較を `>` にすると、1680 行で 2026-11-01 05:00 の `Some(false)` が左 `Err(ContractRequired)`、右 `Err(Expired)` になって失敗した。tsplus の比較を `>` にすると、1697 行で 2026-10-09 05:00 のエリア内が左 `Ok(())`、右 `Err(Unavailable)` になり、1922 行は左 `Ok(())`、右 `Err(AvailabilityUnknown)` になって失敗した。7日と30日を入れ替えると、1680 行で 2026-10-09 05:00 の `Some(false)` が左 `Err(Expired)`、右 `Err(ContractRequired)` になって失敗した。`availability` の加算を30日にすると、1697 行で同じ瞬間のエリア内が左 `Ok(())`、右 `Err(Unavailable)` になり、1922 行は左 `Ok(())`、右 `Err(AvailabilityUnknown)` になって失敗した。`now >= tsplus_deadline` を `now < tsplus_deadline` にすると、1697 行で 2026-10-09 04:59:59 のエリア内が左 `Err(Unavailable)`、右 `Ok(())` になり、1922 行は左 `Ok(())`、右 `Err(AvailabilityUnknown)` になって失敗した。ヘルパーから翌日への繰り上げを外すと、1680 行で 2026-10-09 04:59:59 の `Some(false)` が左 `Err(ContractRequired)`、右 `Ok(())` になり、1922 行は左 `Ok(())`、右 `Err(AvailabilityUnknown)` になって失敗した。いずれもアサーションの失敗で、コンパイルエラーやタイムアウトではない。変えた箇所は戻した。戻したあとの全件が上の 565 件である。
+
+同じ計算を両方の呼び出しへ書き戻してヘルパーを消すと、この2件は成功した。数学的に同じ式の複製は、振る舞いの比較では検出できない。呼び出しの有無をソースの形で検査するテストは入れていない。
+
 ## 2026年11月8日：失敗した準備は Ready にしない
 
 `wait_pending_cleared` は `poll` の戻りを捨て、`pending` が無いことだけを見ていた。認証失敗の工場が、エラーではなく一致する再生可能な音源を返すと、`poll` は `Ready` を返して `pending` を消す。その戻りを捨てると、seek の11件はすべて成功した。
