@@ -581,6 +581,21 @@ fn parse_program(
         failed_record: read_flag("failedRecord").map(|n| n != 0),
     })
 }
+// 終了時刻の放送日の翌日 05:00 JST。基準時刻であり、7日・30日の期限ではない。
+fn morning_after_end_broadcast_day(
+    end: DateTime<FixedOffset>,
+) -> Result<DateTime<FixedOffset>, ProbeError> {
+    let day = broadcast_day(end).ok_or(ProbeError::InvalidProgram)?;
+    day.succ_opt()
+        .and_then(|next| next.and_hms_opt(5, 0, 0))
+        .and_then(|naive| {
+            FixedOffset::east_opt(9 * 3600)?
+                .from_local_datetime(&naive)
+                .single()
+        })
+        .ok_or(ProbeError::InvalidProgram)
+}
+
 fn eligible(
     program: &Program,
     mode: ProbeMode,
@@ -602,26 +617,18 @@ fn eligible(
     }
     // Provisional expiry follows the public implementation, based on the end's broadcast day.
     // The actual playlist response remains authoritative for per-program listening permission.
-    let day = broadcast_day(program.end).ok_or(ProbeError::InvalidProgram)?;
-    let boundary = day
-        .succ_opt()
-        .and_then(|d| d.and_hms_opt(5, 0, 0))
-        .and_then(|d| {
-            FixedOffset::east_opt(9 * 3600)?
-                .from_local_datetime(&d)
-                .single()
-        })
-        .ok_or(ProbeError::InvalidProgram)?;
-    let free_end = boundary
+    // `base` is that next morning. The 7-day and 30-day deadlines are added here.
+    let base = morning_after_end_broadcast_day(program.end)?;
+    let free_deadline = base
         .checked_add_signed(Duration::days(7))
         .ok_or(ProbeError::InvalidProgram)?;
-    let paid_end = boundary
+    let paid_deadline = base
         .checked_add_signed(Duration::days(30))
         .ok_or(ProbeError::InvalidProgram)?;
-    if now >= paid_end {
+    if now >= paid_deadline {
         return Err(ProbeError::Expired);
     }
-    if now >= free_end && membership.time_free_30 != Some(true) {
+    if now >= free_deadline && membership.time_free_30 != Some(true) {
         return Err(ProbeError::ContractRequired);
     }
     Ok(())
@@ -652,18 +659,12 @@ fn availability(
         None => return Err(ProbeError::AvailabilityUnknown),
         Some(false) => (),
     }
-    let day = broadcast_day(program.end).ok_or(ProbeError::InvalidProgram)?;
-    let boundary = day
-        .succ_opt()
-        .and_then(|d| d.and_hms_opt(5, 0, 0))
-        .and_then(|d| {
-            FixedOffset::east_opt(9 * 3600)?
-                .from_local_datetime(&d)
-                .single()
-        })
-        .and_then(|d| d.checked_add_signed(Duration::days(7)))
+    // `base` matches eligible. ts/tsplus switches one week later, not at the 30-day deadline.
+    let base = morning_after_end_broadcast_day(program.end)?;
+    let tsplus_deadline = base
+        .checked_add_signed(Duration::days(7))
         .ok_or(ProbeError::InvalidProgram)?;
-    let index = usize::from(outside) * 2 + usize::from(now >= boundary);
+    let index = usize::from(outside) * 2 + usize::from(now >= tsplus_deadline);
     match program.timefree[index] {
         Some(true) => Ok(()),
         Some(false) => Err(ProbeError::Unavailable),
@@ -1622,6 +1623,426 @@ mod tests {
                 ..program.clone()
             };
             assert_eq!(availability(&program, now, false).unwrap_err(), error);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Gate {
+        Open,
+        Contract,
+        Expired,
+    }
+
+    fn shift(instant: DateTime<FixedOffset>, seconds: i64) -> DateTime<FixedOffset> {
+        instant
+            .checked_add_signed(Duration::seconds(seconds))
+            .unwrap()
+    }
+
+    fn slot(end: &str, flags: [Option<bool>; 4], failed: Option<bool>) -> Program {
+        let end = dt(end);
+        Program {
+            chapter_event: None,
+            title: None,
+            start: shift(end, -3_600),
+            end,
+            timefree: flags,
+            failed_record: failed,
+        }
+    }
+
+    fn gate_text(gate: Gate) -> &'static str {
+        match gate {
+            Gate::Open => "",
+            Gate::Contract => {
+                "対象の契約を確認できません（エリアフリーまたはタイムフリー30が必要です）"
+            }
+            Gate::Expired => "タイムフリーの候補期限を過ぎています",
+        }
+    }
+
+    fn assert_eligible(
+        program: &Program,
+        now: DateTime<FixedOffset>,
+        time_free_30: Option<bool>,
+        gate: Gate,
+    ) {
+        let membership = Membership {
+            area_free: Some(false),
+            time_free_30,
+        };
+        let result = eligible(program, ProbeMode::TimeFree, now, &membership);
+        let expected = match gate {
+            Gate::Open => Ok(()),
+            Gate::Contract => Err(ProbeError::ContractRequired),
+            Gate::Expired => Err(ProbeError::Expired),
+        };
+        assert_eq!(
+            result, expected,
+            "end {} now {now} time_free_30 {time_free_30:?}",
+            program.end
+        );
+        if let Err(error) = result {
+            assert_eq!(error.to_string(), gate_text(gate));
+        }
+    }
+
+    fn assert_route(program: &Program, now: DateTime<FixedOffset>, outside: bool, open: bool) {
+        let result = availability(program, now, outside);
+        let expected = if open {
+            Ok(())
+        } else {
+            Err(ProbeError::Unavailable)
+        };
+        assert_eq!(
+            result, expected,
+            "end {} now {now} outside {outside}",
+            program.end
+        );
+        if let Err(error) = result {
+            assert_eq!(
+                error.to_string(),
+                "番組情報でタイムフリー配信対象外とされています"
+            );
+        }
+    }
+
+    /// 同じ終了時刻について、eligible と availability を期限の直前・一致・直後で見る。
+    /// 期待時刻は表の文字列であり、共有ヘルパーの戻り値ではない。
+    /// 同じ計算を呼び出し側へ書き戻しても、この比較は失敗しない。
+    #[test]
+    fn paired_clock_keeps_seven_and_thirty_day_edges_for_eligible_and_availability() {
+        struct Deadline {
+            end: &'static str,
+            free_at: &'static str,
+            paid_at: &'static str,
+        }
+        let deadlines = [
+            // 2026-10-01 12:00 JST の放送日は 10-01。翌日 05:00 は 10-02。
+            Deadline {
+                end: "2026-10-01T12:00:00+09:00",
+                free_at: "2026-10-09T05:00:00+09:00",
+                paid_at: "2026-11-01T05:00:00+09:00",
+            },
+            // 04:59:59 は前日の放送日のまま。05:00:00 で放送日が進み、両期限が1日ずれる。
+            Deadline {
+                end: "2026-10-02T04:59:59+09:00",
+                free_at: "2026-10-09T05:00:00+09:00",
+                paid_at: "2026-11-01T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2026-10-02T05:00:00+09:00",
+                free_at: "2026-10-10T05:00:00+09:00",
+                paid_at: "2026-11-02T05:00:00+09:00",
+            },
+            // 2026-01-31 の翌日 05:00 は 02-01。30日後は閏年でないので 03-03。
+            Deadline {
+                end: "2026-01-31T18:00:00+09:00",
+                free_at: "2026-02-08T05:00:00+09:00",
+                paid_at: "2026-03-03T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2026-03-01T04:59:59+09:00",
+                free_at: "2026-03-08T05:00:00+09:00",
+                paid_at: "2026-03-31T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2026-03-01T05:00:00+09:00",
+                free_at: "2026-03-09T05:00:00+09:00",
+                paid_at: "2026-04-01T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2025-12-31T23:00:00+09:00",
+                free_at: "2026-01-08T05:00:00+09:00",
+                paid_at: "2026-01-31T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2026-01-01T04:59:59+09:00",
+                free_at: "2026-01-08T05:00:00+09:00",
+                paid_at: "2026-01-31T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2026-01-01T05:00:00+09:00",
+                free_at: "2026-01-09T05:00:00+09:00",
+                paid_at: "2026-02-01T05:00:00+09:00",
+            },
+            // 2024-02-28 の翌日 05:00 は閏日。+7 は 03-07、+30 は 03-30。
+            Deadline {
+                end: "2024-02-28T12:00:00+09:00",
+                free_at: "2024-03-07T05:00:00+09:00",
+                paid_at: "2024-03-30T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2024-02-29T04:59:59+09:00",
+                free_at: "2024-03-07T05:00:00+09:00",
+                paid_at: "2024-03-30T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2024-02-29T05:00:00+09:00",
+                free_at: "2024-03-08T05:00:00+09:00",
+                paid_at: "2024-03-31T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2024-02-29T12:00:00+09:00",
+                free_at: "2024-03-08T05:00:00+09:00",
+                paid_at: "2024-03-31T05:00:00+09:00",
+            },
+            // 2025 年は閏年ではない。02-28 の翌日 05:00 は 03-01。
+            Deadline {
+                end: "2025-02-28T12:00:00+09:00",
+                free_at: "2025-03-08T05:00:00+09:00",
+                paid_at: "2025-03-31T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2025-03-01T04:59:59+09:00",
+                free_at: "2025-03-08T05:00:00+09:00",
+                paid_at: "2025-03-31T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2025-03-01T05:00:00+09:00",
+                free_at: "2025-03-09T05:00:00+09:00",
+                paid_at: "2025-04-01T05:00:00+09:00",
+            },
+            // 19:30Z は翌日 04:30 JST で、放送日はまだ前日。20:30Z は 05:30 JST。
+            Deadline {
+                end: "2026-10-01T19:30:00Z",
+                free_at: "2026-10-09T05:00:00+09:00",
+                paid_at: "2026-11-01T05:00:00+09:00",
+            },
+            Deadline {
+                end: "2026-10-01T20:30:00Z",
+                free_at: "2026-10-10T05:00:00+09:00",
+                paid_at: "2026-11-02T05:00:00+09:00",
+            },
+            // 00:30Z は同日 09:30 JST。UTC の時刻だけ見ると 05:00 前になる。
+            Deadline {
+                end: "2026-10-02T00:30:00Z",
+                free_at: "2026-10-10T05:00:00+09:00",
+                paid_at: "2026-11-02T05:00:00+09:00",
+            },
+        ];
+        for (early, late) in [
+            ("2026-10-02T04:59:59+09:00", "2026-10-02T05:00:00+09:00"),
+            ("2026-03-01T04:59:59+09:00", "2026-03-01T05:00:00+09:00"),
+            ("2026-01-01T04:59:59+09:00", "2026-01-01T05:00:00+09:00"),
+            ("2024-02-29T04:59:59+09:00", "2024-02-29T05:00:00+09:00"),
+            ("2025-03-01T04:59:59+09:00", "2025-03-01T05:00:00+09:00"),
+            ("2026-10-01T19:30:00Z", "2026-10-01T20:30:00Z"),
+        ] {
+            let early_row = deadlines.iter().find(|row| row.end == early).unwrap();
+            let late_row = deadlines.iter().find(|row| row.end == late).unwrap();
+            assert_eq!(
+                shift(dt(early_row.free_at), 86_400),
+                dt(late_row.free_at),
+                "{early} / {late} free"
+            );
+            assert_eq!(
+                shift(dt(early_row.paid_at), 86_400),
+                dt(late_row.paid_at),
+                "{early} / {late} paid"
+            );
+        }
+        let flags = [Some(true), Some(false), Some(false), Some(true)];
+        for row in deadlines {
+            let free_at = dt(row.free_at);
+            let paid_at = dt(row.paid_at);
+            assert!(free_at < paid_at, "{}", row.end);
+            assert_eq!(shift(free_at, 23 * 86_400), paid_at, "{}", row.end);
+            let program = slot(row.end, flags, Some(false));
+            for seconds in [-1_i64, 0, 1] {
+                let now = shift(free_at, seconds);
+                let at_free = seconds >= 0;
+                let free_gate = if at_free { Gate::Contract } else { Gate::Open };
+                assert_eligible(&program, now, Some(false), free_gate);
+                assert_eligible(&program, now, Some(true), Gate::Open);
+                assert_eligible(&program, now, None, free_gate);
+                assert_route(&program, now, false, !at_free);
+                assert_route(&program, now, true, at_free);
+            }
+            for seconds in [-1_i64, 0, 1] {
+                let now = shift(paid_at, seconds);
+                let at_paid = seconds >= 0;
+                let unpaid = if at_paid {
+                    Gate::Expired
+                } else {
+                    Gate::Contract
+                };
+                assert_eligible(&program, now, Some(false), unpaid);
+                assert_eligible(
+                    &program,
+                    now,
+                    Some(true),
+                    if at_paid { Gate::Expired } else { Gate::Open },
+                );
+                assert_eligible(&program, now, None, unpaid);
+                assert_route(&program, now, false, false);
+                assert_route(&program, now, true, true);
+            }
+        }
+    }
+
+    #[test]
+    fn blackout_and_pre_deadline_errors_stay_distinct_around_the_seven_day_edge() {
+        let end = "2026-10-01T12:00:00+09:00";
+        let free_at = dt("2026-10-09T05:00:00+09:00");
+        let allowed = [Some(true); 4];
+        for (label, now) in [("before", shift(free_at, -1)), ("exact", free_at)] {
+            let failed = slot(end, allowed, Some(true));
+            let result = availability(&failed, now, false);
+            assert_eq!(result, Err(ProbeError::Unavailable), "{label}");
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "番組情報でタイムフリー配信対象外とされています"
+            );
+            let unknown_record = slot(end, allowed, None);
+            let result = availability(&unknown_record, now, false);
+            assert_eq!(result, Err(ProbeError::AvailabilityUnknown), "{label}");
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "番組の配信条件が未確認のため取得を中止しました"
+            );
+        }
+        let unknown_flag = [
+            (
+                shift(free_at, -1),
+                false,
+                [None, Some(true), Some(true), Some(true)],
+            ),
+            (free_at, false, [Some(true), None, Some(true), Some(true)]),
+            (
+                shift(free_at, -1),
+                true,
+                [Some(true), Some(true), None, Some(true)],
+            ),
+            (free_at, true, [Some(true), Some(true), Some(true), None]),
+        ];
+        for (now, outside, flags) in unknown_flag {
+            let program = slot(end, flags, Some(false));
+            let result = availability(&program, now, outside);
+            assert_eq!(
+                result,
+                Err(ProbeError::AvailabilityUnknown),
+                "now {now} outside {outside}"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "番組の配信条件が未確認のため取得を中止しました"
+            );
+        }
+        let denied_flag = [
+            (
+                shift(free_at, -1),
+                false,
+                [Some(false), Some(true), Some(true), Some(true)],
+            ),
+            (
+                free_at,
+                false,
+                [Some(true), Some(false), Some(true), Some(true)],
+            ),
+            (
+                shift(free_at, -1),
+                true,
+                [Some(true), Some(true), Some(false), Some(true)],
+            ),
+            (
+                free_at,
+                true,
+                [Some(true), Some(true), Some(true), Some(false)],
+            ),
+        ];
+        for (now, outside, flags) in denied_flag {
+            let program = slot(end, flags, Some(false));
+            let result = availability(&program, now, outside);
+            assert_eq!(
+                result,
+                Err(ProbeError::Unavailable),
+                "now {now} outside {outside}"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "番組情報でタイムフリー配信対象外とされています"
+            );
+        }
+        let program = slot(end, allowed, Some(false));
+        let paid = Membership {
+            area_free: Some(true),
+            time_free_30: Some(true),
+        };
+        let unpaid = Membership {
+            area_free: Some(false),
+            time_free_30: Some(false),
+        };
+        for (now, mode, membership, expected, text) in [
+            (
+                "2026-10-01T10:59:59+09:00",
+                ProbeMode::TimeFree,
+                &paid,
+                Err(ProbeError::Upcoming),
+                "放送前のため配信取得できません",
+            ),
+            (
+                "2026-10-01T11:00:00+09:00",
+                ProbeMode::TimeFree,
+                &paid,
+                Err(ProbeError::StillOnAir),
+                "放送中のためタイムフリーの検証対象外です",
+            ),
+            (
+                "2026-10-01T11:59:59+09:00",
+                ProbeMode::TimeFree,
+                &paid,
+                Err(ProbeError::StillOnAir),
+                "放送中のためタイムフリーの検証対象外です",
+            ),
+            (
+                "2026-10-01T12:00:00+09:00",
+                ProbeMode::TimeFree,
+                &paid,
+                Ok(()),
+                "",
+            ),
+            (
+                "2026-10-01T12:00:00+09:00",
+                ProbeMode::TimeFree,
+                &unpaid,
+                Ok(()),
+                "",
+            ),
+            (
+                "2026-10-01T10:59:59+09:00",
+                ProbeMode::Live,
+                &paid,
+                Err(ProbeError::Upcoming),
+                "放送前のため配信取得できません",
+            ),
+            (
+                "2026-10-01T11:00:00+09:00",
+                ProbeMode::Live,
+                &paid,
+                Ok(()),
+                "",
+            ),
+            (
+                "2026-10-01T11:59:59+09:00",
+                ProbeMode::Live,
+                &unpaid,
+                Ok(()),
+                "",
+            ),
+            (
+                "2026-10-01T12:00:00+09:00",
+                ProbeMode::Live,
+                &paid,
+                Err(ProbeError::InvalidProgram),
+                "指定時刻と番組の放送枠を対応付けできません",
+            ),
+        ] {
+            let result = eligible(&program, mode, dt(now), membership);
+            assert_eq!(result, expected, "{mode:?} {now}");
+            if let Err(error) = result {
+                assert_eq!(error.to_string(), text);
+            }
         }
     }
 
