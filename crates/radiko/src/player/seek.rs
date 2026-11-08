@@ -705,11 +705,15 @@ mod tests {
             }
         }
     }
+    /// 失敗の完了を待つ。待っているあいだの `poll` は、pending を消す最後の1回も含めて `Ready` を返さない。
     fn wait_pending_cleared(control: &mut Controller, current: &StreamInfo) {
         let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             let seen = control.preparation_seq();
-            let _ = control.poll(current, Duration::ZERO);
+            assert!(
+                control.poll(current, Duration::ZERO).is_none(),
+                "a failed preparation must not become ready"
+            );
             if control.pending.is_none() {
                 return;
             }
@@ -836,12 +840,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let stop = StopToken::default();
+        let pcm = bytes();
         let mut control = Controller::new(rx, stop.clone(), move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             // A mismatching response must be rejected before polling/decoding this source.
+            // The bytes are decodable so accepting the wrong slot would become Ready.
             Ok(Box::new(Source {
                 info: info(),
-                bytes: Some(vec![0]),
+                bytes: Some(pcm.clone()),
             }))
         });
         tx.send(Command::Select(target("../OBS", info().starts_at)))
@@ -853,7 +859,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         tx.send(Command::Select(target("TBS", info().ends_at)))
             .unwrap();
-        control.poll(&info(), Duration::ZERO);
         wait_pending_cleared(&mut control, &info());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(!stop.is_cancelled());
@@ -1066,7 +1071,6 @@ mod tests {
             Err(PlaybackError::Source(ProbeError::Authentication))
         });
         tx.send(Command::Seek(Duration::from_secs(60))).unwrap();
-        control.poll(&info(), Duration::ZERO);
         wait_pending_cleared(&mut control, &info());
         assert!(!stop.is_cancelled());
         control.finish_preparation();

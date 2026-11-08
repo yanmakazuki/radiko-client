@@ -2,6 +2,24 @@
 
 日付ごとの検証記録です。新しい記録は先頭へ足します。1節が1回の確認で、対象、手順、結果、その結果に含めない範囲を分けて書いてあります。
 
+## 2026年11月8日：失敗した準備は Ready にしない
+
+`wait_pending_cleared` は `poll` の戻りを捨て、`pending` が無いことだけを見ていた。認証失敗の工場が、エラーではなく一致する再生可能な音源を返すと、`poll` は `Ready` を返して `pending` を消す。その戻りを捨てると、seek の11件はすべて成功した。
+
+待ちの各 `poll` は、`pending` を消す最後の1回も含めて `Ready` ではないことを断言するように戻した。認証失敗と、枠の違う応答の両方がこの関数を使う。枠の違う応答は、受理するとデコードできる音声にした。正しい経路ではデコード前に拒否するので、`Ready` にはならない。イベント待ちと20秒のハング検出、200ミリ秒の監視試験は変えていない。リリースの再生処理は変えていない。
+
+確認環境は Linux x86_64、CPU 4、Ubuntu 24.04.5。Rust 1.99.1（`58cf8f9c3`、2026-10-13）と Rust 1.85.0（`4d91de4e4`、2025-02-17）。`cargo +stable fmt --all -- --check` と `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings` は成功した。`python3 -m unittest discover -s scripts -p 'test_*.py'` は75件成功である。
+
+対象コマンド `cargo +<toolchain> test -p radiko --lib player::seek::tests -- --test-threads=8` は、1プロセスの libtest 8スレッドを順に20回である。stable も Rust 1.85.0 も 20/20 成功、失敗 0。各回は11件成功、`finished in 0.20s`。stable の壁時計は1回目1.583秒、2〜20回目0.286〜0.295秒。Rust 1.85.0 は1回目5.189秒、2〜20回目0.296〜0.368秒。
+
+全件は各ツールチェイン1回だけである。コマンドは `cargo +<toolchain> test --workspace --locked --all-targets --all-features -- --test-threads=4`。このホストの既定並列は CPU 数の4で、別の既定実行はしていない。stable は終了0、壁時計44.534秒、563件成功、失敗0、ignored 2。Rust 1.85.0 は終了0、壁時計50.037秒、同じ563件成功、失敗0、ignored 2。失敗した回は無く、やり直しも無い。
+
+CLIは stable のデバッグビルドで、`c61ac4d` と59件の stdout、stderr、終了コードがバイト列で一致した。前回と同じオフラインの引数で、`programs --restore` は入れていない。ハングは0件。radiko への通信と実機の再生はしていない。
+
+変異は一時的に入れ、終わったら戻した。コンパイル失敗やタイムアウトは殺しに数えていない。認証失敗の代わりに、要求と一致する再生可能な音源を返すと、`authentication_failure_does_not_cancel_current_audio` が「a failed preparation must not become ready」で失敗した。試験時間は0.02秒である。枠不一致の拒否を外すと、`invalid_selection_never_fetches_and_wrong_slot_response_is_not_decoded` が同じ断言で失敗した。試験時間は0.02秒である。以前の4件も残っている。古い工場トークンの `cancel` を外すと「newer seek must cancel the previous factory token」、試験時間0.01秒。世代チェックを通すと `left: 1s`、`right: 2s`、試験時間0.02秒。ライブの再開を65秒にすると `left: (65s, 2026-10-15T12:00:00+09:00)`、`right: (0ns, 2026-10-15T12:00:00+09:00)`、試験時間0.01秒。タイムフリーの再開を0にするとその左右が逆で、試験時間0.01秒である。
+
+変更前の全件で Timeout / SendError が再現したわけではない。この修正は、その失敗の原因を証明するものではない。
+
 ## 2026年11月8日：seek試験の同期待ち
 
 `player::seek` の試験は、2秒のチャネル待ちと壁時計で準備の進みを見ていた。成功条件とハング検出が同じ上限だった。準備側が2秒で受信を諦めると、試験の解放送信が `SendError` になる。全件の負荷で2秒を超えると、位置や取消の断言に届く前に落ち得た。
