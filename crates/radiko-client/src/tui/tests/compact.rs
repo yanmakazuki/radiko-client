@@ -152,6 +152,89 @@ fn footer(buffer: &Buffer) -> (String, String, String) {
 const HINT: &str = "? 操作一覧 / Enter 再生 / Space 一時停止 / q 終了";
 
 #[test]
+fn header_first_line_is_identical_for_normal_and_compact_contexts() {
+    fn header_screen(args: &[&str], live: bool, offline: bool, day: &str) -> Screen {
+        let now = now();
+        let mut values: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+        values.push(day.to_owned());
+        let criteria = crate::programs::criteria(&values, now).unwrap();
+        let mut screen = Screen::new(criteria, String::new());
+        screen.live_mode = live;
+        screen.offline = offline;
+        screen
+    }
+
+    let cases = [
+        (
+            vec!["--all"],
+            false,
+            false,
+            "20261015",
+            "タイムフリー",
+            "全国",
+        ),
+        (vec!["TBS"], false, false, "20261015", "タイムフリー", "TBS"),
+        (
+            vec!["--areas", "JP13,JP14"],
+            false,
+            false,
+            "20261015",
+            "タイムフリー",
+            "JP13,JP14",
+        ),
+        (
+            vec!["TBS"],
+            true,
+            false,
+            "20261015",
+            "ライブ（放送中のみ）",
+            "TBS",
+        ),
+        (
+            vec!["TBS"],
+            true,
+            false,
+            "20261014",
+            "ライブ（取得日が当日と異なります・rで更新）",
+            "TBS",
+        ),
+        (
+            vec!["--all"],
+            false,
+            true,
+            "20261015",
+            "タイムフリー / オフライン確認",
+            "全国",
+        ),
+        (
+            vec!["TBS"],
+            true,
+            true,
+            "20261014",
+            "ライブ（取得日が当日と異なります・rで更新） / オフライン確認",
+            "TBS",
+        ),
+    ];
+    for (args, live, offline, day, mode, scope) in cases {
+        let mut screen = header_screen(&args, live, offline, day);
+        let start = screen.app.committed.range().start();
+        let end = screen.app.committed.range().end();
+        let compact = rows(&buffer(&mut screen, 120, 29));
+        assert_eq!(
+            compact[0],
+            format!("{mode} / {scope} / {start}〜{end}"),
+            "compact header: {args:?}"
+        );
+        let normal = rows(&buffer(&mut screen, 160, 30));
+        assert_eq!(
+            normal[1],
+            format!("{mode} / {scope} / {start}〜{end}（日本時間・05:00区切り）"),
+            "normal header: {args:?}"
+        );
+    }
+}
+
+#[test]
 fn height_29_is_compact_and_30_is_normal_including_one_row_either_way() {
     let mut screen = catalog(24);
     attach(&mut screen);
