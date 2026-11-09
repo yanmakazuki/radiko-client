@@ -231,27 +231,8 @@ fn auth_header_line(screen: &Screen) -> String {
     }
 }
 fn draw_header(frame: &mut Frame, screen: &Screen, now: DateTime<FixedOffset>, area: Rect) {
-    let scope = match screen.app.committed.scope() {
-        Scope::Nationwide => "全国".into(),
-        Scope::Station(id) => id.clone(),
-        Scope::Areas(ids) => ids.join(","),
-    };
+    let (mode, scope) = search_context(screen, now);
     let filter = screen.app.committed.filter();
-    let mode = if screen.live_mode
-        && radiko::domain::broadcast_day(now)
-            .is_some_and(|day| day != screen.app.committed.range().start())
-    {
-        "ライブ（取得日が当日と異なります・rで更新）"
-    } else if screen.live_mode {
-        "ライブ（放送中のみ）"
-    } else {
-        "タイムフリー"
-    };
-    let mode = if screen.offline {
-        format!("{mode} / オフライン確認")
-    } else {
-        mode.to_string()
-    };
     let header = format!(
         "{mode} / {} / {}〜{}（日本時間・05:00区切り）\nキーワード: {}\n番組ジャンル: {} / 出演者分類: {}\n認証: {}\n{}",
         scope,
